@@ -10,17 +10,6 @@ import (
 	"time"
 )
 
-// ResetTokenID identifies one admin password reset token row. It is a
-// distinct named string type, parsed the same way as the identifiers in
-// values.go, so it cannot be confused with AccountID or SessionID.
-type ResetTokenID string
-
-// ParseResetTokenID rejects anything that is not a canonical lowercase UUID.
-func ParseResetTokenID(raw string) (ResetTokenID, error) {
-	v, err := parseUUID("reset token id", raw)
-	return ResetTokenID(v), err
-}
-
 // AuthEpoch is a per-account counter. Every session and reset token carries
 // the epoch that was current when it was issued; a mismatch against the
 // account's current epoch means the credential predates a reset and is no

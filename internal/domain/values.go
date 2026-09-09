@@ -29,6 +29,8 @@ type (
 	TransitionID        string
 	TLSVersionID        string
 	JobID               string
+	ResetTokenID        string
+	CRLDocumentID       string
 )
 
 // uuidLength is the canonical 8-4-4-4-12 hyphenated form length.
@@ -134,6 +136,16 @@ func ParseTLSVersionID(raw string) (TLSVersionID, error) {
 func ParseJobID(raw string) (JobID, error) {
 	v, err := parseUUID("job id", raw)
 	return JobID(v), err
+}
+
+func ParseResetTokenID(raw string) (ResetTokenID, error) {
+	v, err := parseUUID("reset token id", raw)
+	return ResetTokenID(v), err
+}
+
+func ParseCRLDocumentID(raw string) (CRLDocumentID, error) {
+	v, err := parseUUID("crl document id", raw)
+	return CRLDocumentID(v), err
 }
 
 // Version is a non-negative optimistic locking counter.
