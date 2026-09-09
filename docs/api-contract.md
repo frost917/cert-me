@@ -152,3 +152,24 @@ preview는 개인키를 저장하지 않는다. 브라우저는 선택 파일을
 rotate·restore-finalize·재설정 링크 발급·bootstrap 재생성은 내부 CLI 전용이다. 일반 웹 API가 저장 암호화 키를 받거나 유지보수 잠금을 우회하지 않는다. 실행 중 CLI의 비밀번호 재설정 요청은 로컬 전용 Unix 소켓을 통해 같은 서비스 계층에서 처리하며, 오프라인에서는 배타 잠금 획득 후 실행한다. 소켓은 컨테이너 운영자만 접근하도록 파일 권한으로 제한하고 외부 HTTP에 노출하지 않는다.
 
 import 요청의 중복 방지 해시는 인증서/CRL 지문·제공한 CA 키의 SPKI·인수 선택 등 정규화한 업무 입력을 사용한다. 해제 암호·토큰 원문·multipart 경계는 포함하지 않는다. 입력 키의 일치 검증 없이 지문만 믿고 재생하지 않는다.
+
+
+## 확정 HTTP 보안 규칙
+
+- 상태 변경의 Origin은 HTTPS origin(스킴·정규화 호스트·유효 포트)으로 파싱하고 현재 설정 service_url의 origin과 정확히 비교한다. null·복수·잘못된 Origin은 거부한다. service_url의 userinfo/fragment는 금지한다. X-Forwarded-Host/Proto는 비교 기준이 아니다. 설정 이전에는 직접 받은 HTTPS 요청 authority와 Origin의 일치를 요구하며 pre-auth nonce를 그 origin에 결합한다. 이는 최초 설정 승인 수단이 아니므로 [제한된 초기 노출](./architecture.md)의 운영 전제가 적용된다. 설정 후 이전 출처의 pre-auth 토큰은 거부한다.
+- pre-auth 쿠키는 `__Host-certme_preauth`, Secure·HttpOnly·SameSite=Strict·Path=/·Max-Age=600이다. 32바이트 난수 nonce와 서명 토큰의 만료·origin·목적(pre-auth)을 함께 검증한다. 서명 키는 프로세스 시작마다 생성하는 메모리 전용 난수 키이며 재시작 시 기존 pre-auth가 무효화된다. 세션 CSRF와 pre-auth는 대체할 수 없다. `/auth/csrf` GET은 Sec-Fetch-Site가 있으면 반드시 same-origin이어야 하며 Origin 또는 Referer 중 존재하는 출처 값은 모두 기준 origin과 일치해야 한다. Sec-Fetch-Site도 없으면 검증된 Origin/Referer 중 하나가 필요하고 아무 증거도 없으면 403이다.
+- 전체 HTML 응답에 `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'`를 적용한다. unsafe-inline/unsafe-eval은 허용하지 않는다. JS/CSS는 embed한 동일 출처 파일만 사용하고 inline handler를 쓰지 않는다. HTMX의 allowEval=false, allowScriptTags=false, includeIndicatorStyles=false를 초기화한 뒤 처리하며 필요한 indicator CSS는 로컬 파일로 제공한다.
+- 신뢰되지 않은 Subject·SAN·이름·파일명·오류는 html/template의 문맥별 escape를 유지한다. 외부 값을 template.HTML/JS/URL 등 안전 타입으로 승격하지 않는다. HTMX 조각도 같은 템플릿 규칙을 따른다. 전체 응답에 nosniff와 no-referrer, HTML에 X-Frame-Options: DENY를 적용한다. TLS 최소 버전은 1.2이며 암호군은 고정 Go toolchain의 안전 기본값을 사용하고 레거시 추가는 허용하지 않는다. HSTS는 MVP 기본 비활성화, preload/includeSubDomains는 발행하지 않는다.
+- 재설정 페이지는 링크 토큰을 메모리로 옮기고 최초 로드 시 history.replaceState로 현재 주소를 `/`로 바꾼다. 토큰을 local/sessionStorage·hidden HTML·URL에 다시 저장하지 않는다. 제출 시 메모리 토큰을 기존 재설정 POST 본문에 넣는다. 새로고침으로 메모리 토큰이 사라지면 원래 링크를 다시 열도록 안내한다. GET만으로 토큰을 소비하지 않는다. 이 조치는 이미 남은 외부 로그를 삭제하지 않는다.
+- 다운로드에는 안전한 고정 파일명으로 Content-Disposition: attachment를 사용한다. 토큰·Subject·사용자 파일명을 파일명에 삽입하지 않는다. 대시보드의 다운로드 Blob URL은 사용 완료 후 revoke한다. 헤더 수신 제한 10초, 요청 본문 수신 최대 60초, idle 60초, 헤더 최대 32 KiB를 기본값으로 한다. 본문 제한 시간과 KDF 실행 시간은 별개이며 context 취소만으로 KDF 중단을 보장하지 않는다.
+- 개인키 전송 Send는 소비 커밋 후 최대 60초의 실제 쓰기 deadline을 적용한다. HTTP adapter는 writer deadline 지원을 보장하며 불가능하면 소비 전에 거부한다. private 동시 준비/전송은 최대 4건, 대기 최대 5초, 인코딩 payload는 건당 최대 16 MiB다. 자원 초과는 소비 전에 503 또는 크기 정책 오류로 반환하며 새 발급/토큰을 자동 생성하지 않는다. 메모리 버퍼는 한도를 확인하며 증가시키고 종료 때 정리한다.
+
+import의 공개 manifest/evidence는 아래 버전 1 스키마만 허용한다. 모든 객체에서 미지정 속성을 거부하고 JSON 중첩 깊이는 16을 넘지 않는다. metadata 전체는 UTF-8 256 KiB 이하이며 기존 multipart 16 MiB 한도도 적용한다.
+
+| 스키마 | 허용 필드 |
+| --- | --- |
+| ImportManifest | schema_version=1, files(1~100개 ImportManifestFile) |
+| ImportManifestFile | file_id(요청 파일 식별자, 최대 128자), kind(certificate/crl/ca_key), sha256(인증서/CRL 원본 DER 지문 또는 키의 정규화 공개 SPKI 지문), issuer_certificate_id(선택 UUID) |
+| TakeoverEvidence | schema_version=1, crl_sha256(0~100개 DER 지문), issuance_records_checked(boolean), crl_routes_checked(boolean) |
+
+manifest는 서버가 파싱한 공개 자료로 재구성한다. private 키 파일의 원본/암호문 지문·passphrase·입력 metadata 전체를 공개 manifest에 복사하지 않는다. 파일명은 요청 내 식별에만 쓰고 서버 경로로 해석하지 않는다. 중복 file_id/파일명·누락/초과 매핑은 거부한다. preview_manifest와 파일의 대응은 commit에서 다시 비교하고 현재 DB 검증을 수행한다. preview_manifest는 commit 필수이며 preview 요청에는 생략한다. evidence의 CRL 지문은 실제 제공 또는 등록된 해당 CA의 검증된 CRL과 결합해 검사하고, 발급 자료/경로 확인 boolean은 둘 다 true여야 takeover를 확정한다. 외부 시스템을 자동 조회해 이 진술을 검증하지 않는다.

@@ -9,7 +9,7 @@
 | PostgreSQL | 18.x, 초기 테스트 이미지 18.6 | database/sql 어댑터 github.com/jackc/pgx/v5/stdlib v5.11.0 |
 | MySQL | 8.4 LTS, 초기 테스트 이미지 8.4.11 | github.com/go-sql-driver/mysql v1.10.1. 8.4.12 릴리스 노트는 있으나 공식 이미지 태그 확인 실패로 8.4.11을 테스트 기준으로 고정 |
 | MariaDB | 11.8 LTS, 초기 테스트 이미지 11.8.9 | 동일 mysql 드라이버, 독립 스키마 테스트 |
-| 비밀번호 해시 | golang.org/x/crypto v0.57.0 / argon2 | Argon2id. 운영 파라미터 튜닝은 인증 구현 단계 |
+| 비밀번호 해시 | golang.org/x/crypto v0.57.0 / argon2 | Argon2id v19 고정 프로필(memory 64 MiB, iterations 3, parallelism 1, salt 16 B, output 32 B). 프로세스 전체 동시 실행 2개 |
 | 암호화 PKCS#8 | github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 | 버전 태그 대신 정확한 commit 고정. 서비스는 PBES2/PBKDF2-HMAC-SHA256/AES-CBC만 허용하도록 별도 ASN.1 정책 검사 필요 |
 | PKCS#12 | software.sslmate.com/src/go-pkcs12 v0.7.3 | Modern2023 encoder 명시 사용. 약한 legacy encoder로 자동 fallback하지 않음 |
 | OpenAPI | 3.0.3 / kin-openapi v0.149.0 | 참조·스키마·operation 구조 검증에 사용. 런타임 자동 라우터로 결정한 것은 아님 |
@@ -42,4 +42,4 @@ go vet ./...
 
 ## 남은 구현 범위
 
-실제 HTTP 핸들러, 인증·발급 서비스, 보안 입력 파서, CLI, 오프라인 마이그레이션 실행기, 실행 잠금·중단 복구는 아직 없다. 다음 구현은 journal·배타 잠금·마이그레이션 실행기부터 시작하고, 초기 HTTPS·설정·세션을 연결한다. SQL이 파싱된다는 이유로 one-time 전달·rotate·폐기 게시 계약이 구현됐다고 표시하지 않는다.
+실제 HTTP 핸들러, 인증·발급 서비스, 보안 입력 파서, CLI, 오프라인 마이그레이션 실행기, 실행 잠금·중단 복구는 아직 없다. [백엔드 구현 설계](./backend-implementation.md)의 객체·서비스·인터페이스를 기준으로 B01부터 구현한다. 실행기 계약은 이후 백엔드 구조에 맞춰 구현할 저장소 참고 자료다. SQL이 파싱된다는 이유로 one-time 전달·rotate·폐기 게시 계약이 구현됐다고 표시하지 않는다.

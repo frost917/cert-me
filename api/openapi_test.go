@@ -58,3 +58,32 @@ func TestIssuanceAndInputSchemas(t *testing.T) {
 		t.Fatal("invalid rotation interval accepted")
 	}
 }
+
+func TestImportPublicMetadataSchemasAreClosed(t *testing.T) {
+	doc, err := openapi3.NewLoader().LoadFromFile("openapi.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := doc.Components.Schemas["ImportManifest"].Value
+	if manifest.AdditionalProperties.Has != nil && *manifest.AdditionalProperties.Has {
+		t.Fatal("import manifest must be a closed public schema")
+	}
+	evidence := doc.Components.Schemas["TakeoverEvidence"].Value
+	if evidence.AdditionalProperties.Has != nil && *evidence.AdditionalProperties.Has {
+		t.Fatal("takeover evidence must be a closed public schema")
+	}
+	for _, name := range []string{"ImportManifest", "TakeoverEvidence"} {
+		if len(doc.Components.Schemas[name].Value.Required) == 0 {
+			t.Fatalf("%s must require its schema version and public fields", name)
+		}
+	}
+
+	metadata := doc.Components.Schemas["ImportMetadata"].Value
+	if metadata.AdditionalProperties.Has != nil && *metadata.AdditionalProperties.Has {
+		t.Fatal("import metadata must be a closed schema")
+	}
+	if _, ok := metadata.Properties["preview_manifest"]; !ok {
+		t.Fatal("import metadata must carry the typed preview manifest")
+	}
+}

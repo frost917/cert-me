@@ -64,18 +64,23 @@ S['DownloadLinkRequest']=obj({'purpose':enum('public','private')},['purpose'])
 S['DownloadLink']=obj({'url':string(format='uri'),'expires_at':TIME,'token_id':ID},['url','expires_at','token_id'])
 S['Job']=obj({'id':ID,'kind':string(),'state':enum('pending','running','succeeded','failed'),'last_error_code':nullable(string()),'available_at':TIME,'attempt_count':INT,'version':VERSION},['id','kind','state','version'])
 S['JobAccepted']=obj({'job_id':ID},['job_id'])
-S['TakeoverInput']=obj({'history_assertion':enum('crls_provided','no_previous_revocations'),'previous_max_number_hex':HEX,'external_issuer_stopped_at':TIME,'evidence':SNAP},['history_assertion','previous_max_number_hex','external_issuer_stopped_at','evidence'])
+S['TakeoverEvidence']=obj({'schema_version':{'type':'integer','enum':[1]},'crl_sha256':dict(arr(HASH),maxItems=100,uniqueItems=True),'issuance_records_checked':BOOL,'crl_routes_checked':BOOL},['schema_version','crl_sha256','issuance_records_checked','crl_routes_checked'])
+S['TakeoverEvidence']['description']='Public assertions only. Both checks must be true to confirm takeover; CRL digests must match verified CRLs for this CA. No automatic network fetch.'
+S['TakeoverInput']=obj({'history_assertion':enum('crls_provided','no_previous_revocations'),'previous_max_number_hex':HEX,'external_issuer_stopped_at':TIME,'evidence':ref('TakeoverEvidence')},['history_assertion','previous_max_number_hex','external_issuer_stopped_at','evidence'])
 S['Takeover']=obj({'id':ID,'ca_key_generation_id':ID,'state':enum('pending','confirmed'),'confirmed_at':nullable(TIME),'version':VERSION},['id','ca_key_generation_id','state','version'])
 S['ImportItem']=obj({'file_id':string(maxLength=128),'sha256':HASH,'kind':enum('certificate','crl','ca_key'),'status':enum('new','duplicate','conflict'),'existing_id':nullable(ID),'error_code':nullable(string())},['file_id','kind','status'])
-S['ImportPreview']=obj({'manifest':SNAP,'items':arr(ref('ImportItem'))},['manifest','items'])
+S['ImportManifestFile']=obj({'file_id':string(minLength=1,maxLength=128),'kind':enum('certificate','crl','ca_key'),'sha256':HASH,'issuer_certificate_id':ID},['file_id','kind','sha256'])
+S['ImportManifestFile']['description']='sha256 is certificate/CRL DER or normalized public SPKI for ca_key; never a private-key file digest. file_id matches the request file name, never a server path.'
+S['ImportManifest']=obj({'schema_version':{'type':'integer','enum':[1]},'files':dict(arr(ref('ImportManifestFile')),minItems=1,maxItems=100)},['schema_version','files'])
+S['ImportPreview']=obj({'manifest':ref('ImportManifest'),'items':arr(ref('ImportItem'))},['manifest','items'])
 S['ImportResult']=obj({'id':ID,'state':enum('committed','failed'),'committed_at':nullable(TIME),'items':arr(ref('ImportItem')),'certificate_ids':arr(ID),'authority_ids':arr(ID)},['id','state','items','certificate_ids','authority_ids'])
 # Binary multipart parts are bounded independently by handler; never disk-spool key parts.
 BINARY=string(format='binary',writeOnly=True)
 S['ImportUpload']=obj({'files':{'type':'array','maxItems':100,'minItems':1,'items':BINARY},'metadata':SNAP},['files','metadata'])
-S['ImportUpload']['description']='metadata maps multipart file names to certificate/crl/ca_key, issuer certificate IDs and key passphrases; metadata is request-only and secret fields must not be persisted. Total 16 MiB, each file 4 MiB.'
+S['ImportUpload']['description']='metadata maps multipart file names to certificate/crl/ca_key, issuer certificate IDs and key passphrases; metadata is request-only and secret fields must not be persisted. Total 16 MiB, each file 4 MiB, metadata 256 KiB and nesting depth <=16. Commit requires preview_manifest; preview may omit it. Reject duplicate file names/IDs and inconsistent mappings. Public manifest is reconstructed by the server.'
 # Give metadata a concrete wire shape instead of arbitrary secret-bearing JSON.
 S['ImportFileMetadata']=obj({'file_name':string(minLength=1,maxLength=128),'kind':enum('certificate','crl','ca_key'),'issuer_certificate_id':ID,'passphrase':string(writeOnly=True,maxLength=4096)},['file_name','kind'])
-S['ImportMetadata']=obj({'schema_version':{'type':'integer','enum':[1]},'files':arr(ref('ImportFileMetadata')),'preview_manifest':SNAP,'takeovers':arr(obj({'ca_certificate_sha256':HASH,'confirmation':ref('TakeoverInput')},['ca_certificate_sha256','confirmation']))},['schema_version','files'])
+S['ImportMetadata']=obj({'schema_version':{'type':'integer','enum':[1]},'files':dict(arr(ref('ImportFileMetadata')),minItems=1,maxItems=100),'preview_manifest':ref('ImportManifest'),'takeovers':dict(arr(obj({'ca_certificate_sha256':HASH,'confirmation':ref('TakeoverInput')},['ca_certificate_sha256','confirmation'])),maxItems=100)},['schema_version','files'])
 S['ImportUpload']['properties']['metadata']=ref('ImportMetadata')
 S['SigningKeyUpload']=obj({'key':BINARY,'passphrase':string(writeOnly=True,maxLength=4096)},['key'])
 S['TLSUpload']=obj({'certificate':BINARY,'chain':BINARY,'key':BINARY,'passphrase':string(writeOnly=True,maxLength=4096)},['certificate','key'])

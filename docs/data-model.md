@@ -204,3 +204,12 @@ PKI 참조에는 원칙적으로 ON DELETE RESTRICT를 사용한다. secret·세
 6. 잘못된 subtype·다른 series 키 세대·불일치 issuer·내부 TLS의 delivery 생성은 저장소 계약에서 거부한다.
 
 장기 ACME 계정·order·authorization·challenge, CA 역할·태그 ACL, 교차 서명 경로 선택, OCSP 캐시는 이번 테이블에 억지로 포함하지 않는다. 기존 ID·키 세대·issuer 관계를 확장하는 별도 마이그레이션으로 추가한다.
+
+
+## 보안 검토 반영 저장 계약
+
+import_batches.input_manifest_json은 API ImportManifest v1의 서버 재구성 결과만 저장한다. result_json은 ImportResult의 공개 결과 필드만 저장하고 ca_takeovers.evidence_json은 TakeoverEvidence v1만 저장한다. 스키마 버전별 허용 필드 외 값은 거부하며 입력 metadata 전체를 JSON 컬럼에 넘기지 않는다. 별도 SQL 컬럼 추가는 필요하지 않다.
+
+개인키 전송 후 완료/실패 기록이 미확정이면 runtime이 즉시 일반 요청을 닫고 종료한다. 다음 시작 시 transferring을 failed·폐기·CRL 작업·감사와 원자적으로 정리한 뒤 요청을 연다. MVP는 실행 중 lease 회수나 attempt 테이블을 추가하지 않는다. 완료 후처리 commit이 실제로 성공한 경우 재시작은 저장된 server_completed를 유지한다. 실패 상태를 되돌리는 늦은 callback을 허용하지 않는다.
+
+revocation의 certificate_id가 있으면 issuer_ca_key_generation_id·serial_hex가 해당 인증서와 일치해야 하며 certificate_id 없는 과거 CRL 항목은 허용한다. delivery의 certificate·Leaf key generation·key material의 일치도 같은 writer 트랜잭션에서 검증한다. 네 저장 어댑터 모두 불일치 삽입의 전체 rollback을 계약 테스트한다. 서비스가 검증한 공개 DTO와 명시적 repository 경로를 사용하며 임의 row 쓰기 API를 제공하지 않는다.

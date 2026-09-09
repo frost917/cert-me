@@ -7421,6 +7421,40 @@
           "job_id"
         ]
       },
+      "TakeoverEvidence": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "enum": [
+              1
+            ]
+          },
+          "crl_sha256": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "maxItems": 100,
+            "uniqueItems": true
+          },
+          "issuance_records_checked": {
+            "type": "boolean"
+          },
+          "crl_routes_checked": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "schema_version",
+          "crl_sha256",
+          "issuance_records_checked",
+          "crl_routes_checked"
+        ],
+        "description": "Public assertions only. Both checks must be true to confirm takeover; CRL digests must match verified CRLs for this CA. No automatic network fetch."
+      },
       "TakeoverInput": {
         "type": "object",
         "additionalProperties": false,
@@ -7441,18 +7475,7 @@
             "format": "date-time"
           },
           "evidence": {
-            "type": "object",
-            "required": [
-              "schema_version"
-            ],
-            "properties": {
-              "schema_version": {
-                "type": "integer",
-                "minimum": 1
-              }
-            },
-            "additionalProperties": true,
-            "description": "버전별 공개 메타데이터. 개인키·토큰·해제 암호 금지."
+            "$ref": "#/components/schemas/TakeoverEvidence"
           }
         },
         "required": [
@@ -7543,23 +7566,69 @@
           "status"
         ]
       },
+      "ImportManifestFile": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "file_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "certificate",
+              "crl",
+              "ca_key"
+            ]
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "issuer_certificate_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "file_id",
+          "kind",
+          "sha256"
+        ],
+        "description": "sha256 is certificate/CRL DER or normalized public SPKI for ca_key; never a private-key file digest. file_id matches the request file name, never a server path."
+      },
+      "ImportManifest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "enum": [
+              1
+            ]
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ImportManifestFile"
+            },
+            "minItems": 1,
+            "maxItems": 100
+          }
+        },
+        "required": [
+          "schema_version",
+          "files"
+        ]
+      },
       "ImportPreview": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "manifest": {
-            "type": "object",
-            "required": [
-              "schema_version"
-            ],
-            "properties": {
-              "schema_version": {
-                "type": "integer",
-                "minimum": 1
-              }
-            },
-            "additionalProperties": true,
-            "description": "버전별 공개 메타데이터. 개인키·토큰·해제 암호 금지."
+            "$ref": "#/components/schemas/ImportManifest"
           },
           "items": {
             "type": "array",
@@ -7644,7 +7713,7 @@
           "files",
           "metadata"
         ],
-        "description": "metadata maps multipart file names to certificate/crl/ca_key, issuer certificate IDs and key passphrases; metadata is request-only and secret fields must not be persisted. Total 16 MiB, each file 4 MiB."
+        "description": "metadata maps multipart file names to certificate/crl/ca_key, issuer certificate IDs and key passphrases; metadata is request-only and secret fields must not be persisted. Total 16 MiB, each file 4 MiB, metadata 256 KiB and nesting depth <=16. Commit requires preview_manifest; preview may omit it. Reject duplicate file names/IDs and inconsistent mappings. Public manifest is reconstructed by the server."
       },
       "ImportFileMetadata": {
         "type": "object",
@@ -7692,21 +7761,12 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/ImportFileMetadata"
-            }
+            },
+            "minItems": 1,
+            "maxItems": 100
           },
           "preview_manifest": {
-            "type": "object",
-            "required": [
-              "schema_version"
-            ],
-            "properties": {
-              "schema_version": {
-                "type": "integer",
-                "minimum": 1
-              }
-            },
-            "additionalProperties": true,
-            "description": "버전별 공개 메타데이터. 개인키·토큰·해제 암호 금지."
+            "$ref": "#/components/schemas/ImportManifest"
           },
           "takeovers": {
             "type": "array",
@@ -7726,7 +7786,8 @@
                 "ca_certificate_sha256",
                 "confirmation"
               ]
-            }
+            },
+            "maxItems": 100
           }
         },
         "required": [
