@@ -1,0 +1,77 @@
+name: contracts
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  local-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: python3 tools/check_artifacts.py
+      - run: go test ./... -v
+      - run: go vet ./...
+  external-schema:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dialect: postgres
+            image: postgres:18.6@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+            port: '5432'
+            health: pg_isready -U certme -d certme_test
+          - dialect: mysql
+            image: mysql:8.4.11@sha256:3466ba4a4828aa8d46fb7c3bc16b67b781c98413cf4ea0fac6feaa6e881faa26
+            port: '3306'
+            health: mysqladmin ping -h 127.0.0.1 -proot-test-only
+          - dialect: mariadb
+            image: mariadb:11.8.9@sha256:2439dcd7d14010ecd1ff7a4e1c5abe8e208c34fe35290744deeeaac3569043c3
+            port: '3306'
+            health: healthcheck.sh --connect --innodb_initialized
+    services:
+      db:
+        image: ${{ matrix.image }}
+        env:
+          POSTGRES_USER: certme
+          POSTGRES_PASSWORD: test-only
+          POSTGRES_DB: certme_test
+          MYSQL_ROOT_PASSWORD: root-test-only
+          MYSQL_DATABASE: certme_test
+          MYSQL_USER: certme
+          MYSQL_PASSWORD: test-only
+          MARIADB_ROOT_PASSWORD: root-test-only
+          MARIADB_DATABASE: certme_test
+          MARIADB_USER: certme
+          MARIADB_PASSWORD: test-only
+        ports:
+          - ${{ matrix.port }}
+        options: >-
+          --health-cmd="${{ matrix.health }}"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test isolated empty schema
+        env:
+          TEST_DIALECT: ${{ matrix.dialect }}
+          TEST_DB_PORT: ${{ job.services.db.ports[matrix.port] }}
+        run: |
+          if [ "$TEST_DIALECT" = postgres ]; then
+            export CERTME_TEST_POSTGRES_DSN="postgres://certme:test-only@127.0.0.1:${TEST_DB_PORT}/certme_test?sslmode=disable"
+          elif [ "$TEST_DIALECT" = mysql ]; then
+            export CERTME_TEST_MYSQL_DSN="certme:test-only@tcp(127.0.0.1:${TEST_DB_PORT})/certme_test"
+          else
+            export CERTME_TEST_MARIADB_DSN="certme:test-only@tcp(127.0.0.1:${TEST_DB_PORT})/certme_test"
+          fi
+          go test ./internal/storage/migrations -run "TestSchema/${TEST_DIALECT}$" -v -count=1

@@ -1,0 +1,19 @@
+{
+  "checked_at": "2026-09-09",
+  "go": "1.27.1",
+  "openapi": "3.0.3",
+  "go_dependencies": "go.mod and go.sum",
+  "sqlite": {"driver": "modernc.org/sqlite v1.58.0", "embedded_version": "3.53.4"},
+  "database_test_targets": {
+    "postgres": "postgres:18.6@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280",
+    "mysql": "mysql:8.4.11@sha256:3466ba4a4828aa8d46fb7c3bc16b67b781c98413cf4ea0fac6feaa6e881faa26",
+    "mariadb": "mariadb:11.8.9@sha256:2439dcd7d14010ecd1ff7a4e1c5abe8e208c34fe35290744deeeaac3569043c3"
+  },
+  "frontend": {
+    "htmx.org": {
+      "version": "2.0.10",
+      "tarball": "https://registry.npmjs.org/htmx.org/-/htmx.org-2.0.10.tgz",
+      "integrity": "sha512-kdeJe7ZVwaS6QMz/ebBIVtZdpwen6L0OQ5GOhPV9MKBb196TCZeZu4yA7ZIQsaLKv7EpXz+So7KSXNuHXhj7Cw=="
+    }
+  }
+}
