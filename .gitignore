@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 /coverage.out
 /bin/
+.claude/worktrees/
