@@ -193,6 +193,8 @@ version은 DB 저장 횟수가 아니라 낙관적 잠금 토큰이다. 도메�
 
 secret.Input은 단기 []byte의 소유권을 갖는다. `Close()`는 소유 버퍼를 지우고 참조를 끊으며 여러 번 호출해도 안전하다. String/LogValue는 항상 redacted, MarshalJSON은 오류를 반환한다. 평문을 필요로 하는 어댑터에만 `Use(func([]byte) error)`로 동기 접근을 제공한다. callback이 참조를 보존하지 않는 것은 어댑터 계약이며 메모리 안전 삭제의 절대 보장을 주장하지 않는다.
 
+secret.Input은 실행 중인 Use callback 수를 추적한다. Close는 즉시 closed로 표시해 새 Use를 거부하되 callback이 남아 있으면 기다리지 않고 반환하고, 마지막 callback이 종료될 때 버퍼를 지운다. callback 종료 처리는 panic에도 defer로 수행한다. callback 내부 Close와 중첩 Use가 데드락을 만들지 않으며, 다른 goroutine의 Close가 사용 중인 버퍼를 동시에 덮어쓰지 않는다. callback이 없으면 Close가 즉시 버퍼를 지운다. callback은 바이트를 읽기 전용으로 사용하고 참조를 외부에 보존하지 않는다. Use/Close 경합은 race detector 테스트로 검증한다.
+
 HTTP/CLI는 비밀을 별도 command 필드의 secret.Input으로 변환하고 작업 반환 시 Close한다. command 전체를 로깅하지 않는다. encrypted secret에는 OwnerKeyID·Purpose·FormatVersion·EncryptionGenerationID·Nonce·Ciphertext가 있으며 AAD를 검증해 다른 레코드로 옮긴 암호문을 거부한다.
 
 ```go

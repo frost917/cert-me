@@ -32,6 +32,11 @@ type Input struct {
 	mu     sync.Mutex
 	buf    []byte
 	closed bool
+	// inUse counts callbacks currently running in Use. Close never waits on
+	// them; it stops new callers immediately and leaves the zeroing to the
+	// last callback to finish, so no callback ever reads a buffer while Close
+	// writes over it.
+	inUse int
 }
 
 // New takes ownership of buf. The caller must not retain or reuse buf; New
@@ -85,24 +90,43 @@ func ReadAll(r io.Reader, limit int) (*Input, error) {
 // the slice or hand it to another goroutine; that is the adapter contract.
 // A nil Input is treated as closed so callers do not need a nil check.
 //
+// The bytes are read-only for the duration of the callback.
+//
 // The lock is released before the callback runs, so the callback may call any
 // method on the same Input -- including a deferred Close, which is the natural
 // thing to write. Holding a non-reentrant mutex across the callback would
-// deadlock on exactly that. The buffer is captured while the lock is held; a
-// concurrent Close zeroes that array, so a racing Close during the callback
-// blanks the plaintext rather than freeing it out from under the callback.
+// deadlock on exactly that. Releasing it alone would race instead: a Close on
+// another goroutine would zero the array while the callback reads it. So the
+// callback is counted while it runs, and a Close that arrives meanwhile only
+// marks the Input closed; the zeroing happens when the last callback leaves.
+// The release is deferred, so a panicking callback still cleans up.
 func (i *Input) Use(fn func([]byte) error) error {
 	if i == nil {
 		return ErrClosed
 	}
 	i.mu.Lock()
-	buf := i.buf
-	closed := i.closed
-	i.mu.Unlock()
-	if closed || buf == nil {
+	if i.closed || i.buf == nil {
+		i.mu.Unlock()
 		return ErrClosed
 	}
+	buf := i.buf
+	i.inUse++
+	i.mu.Unlock()
+
+	defer i.release()
 	return fn(buf)
+}
+
+// release ends one callback and performs a Close that was deferred while the
+// callback was running.
+func (i *Input) release() {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.inUse--
+	if i.inUse == 0 && i.closed && i.buf != nil {
+		zero(i.buf)
+		i.buf = nil
+	}
 }
 
 // Len reports the plaintext length, which is not itself secret. A closed or
@@ -113,6 +137,11 @@ func (i *Input) Len() int {
 	}
 	i.mu.Lock()
 	defer i.mu.Unlock()
+	// A closed Input reports 0 even while a last callback still holds the
+	// buffer, so Len never contradicts Use returning ErrClosed.
+	if i.closed {
+		return 0
+	}
 	return len(i.buf)
 }
 
@@ -121,6 +150,11 @@ func (i *Input) IsEmpty() bool { return i.Len() == 0 }
 
 // Close zeroes the owned buffer and drops the reference. Repeated calls are
 // safe, and Close on a nil Input is a no-op so defer needs no guard.
+//
+// Close never blocks. It marks the Input closed at once, so every later Use
+// fails, but if callbacks are still running -- including a Close called from
+// inside one -- the buffer is zeroed by the last of them rather than out from
+// under a reader.
 func (i *Input) Close() error {
 	if i == nil {
 		return nil
@@ -130,9 +164,12 @@ func (i *Input) Close() error {
 	if i.closed {
 		return nil
 	}
+	i.closed = true
+	if i.inUse > 0 {
+		return nil
+	}
 	zero(i.buf)
 	i.buf = nil
-	i.closed = true
 	return nil
 }
 

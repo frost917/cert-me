@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -249,5 +250,168 @@ func TestReadAllDoesNotLeaveAnUnzeroedCopy(t *testing.T) {
 	}
 	if err := in.Use(func([]byte) error { return nil }); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Use after Close = %v, want ErrClosed", err)
+	}
+}
+
+// TestConcurrentUseAndClose is the race the counted-callback design exists to
+// prevent: Close zeroing the array while a callback reads it. Run under -race.
+func TestConcurrentUseAndClose(t *testing.T) {
+	const size = 1 << 20
+	in, err := ReadAll(bytes.NewReader(bytes.Repeat([]byte("p"), size)), size)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_ = in.Use(func(b []byte) error {
+			for round := 0; round < 200; round++ {
+				var sum int
+				for _, c := range b {
+					sum += int(c)
+				}
+				_ = sum
+			}
+			return nil
+		})
+	}()
+	go func() {
+		defer wg.Done()
+		if err := in.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+	wg.Wait()
+
+	// Whichever order they ran in, the Input ends up closed and cleared.
+	if err := in.Use(func([]byte) error { return nil }); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Use after the race = %v, want ErrClosed", err)
+	}
+	if in.Len() != 0 {
+		t.Errorf("Len after close = %d, want 0", in.Len())
+	}
+}
+
+// TestCloseDuringUseZeroesWhenTheLastCallbackLeaves pins the deferred zeroing:
+// Close does not wait, the callback keeps reading intact bytes, and the buffer
+// is cleared once the last callback returns.
+func TestCloseDuringUseZeroesWhenTheLastCallbackLeaves(t *testing.T) {
+	owned := []byte("hunter2-hunter2")
+	in := New(owned)
+
+	entered := make(chan struct{})
+	closed := make(chan struct{})
+
+	go func() {
+		<-entered
+		_ = in.Close() // must return without waiting for the callback
+		close(closed)
+	}()
+
+	err := in.Use(func(b []byte) error {
+		close(entered)
+		<-closed // Close has already run and marked the Input closed
+
+		// The bytes this callback was handed are still intact.
+		if string(b) != "hunter2-hunter2" {
+			return errors.New("plaintext was zeroed while the callback was running")
+		}
+		// A new Use is already refused.
+		if err := in.Use(func([]byte) error { return nil }); !errors.Is(err, ErrClosed) {
+			return errors.New("a new Use was admitted after Close")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Use: %v", err)
+	}
+
+	// Now that the last callback has left, the buffer is zeroed.
+	if !bytes.Equal(owned, make([]byte, len(owned))) {
+		t.Errorf("buffer was not zeroed after the last callback left: %q", owned)
+	}
+}
+
+// TestCloseInsideCallbackStillZeroes covers the in-callback Close, which must
+// neither deadlock nor zero the bytes the callback is still reading.
+func TestCloseInsideCallbackStillZeroes(t *testing.T) {
+	owned := []byte("secret-value")
+	in := New(owned)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- in.Use(func(b []byte) error {
+			defer in.Close()
+			if string(b) != "secret-value" {
+				return errors.New("plaintext already zeroed inside the callback")
+			}
+			return nil
+		})
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Use: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Use deadlocked on a Close inside the callback")
+	}
+
+	if !bytes.Equal(owned, make([]byte, len(owned))) {
+		t.Errorf("buffer was not zeroed after the callback closed it: %q", owned)
+	}
+}
+
+// TestPanickingCallbackStillReleases checks the deferred release: a callback
+// that panics must not leave the Input permanently marked in use, or a later
+// Close would never zero the buffer.
+func TestPanickingCallbackStillReleases(t *testing.T) {
+	owned := []byte("panic-path")
+	in := New(owned)
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("expected the callback panic to propagate")
+			}
+		}()
+		_ = in.Use(func([]byte) error { panic("boom") })
+	}()
+
+	// The Input is usable again, so the release ran.
+	if err := in.Use(func([]byte) error { return nil }); err != nil {
+		t.Fatalf("Use after a panicking callback = %v, want nil", err)
+	}
+	if err := in.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !bytes.Equal(owned, make([]byte, len(owned))) {
+		t.Errorf("buffer was not zeroed after a panicking callback: %q", owned)
+	}
+}
+
+// TestNestedUseHoldsTheBufferUntilTheOuterCallbackLeaves checks the counter
+// with more than one active callback.
+func TestNestedUseHoldsTheBufferUntilTheOuterCallbackLeaves(t *testing.T) {
+	owned := []byte("nested-secret")
+	in := New(owned)
+
+	err := in.Use(func(outer []byte) error {
+		return in.Use(func(inner []byte) error {
+			_ = in.Close() // deferred: two callbacks are still active
+			if string(inner) != "nested-secret" || string(outer) != "nested-secret" {
+				return errors.New("plaintext zeroed with callbacks still active")
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("nested Use: %v", err)
+	}
+	if !bytes.Equal(owned, make([]byte, len(owned))) {
+		t.Errorf("buffer was not zeroed after the outer callback left: %q", owned)
 	}
 }
