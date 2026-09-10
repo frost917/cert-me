@@ -138,8 +138,7 @@ type state struct {
 	// ID() accessor of its own (unlike every other stored entity), but its
 	// candidate version id is set once at construction and never reused
 	// across rows, so it is a stable synthetic key for this test double.
-	tlsChanges         map[domain.TLSVersionID]domain.TLSChange
-	activeTLSChangeKey domain.TLSVersionID // zero until a change has been applied
+	tlsChanges map[domain.TLSVersionID]domain.TLSChange
 
 	requestResults map[port.OperationRequestKey]port.OperationRequestResult
 
@@ -236,7 +235,6 @@ func (s *state) clone() *state {
 		deploymentConfirmations: append([]domain.DeploymentConfirmation(nil), s.deploymentConfirmations...),
 		tlsVersions:             make(map[domain.TLSVersionID]domain.TLSVersion, len(s.tlsVersions)),
 		tlsChanges:              make(map[domain.TLSVersionID]domain.TLSChange, len(s.tlsChanges)),
-		activeTLSChangeKey:      s.activeTLSChangeKey,
 		requestResults:          make(map[port.OperationRequestKey]port.OperationRequestResult, len(s.requestResults)),
 		secrets:                 make(map[secretKey]domain.EncryptedSecret, len(s.secrets)),
 		verifierSet:             s.verifierSet,

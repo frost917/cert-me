@@ -16,10 +16,15 @@ var _ port.TLSRepository = tlsRepo{}
 // the caller gets ErrNotFound rather than a zero TLSChange that would read
 // as a prepared candidate.
 func (r tlsRepo) GetActiveForUpdate(_ context.Context) (domain.TLSChange, error) {
-	if r.s.activeTLSChangeKey == "" {
+	// The active pointer lives on the installation row and nowhere else.
+	// Keeping a second copy beside it would let the two disagree the moment
+	// a service saved the installation through InstallationRepository, which
+	// is the same two-sources-of-truth defect the audit scope argument was
+	// corrected for.
+	if !r.s.installationSet || r.s.installation.ActiveTLSVersionID == "" {
 		return domain.TLSChange{}, port.ErrNotFound
 	}
-	change, ok := r.s.tlsChanges[r.s.activeTLSChangeKey]
+	change, ok := r.s.tlsChanges[r.s.installation.ActiveTLSVersionID]
 	if !ok {
 		return domain.TLSChange{}, port.ErrNotFound
 	}
@@ -90,6 +95,5 @@ func (r tlsRepo) SetActive(_ context.Context, expectedVersion domain.Version, ve
 	installation.ActiveTLSVersionID = versionID
 	installation.Version = installation.Version.Next()
 	r.s.installation = installation
-	r.s.activeTLSChangeKey = versionID
 	return nil
 }
