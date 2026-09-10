@@ -68,6 +68,41 @@ func TestCommandFieldsMatchOpenAPISchemas(t *testing.T) {
 	}
 }
 
+// loadOpenAPIStringEnum reads api/openapi.json and returns the string enum
+// values declared on components.schemas[schema].properties[property]. It is
+// the shared helper for every "does our mapping table stay in sync with the
+// live OpenAPI enum" test in this package (Q1's DeploymentAction bridge,
+// Q2's RevocationReason bridge), so an enum value added or removed on either
+// side is caught by re-reading the document rather than by a hardcoded Go
+// slice drifting out of sync with it.
+func loadOpenAPIStringEnum(t *testing.T, schema, property string) []string {
+	t.Helper()
+	doc, err := openapi3.NewLoader().LoadFromFile("../../../api/openapi.json")
+	if err != nil {
+		t.Fatalf("failed to load openapi.json: %v", err)
+	}
+	s, ok := doc.Components.Schemas[schema]
+	if !ok {
+		t.Fatalf("openapi.json has no schema named %q", schema)
+	}
+	prop, ok := s.Value.Properties[property]
+	if !ok {
+		t.Fatalf("openapi.json schema %q has no property %q", schema, property)
+	}
+	out := make([]string, 0, len(prop.Value.Enum))
+	for _, v := range prop.Value.Enum {
+		sv, ok := v.(string)
+		if !ok {
+			t.Fatalf("openapi.json schema %q property %q enum value %v is not a string", schema, property, v)
+		}
+		out = append(out, sv)
+	}
+	if len(out) == 0 {
+		t.Fatalf("openapi.json schema %q property %q has no enum values", schema, property)
+	}
+	return out
+}
+
 // jsonTaggedFieldNames returns the set of JSON property names a struct
 // decodes, skipping json:"-" (server-filled) fields.
 func jsonTaggedFieldNames(v any) map[string]struct{} {

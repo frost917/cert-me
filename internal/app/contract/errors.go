@@ -135,7 +135,15 @@ func AsAppError(err error) (*AppError, bool) {
 // FromDomainError maps a domain policy error onto the app error contract so a
 // service does not have to classify each sentinel by hand. The domain error is
 // kept as the cause and its code and fields are carried through when present.
-func FromDomainError(err error) *AppError {
+//
+// It returns error rather than *AppError on purpose. A helper returning a
+// concrete pointer type turns `return FromDomainError(err)` in an
+// error-returning Validate into a non-nil interface holding a nil pointer
+// whenever err is nil, so every valid input would be reported as a failure.
+// Returning the interface makes the nil case a genuine nil. Use AsAppError
+// when you need the concrete value back, and NewAppError/WrapAppError when
+// you want to keep decorating with WithField.
+func FromDomainError(err error) error {
 	if err == nil {
 		return nil
 	}

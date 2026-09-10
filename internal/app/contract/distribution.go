@@ -2,6 +2,7 @@ package contract
 
 import (
 	"fmt"
+	"unicode/utf8"
 
 	"cert-me/internal/domain"
 	"cert-me/internal/secret"
@@ -118,13 +119,58 @@ type DownloadCommand struct {
 	PKCS12Password *secret.Input  `json:"-"`
 }
 
-// Validate checks the query-derived fields. RawToken presence/shape is
-// intentionally not string-inspected here: the token is a secret and its
-// only real validation is the grant hash lookup Deliver performs inside the
-// transaction, not a client-visible format check.
+// rawTokenMinLength/rawTokenMaxLength are the /download/{token} path
+// parameter's minLength/maxLength from api/openapi.json.
+const (
+	rawTokenMinLength = 32
+	rawTokenMaxLength = 256
+)
+
+// validateSecretRuneLength measures a secret's plaintext length in runes
+// without ever letting the plaintext escape the secret.Input.Use callback:
+// the callback only ever produces a count and an ok/invalid-UTF-8 verdict,
+// never the bytes themselves. Invalid UTF-8 makes the rune count meaningless,
+// so it is rejected outright rather than counted some other way.
+func validateSecretRuneLength(in *secret.Input, min, max int) error {
+	if in == nil || in.IsEmpty() {
+		return fmt.Errorf("%w: value must not be empty", domain.ErrInvalidValue)
+	}
+	var (
+		count   int
+		invalid bool
+	)
+	err := in.Use(func(b []byte) error {
+		for len(b) > 0 {
+			r, size := utf8.DecodeRune(b)
+			if r == utf8.RuneError && size <= 1 {
+				invalid = true
+				return nil
+			}
+			count++
+			b = b[size:]
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("%w: value is unavailable", domain.ErrInvalidValue)
+	}
+	if invalid {
+		return fmt.Errorf("%w: value must be valid UTF-8", domain.ErrInvalidValue)
+	}
+	if count < min || count > max {
+		return fmt.Errorf("%w: value must be %d..%d characters", domain.ErrInvalidValue, min, max)
+	}
+	return nil
+}
+
+// Validate checks the query-derived fields. RawToken's only shape check is
+// the path parameter's minLength/maxLength bound (api/openapi.json
+// /download/{token}.token: minLength 32, maxLength 256); beyond that it is a
+// secret and its real validation is the grant hash lookup Deliver performs
+// inside the transaction, not a client-visible format check.
 func (c DownloadCommand) Validate() error {
-	if c.RawToken == nil || c.RawToken.IsEmpty() {
-		return NewAppError(ErrorKindValidation, "raw_token_required", "a download token is required")
+	if err := validateSecretRuneLength(c.RawToken, rawTokenMinLength, rawTokenMaxLength); err != nil {
+		return NewAppError(ErrorKindValidation, "raw_token_invalid", fmt.Sprintf("a download token must be %d..%d characters", rawTokenMinLength, rawTokenMaxLength))
 	}
 	if err := c.Format.Validate(); err != nil {
 		return FromDomainError(err)

@@ -3,6 +3,7 @@ package contract
 import (
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	"cert-me/internal/domain"
 )
@@ -72,10 +73,16 @@ func RevocationReasonView(r domain.RevocationReason) string {
 
 const maxJustificationLength = 4096
 
-// validateJustification is shared by every command in this file that carries
-// a free-text justification (Revoke, Correct, ReportFailure in
-// distribution.go). The OpenAPI Justification/Revoke/RevocationCorrection
-// schemas all cap it at 4096 characters.
+// validateJustification is shared by every command that carries a free-text
+// justification (Revoke, Correct, ReportFailure in distribution.go, DestroyKey
+// in authority.go). The OpenAPI Justification/Revoke/RevocationCorrection/
+// KeyDestruction schemas all cap it at 4096 characters, and a JSON schema
+// maxLength counts characters rather than bytes, so this measures runes for
+// the same reason the password checks in setup.go do.
+//
+// The offending value is never attached to the error as a public field: it is
+// operator free text of up to 4096 characters and echoing it back only makes
+// the error payload as large as the input that was just rejected.
 func validateJustification(justification string, required bool) error {
 	if justification == "" {
 		if required {
@@ -83,7 +90,7 @@ func validateJustification(justification string, required bool) error {
 		}
 		return nil
 	}
-	if len(justification) > maxJustificationLength {
+	if utf8.RuneCountInString(justification) > maxJustificationLength {
 		return NewAppError(ErrorKindValidation, "justification_too_long", "justification must be at most 4096 characters")
 	}
 	return nil

@@ -10,6 +10,31 @@ import (
 	"cert-me/internal/secret"
 )
 
+// TestDownloadPurposeInput_ExhaustiveAgainstOpenAPI is Q2's "check for any
+// other enum bridged similarly": DownloadPurposeInput bridges OpenAPI's
+// DownloadLinkRequest.purpose enum ("public"/"private") onto
+// domain.GrantPurpose ("leaf_public"/"leaf_private"). Unlike
+// RevocationReasonInput/DeploymentActionInput there is no reverse (domain ->
+// wire) direction exercised anywhere in this package, so only the wire ->
+// domain direction is checked here, exhaustively against the live document.
+func TestDownloadPurposeInput_ExhaustiveAgainstOpenAPI(t *testing.T) {
+	wireValues := loadOpenAPIStringEnum(t, "DownloadLinkRequest", "purpose")
+	if len(wireValues) != 2 {
+		t.Fatalf("api/openapi.json DownloadLinkRequest.purpose enum has %d values, expected 2: %v", len(wireValues), wireValues)
+	}
+	seenDomain := make(map[domain.GrantPurpose]string, len(wireValues))
+	for _, wire := range wireValues {
+		purpose, err := DownloadPurposeInput(wire).Domain()
+		if err != nil {
+			t.Fatalf("wire purpose %q has no mapping to a domain.GrantPurpose: %v", wire, err)
+		}
+		if prev, dup := seenDomain[purpose]; dup {
+			t.Fatalf("wire purposes %q and %q both map to the same domain.GrantPurpose %q", prev, wire, purpose)
+		}
+		seenDomain[purpose] = wire
+	}
+}
+
 func TestDistributionCreateLinkCommand_ValidateRejectsForeignID(t *testing.T) {
 	cmd := DistributionCreateLinkCommand{CertificateID: "definitely-not-a-uuid", Purpose: DownloadPurposePublic}
 	if err := cmd.Validate(); err == nil {
@@ -48,8 +73,50 @@ func TestDownloadCommand_ValidateRequiresRawToken(t *testing.T) {
 	}
 }
 
+// TestDownloadCommand_ValidateEnforcesRawTokenLength is Q3: the
+// /download/{token} path parameter declares minLength 32 / maxLength 256 in
+// api/openapi.json, but DownloadCommand.Validate did not check RawToken's
+// length at all. It must reject a too-short token, a too-long token, and a
+// token that is not valid UTF-8 (rune length is undefined on invalid
+// UTF-8), and accept a token whose length sits inside [32, 256].
+func TestDownloadCommand_ValidateEnforcesRawTokenLength(t *testing.T) {
+	mk := func(s string) *secret.Input { return secret.FromString(s) }
+
+	tooShort := mk(strings.Repeat("a", 31))
+	defer tooShort.Close()
+	if err := (DownloadCommand{RawToken: tooShort, Format: DownloadFormatPEM}).Validate(); err == nil {
+		t.Fatal("expected a 31-byte raw token (below minLength 32) to be rejected")
+	}
+
+	tooLong := mk(strings.Repeat("a", 257))
+	defer tooLong.Close()
+	if err := (DownloadCommand{RawToken: tooLong, Format: DownloadFormatPEM}).Validate(); err == nil {
+		t.Fatal("expected a 257-byte raw token (above maxLength 256) to be rejected")
+	}
+
+	invalidUTF8 := secret.New([]byte{0xff, 0xfe, 0xfd})
+	// Pad to at least 32 bytes so only the UTF-8 validity is under test.
+	invalidUTF8 = secret.New(append([]byte{0xff, 0xfe, 0xfd}, []byte(strings.Repeat("a", 32))...))
+	defer invalidUTF8.Close()
+	if err := (DownloadCommand{RawToken: invalidUTF8, Format: DownloadFormatPEM}).Validate(); err == nil {
+		t.Fatal("expected a raw token containing invalid UTF-8 to be rejected")
+	}
+
+	valid := mk(strings.Repeat("a", 32))
+	defer valid.Close()
+	if err := (DownloadCommand{RawToken: valid, Format: DownloadFormatPEM}).Validate(); err != nil {
+		t.Fatalf("expected a 32-byte raw token to be accepted: %v", err)
+	}
+
+	validMax := mk(strings.Repeat("a", 256))
+	defer validMax.Close()
+	if err := (DownloadCommand{RawToken: validMax, Format: DownloadFormatPEM}).Validate(); err != nil {
+		t.Fatalf("expected a 256-byte raw token to be accepted: %v", err)
+	}
+}
+
 func TestDownloadCommand_ValidateRejectsBadFormatAndPart(t *testing.T) {
-	tok := secret.FromString("token-value")
+	tok := secret.FromString(strings.Repeat("a", 32))
 	defer tok.Close()
 
 	badFormat := DownloadCommand{RawToken: tok, Format: "not_a_format"}
@@ -64,7 +131,7 @@ func TestDownloadCommand_ValidateRejectsBadFormatAndPart(t *testing.T) {
 }
 
 func TestDownloadCommand_ValidateRejectsPKCS12PasswordWithoutPKCS12Format(t *testing.T) {
-	tok := secret.FromString("token-value")
+	tok := secret.FromString(strings.Repeat("a", 32))
 	defer tok.Close()
 	pw := secret.FromString("password")
 	defer pw.Close()

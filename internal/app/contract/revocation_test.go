@@ -13,6 +13,40 @@ const testCertID = "00000000-0000-4000-8000-000000000001"
 const testKeyMaterialID = "00000000-0000-4000-8000-000000000002"
 const testRevocationID = "00000000-0000-4000-8000-000000000003"
 
+// TestRevocationReasonMapping_ExhaustiveAgainstOpenAPI is Q2: it reads
+// api/openapi.json's Revoke.reason enum at test time (rather than a
+// hardcoded Go slice) and asserts every wire value there maps, via
+// revocationReasonToDomain/RevocationReasonInput.Domain, to a distinct,
+// valid domain.RevocationReason, and that domainToRevocationReason/
+// RevocationReasonView round-trips back to the original wire value. Because
+// the wire-value list comes from the live document, a future enum value
+// added to api/openapi.json without updating the mapping table fails this
+// test; a value removed from the domain side without updating the table
+// also fails via the "maps to a distinct valid reason" check.
+func TestRevocationReasonMapping_ExhaustiveAgainstOpenAPI(t *testing.T) {
+	wireValues := loadOpenAPIStringEnum(t, "Revoke", "reason")
+	if len(wireValues) != 8 {
+		t.Fatalf("api/openapi.json Revoke.reason enum has %d values, expected 8 (report this as a finding rather than forcing the count): %v", len(wireValues), wireValues)
+	}
+
+	seenDomain := make(map[domain.RevocationReason]string, len(wireValues))
+	for _, wire := range wireValues {
+		reason, err := RevocationReasonInput(wire).Domain()
+		if err != nil {
+			t.Fatalf("wire reason %q has no mapping to a domain.RevocationReason: %v", wire, err)
+		}
+		if prev, dup := seenDomain[reason]; dup {
+			t.Fatalf("wire reasons %q and %q both map to the same domain.RevocationReason %q -- mapping is not bijective", prev, wire, reason)
+		}
+		seenDomain[reason] = wire
+
+		back := RevocationReasonView(reason)
+		if back != wire {
+			t.Fatalf("round-trip mismatch: wire %q -> domain %q -> wire %q", wire, reason, back)
+		}
+	}
+}
+
 func TestRevocationRevokeCommand_ValidateRejectsForeignOrMalformedID(t *testing.T) {
 	cases := []struct {
 		name string

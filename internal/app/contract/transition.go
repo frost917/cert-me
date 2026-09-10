@@ -173,14 +173,29 @@ const (
 	TransitionStateViewClosed              TransitionStateView = "closed"
 )
 
-// DeploymentView is the OpenAPI Deployment data object.
+// DeploymentView is the OpenAPI Deployment data object. Action is the wire
+// enum type (DeploymentActionInput), not domain.DeploymentAction: this file's
+// header NOTE says views expose the OpenAPI wire values directly, and
+// Deployment.action's wire spelling differs from the domain enum (e.g.
+// "certificate_installed" vs domain.DeploymentActionCertReplaced's
+// "cert_key_replaced"), so a domain-typed field here would let an adapter
+// emit a value api/openapi.json's enum rejects. Build it with
+// NewDeploymentActionView so the mapping stays the single deliberate
+// translation point.
 type DeploymentView struct {
 	ID            string // deployment_confirmations has no dedicated typed ID in domain
 	TargetLabel   string
 	CertificateID *domain.CertificateID
-	Action        domain.DeploymentAction
+	Action        DeploymentActionInput
 	ConfirmedAt   domain.Instant
 	ConfirmedBy   domain.AccountID
+}
+
+// NewDeploymentActionView converts a domain action to the wire-view value
+// DeploymentView.Action holds, using the same total, bijective mapping table
+// DeploymentActionInput.Domain() reads in the other direction.
+func NewDeploymentActionView(a domain.DeploymentAction) DeploymentActionInput {
+	return DeploymentActionInput(DeploymentActionView(a))
 }
 
 // TransitionView is the OpenAPI Transition data object.

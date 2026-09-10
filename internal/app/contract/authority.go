@@ -165,8 +165,6 @@ func (c AuthoritySetIssuanceStateCommand) Validate() error {
 	return nil
 }
 
-const maxJustificationLength = 4096
-
 // AuthorityDestroyKeyCommand is the JSON decode target for the OpenAPI
 // KeyDestruction schema.
 type AuthorityDestroyKeyCommand struct {
@@ -184,8 +182,11 @@ func (c AuthorityDestroyKeyCommand) Validate() error {
 	}
 	// KeyDestruction lists justification as required, so an empty string
 	// (not just one over the max length) must be rejected.
-	if c.Justification == "" || len(c.Justification) > maxJustificationLength {
-		return NewAppError(ErrorKindValidation, "invalid_justification", "justification is required and must be at most 4096 characters").WithField("justification", c.Justification)
+	// KeyDestruction lists justification as required, so an empty value is
+	// rejected here through the same shared check every other justification
+	// field uses.
+	if err := validateJustification(c.Justification, true); err != nil {
+		return err
 	}
 	return nil
 }

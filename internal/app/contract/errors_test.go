@@ -93,7 +93,10 @@ func TestFromDomainError_CarriesCodeFieldsAndSentinel(t *testing.T) {
 	policyErr := domain.NewPolicyError(domain.ErrConflict, "version_mismatch", "the record changed").
 		WithField("field", "version")
 
-	appErr := FromDomainError(policyErr)
+	appErr, ok := AsAppError(FromDomainError(policyErr))
+	if !ok {
+		t.Fatal("FromDomainError did not produce an AppError")
+	}
 	if appErr.Kind() != ErrorKindConflict {
 		t.Fatalf("kind %q, want conflict", appErr.Kind())
 	}
@@ -109,7 +112,10 @@ func TestFromDomainError_CarriesCodeFieldsAndSentinel(t *testing.T) {
 }
 
 func TestFromDomainError_MapsNotPermittedToForbidden(t *testing.T) {
-	appErr := FromDomainError(domain.ErrNotPermitted)
+	appErr, ok := AsAppError(FromDomainError(domain.ErrNotPermitted))
+	if !ok {
+		t.Fatal("FromDomainError did not produce an AppError")
+	}
 	if appErr.Kind() != ErrorKindForbidden {
 		t.Fatalf("kind %q, want forbidden", appErr.Kind())
 	}
@@ -127,23 +133,18 @@ func TestFromDomainError_PassesThroughAnExistingAppError(t *testing.T) {
 	}
 }
 
-// FromDomainError returns a *AppError, so `return FromDomainError(err)` from a
-// function declared to return `error` produces a NON-NIL error interface
-// holding a nil pointer whenever err is nil. This test pins that hazard so the
-// helper's nil contract is explicit: callers must only reach it inside an
-// `if err != nil` branch. A Validate that returns it unconditionally will
-// report failure for every valid command.
-func TestFromDomainError_NilReturnsATypedNilPointer(t *testing.T) {
+// FromDomainError must return a genuinely nil error for a nil input. It
+// returns the error interface rather than *AppError precisely so that
+// `return FromDomainError(err)` from an error-returning Validate cannot box a
+// nil pointer into a non-nil interface -- a trap that reports every valid
+// command as invalid, and one a developer hit during B02.
+func TestFromDomainError_NilIsATrulyNilError(t *testing.T) {
 	if got := FromDomainError(nil); got != nil {
-		t.Fatalf("FromDomainError(nil) returned %v, want a nil *AppError", got)
+		t.Fatalf("FromDomainError(nil) returned a non-nil error: %#v", got)
 	}
 
-	// Demonstrate the trap the nil pointer creates at an `error` boundary.
 	boxed := func() error { return FromDomainError(nil) }()
-	if boxed == nil {
-		t.Skip("a nil *AppError no longer boxes as a non-nil error; the hazard is gone")
-	}
-	if _, ok := AsAppError(boxed); !ok {
-		t.Fatal("the boxed value is not recognisable as an AppError")
+	if boxed != nil {
+		t.Fatalf("returning FromDomainError(nil) through an error boundary produced %#v", boxed)
 	}
 }

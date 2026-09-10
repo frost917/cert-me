@@ -2,6 +2,7 @@ package contract
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -105,6 +106,79 @@ func TestDeploymentActionInput_RoundTrip(t *testing.T) {
 		}
 		if back := DeploymentActionView(d); DeploymentActionInput(back) != wire {
 			t.Fatalf("round-trip mismatch: %q -> %q -> %q", wire, d, back)
+		}
+	}
+}
+
+// TestDeploymentView_ActionFieldIsWireType is Q1: transition.go's file
+// header says "Views below expose the OpenAPI wire values directly
+// (TransitionStateView, DeploymentActionInput/View) with an explicit
+// mapping to the domain enum" -- but DeploymentView.Action was declared as
+// domain.DeploymentAction (domain values like "cert_key_replaced"), not the
+// wire enum (api/openapi.json Deployment.action: trust_added /
+// certificate_installed / trust_removed). An adapter trusting the header
+// comment and emitting DeploymentView.Action as-is would produce a value
+// the OpenAPI schema rejects. This test pins the field's static type to
+// DeploymentActionInput, the wire-view type already used for the input
+// side.
+func TestDeploymentView_ActionFieldIsWireType(t *testing.T) {
+	field, ok := reflect.TypeOf(DeploymentView{}).FieldByName("Action")
+	if !ok {
+		t.Fatal("DeploymentView has no Action field")
+	}
+	wantType := reflect.TypeOf(DeploymentActionInput(""))
+	if field.Type != wantType {
+		t.Fatalf("DeploymentView.Action must be %s (the OpenAPI wire enum view type), got %s -- "+
+			"the file header claims views expose wire values directly, so a domain-typed Action "+
+			"would let an adapter emit a value api/openapi.json's Deployment.action enum rejects",
+			wantType, field.Type)
+	}
+}
+
+// TestDeploymentActionMapping_ExhaustiveRoundTrip is Q1/Q2: every
+// domain.DeploymentAction constant (internal/domain/transition.go lines
+// 287-289: DeploymentActionTrustAdded, DeploymentActionCertReplaced,
+// DeploymentActionTrustRemoved -- domain.DeploymentAction exports no
+// enumerator, so they are listed here by hand) must map to a distinct,
+// valid entry of api/openapi.json's Deployment.action enum, and mapping
+// back must reproduce the original domain value. This is the "total
+// mapping function, both directions" the finding calls for, verified
+// against the live OpenAPI document rather than a hardcoded wire list, so
+// a future domain action added without updating the mapping table fails
+// here.
+func TestDeploymentActionMapping_ExhaustiveRoundTrip(t *testing.T) {
+	wireEnum := loadOpenAPIStringEnum(t, "Deployment", "action")
+	wireEnumSet := make(map[string]struct{}, len(wireEnum))
+	for _, w := range wireEnum {
+		wireEnumSet[w] = struct{}{}
+	}
+
+	domainActions := []domain.DeploymentAction{
+		domain.DeploymentActionTrustAdded,
+		domain.DeploymentActionCertReplaced,
+		domain.DeploymentActionTrustRemoved,
+	}
+	if len(domainActions) != len(wireEnum) {
+		t.Fatalf("domain.DeploymentAction has %d values but api/openapi.json Deployment.action enum has %d -- mapping table is no longer total", len(domainActions), len(wireEnum))
+	}
+
+	seenWire := make(map[DeploymentActionInput]domain.DeploymentAction, len(domainActions))
+	for _, d := range domainActions {
+		wire := DeploymentActionInput(DeploymentActionView(d))
+		if _, ok := wireEnumSet[string(wire)]; !ok {
+			t.Fatalf("domain action %q maps to wire value %q, which is not in api/openapi.json's Deployment.action enum %v", d, wire, wireEnum)
+		}
+		if prev, dup := seenWire[wire]; dup {
+			t.Fatalf("domain actions %q and %q both map to the same wire value %q -- mapping is not bijective", prev, d, wire)
+		}
+		seenWire[wire] = d
+
+		back, err := wire.Domain()
+		if err != nil {
+			t.Fatalf("wire value %q (from domain action %q) failed to map back: %v", wire, d, err)
+		}
+		if back != d {
+			t.Fatalf("round-trip mismatch: domain %q -> wire %q -> domain %q", d, wire, back)
 		}
 	}
 }
