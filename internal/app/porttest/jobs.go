@@ -42,6 +42,27 @@ func (r jobRepo) UpsertDemand(_ context.Context, dedupKey, kind string, payloadV
 		existing.Kind = kind
 		existing.PayloadVersion = payloadVersion
 		existing.Payload = cloneBytes(payload)
+		// A finished row must go back to pending. Merging a new demand into a
+		// succeeded/failed row and leaving its state alone would mean CRL
+		// publication never runs again after its first success, because the
+		// row stays terminal and ClaimDue only considers pending and running
+		// rows (docs/data-model.md:159 "작업 완료 시 같은 dedup_key에 새 작업
+		// 요구가 들어왔는지 generation/version을 검사하고 그 요구까지 삭제하지
+		// 않는다").
+		//
+		// The previous run's lease and retry backoff are cleared with it: the
+		// demand is new work, not a continuation of the finished attempt, so
+		// an AvailableAt left over from the old run's backoff must not delay
+		// it and the old attempt count must not push it toward a retry limit.
+		// A running row is deliberately left alone -- its lease still belongs
+		// to a live worker, which re-reads the row on completion.
+		if existing.State == contract.JobStateSucceeded || existing.State == contract.JobStateFailed {
+			existing.State = contract.JobStatePending
+			existing.LeaseUntil = domain.Instant{}
+			existing.AvailableAt = domain.Instant{}
+			existing.AttemptCount = 0
+			existing.LastErrorCode = ""
+		}
 		existing.Version = existing.Version.Next()
 		r.s.jobs[id] = existing
 		return nil

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"cert-me/internal/app/contract"
+	"cert-me/internal/app/port"
 )
 
 // TestUpsertDemand_MergesIntoRunningRowInsteadOfSpawningSecond is J1's
@@ -173,5 +174,114 @@ func TestClaimDue_ReclaimsExpiredLease(t *testing.T) {
 	}
 	if second.LeaseUntil != instant(300) {
 		t.Fatalf("expected the new lease to be stamped, got %v", second.LeaseUntil)
+	}
+}
+
+// A finished job must go back to pending when a new demand arrives under the
+// same dedup key. Without this, CRL publication stops permanently after its
+// first success: the row stays terminal and ClaimDue only considers pending
+// and running rows.
+func TestUpsertDemand_ResumesTerminalRowsOnANewDemand(t *testing.T) {
+	for _, terminal := range []contract.JobState{contract.JobStateSucceeded, contract.JobStateFailed} {
+		t.Run(string(terminal), func(t *testing.T) {
+			store := NewStore()
+			ctx := context.Background()
+			const key = "crl:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+			must := func(err error) {
+				t.Helper()
+				if err != nil {
+					t.Fatalf("write: %v", err)
+				}
+			}
+
+			must(store.Write(ctx, func(tx port.TxStores) error {
+				return tx.Jobs().UpsertDemand(ctx, key, "crl_publish", 1, []byte("{}"))
+			}))
+			var claimed []port.Job
+			must(store.Write(ctx, func(tx port.TxStores) error {
+				var err error
+				claimed, err = tx.Jobs().ClaimDue(ctx, instant(100), instant(200), 10)
+				return err
+			}))
+			if len(claimed) != 1 {
+				t.Fatalf("first claim returned %d jobs, want 1", len(claimed))
+			}
+
+			// The worker finishes the run and records the terminal state.
+			done := claimed[0]
+			done.State = terminal
+			done.LastErrorCode = "previous_run"
+			done.AvailableAt = instant(9999) // a retry backoff from the old run
+			must(store.Write(ctx, func(tx port.TxStores) error {
+				return tx.Jobs().Save(ctx, done, done.Version)
+			}))
+
+			// A new revocation arrives under the same dedup key.
+			must(store.Write(ctx, func(tx port.TxStores) error {
+				return tx.Jobs().UpsertDemand(ctx, key, "crl_publish", 1, []byte(`{"gen":2}`))
+			}))
+
+			var again []port.Job
+			must(store.Write(ctx, func(tx port.TxStores) error {
+				var err error
+				again, err = tx.Jobs().ClaimDue(ctx, instant(300), instant(400), 10)
+				return err
+			}))
+			if len(again) != 1 {
+				t.Fatalf("after a new demand on a %s job, ClaimDue returned %d jobs, want 1", terminal, len(again))
+			}
+			// Still one row, and the old run's backoff and error must not
+			// have followed the new demand.
+			if again[0].ID != done.ID {
+				t.Fatalf("a second row was created: %q then %q", done.ID, again[0].ID)
+			}
+			if again[0].LastErrorCode != "" {
+				t.Fatalf("the previous run's error code survived: %q", again[0].LastErrorCode)
+			}
+			if again[0].AttemptCount != 1 {
+				t.Fatalf("attempt count is %d, want 1 for a fresh demand's first claim", again[0].AttemptCount)
+			}
+		})
+	}
+}
+
+// A running row's lease belongs to a live worker and must not be disturbed by
+// a new demand: only terminal rows are resumed.
+func TestUpsertDemand_LeavesARunningRowsLeaseAlone(t *testing.T) {
+	store := NewStore()
+	ctx := context.Background()
+	const key = "crl:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	must(store.Write(ctx, func(tx port.TxStores) error {
+		return tx.Jobs().UpsertDemand(ctx, key, "crl_publish", 1, []byte("{}"))
+	}))
+	var claimed []port.Job
+	must(store.Write(ctx, func(tx port.TxStores) error {
+		var err error
+		claimed, err = tx.Jobs().ClaimDue(ctx, instant(100), instant(200), 10)
+		return err
+	}))
+	must(store.Write(ctx, func(tx port.TxStores) error {
+		return tx.Jobs().UpsertDemand(ctx, key, "crl_publish", 1, []byte(`{"gen":2}`))
+	}))
+
+	var got port.Job
+	must(store.Read(ctx, func(tx port.TxStores) error {
+		var err error
+		got, err = tx.Jobs().GetForUpdate(ctx, claimed[0].ID)
+		return err
+	}))
+	if got.State != contract.JobStateRunning {
+		t.Fatalf("state is %q, want the running row left alone", got.State)
+	}
+	if !got.LeaseUntil.Equal(instant(200)) {
+		t.Fatalf("lease is %v, want the live worker's lease preserved", got.LeaseUntil)
 	}
 }

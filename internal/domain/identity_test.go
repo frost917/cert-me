@@ -642,10 +642,12 @@ func TestIdentityResetTransitionsBumpVersion(t *testing.T) {
 // would either create a duplicate account or fail to log in, with no error.
 func TestNormalizeLoginName(t *testing.T) {
 	tests := map[string]string{
-		"Admin":        "admin",
-		"ADMIN":        "admin",
-		"admin":        "admin",
-		"  admin  ":    "admin",
+		"Admin": "admin",
+		"ADMIN": "admin",
+		"admin": "admin",
+		// Whitespace is not rescued: it is invalid input the contract layer
+		// rejects before normalization ever runs.
+		"  admin  ":    "  admin  ",
 		"Ops.Team_1-A": "ops.team_1-a",
 		"":             "",
 	}

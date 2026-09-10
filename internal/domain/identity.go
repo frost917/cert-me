@@ -103,16 +103,21 @@ type Account struct {
 // go through it: if the two paths normalized differently, a case variant would
 // either create a duplicate account or fail to log in, silently.
 //
-// The transform is ASCII lowercasing after trimming surrounding whitespace.
-// That is sufficient and total here because the login-name charset is
+// The transform is ASCII lowercasing and nothing else. It deliberately does
+// NOT trim surrounding whitespace: character-set and length validation runs
+// first, at the contract layer, and a login name containing a space is
+// invalid input to be rejected rather than input to be rescued by
+// normalization ([backend-implementation.md §13] "외부 로그인 이름은 문자·
+// 길이를 먼저 검증하며 공백 입력을 trim으로 구제하지 않습니다").
+//
+// Lowercasing is sufficient and total here because the login-name charset is
 // restricted to [A-Za-z0-9._-] by the OpenAPI Credentials schema, so there is
 // no Unicode case-folding or normalization form to consider. data-model.md
 // also requires identifier comparison to carry plain byte-comparison meaning
 // rather than relying on a database collation, which is what a Go-side
 // deterministic transform gives.
 func NormalizeLoginName(raw string) string {
-	trimmed := strings.TrimSpace(raw)
-	out := []byte(trimmed)
+	out := []byte(raw)
 	for i := 0; i < len(out); i++ {
 		if out[i] >= 'A' && out[i] <= 'Z' {
 			out[i] += 'a' - 'A'
