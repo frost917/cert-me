@@ -97,6 +97,30 @@ type Account struct {
 	version             Version
 }
 
+// NormalizeLoginName is the single canonical transform from a login name as
+// typed to the value stored in accounts.normalized_login_name (data-model.md).
+// Both the uniqueness check on account creation and the lookup on login must
+// go through it: if the two paths normalized differently, a case variant would
+// either create a duplicate account or fail to log in, silently.
+//
+// The transform is ASCII lowercasing after trimming surrounding whitespace.
+// That is sufficient and total here because the login-name charset is
+// restricted to [A-Za-z0-9._-] by the OpenAPI Credentials schema, so there is
+// no Unicode case-folding or normalization form to consider. data-model.md
+// also requires identifier comparison to carry plain byte-comparison meaning
+// rather than relying on a database collation, which is what a Go-side
+// deterministic transform gives.
+func NormalizeLoginName(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	out := []byte(trimmed)
+	for i := 0; i < len(out); i++ {
+		if out[i] >= 'A' && out[i] <= 'Z' {
+			out[i] += 'a' - 'A'
+		}
+	}
+	return string(out)
+}
+
 // AccountFacts is the constructor input for rehydrating an Account from
 // storage. It carries every field the row-level invariants below need.
 type AccountFacts struct {
@@ -117,6 +141,13 @@ func NewAccount(facts AccountFacts) (Account, error) {
 	}
 	if strings.TrimSpace(facts.NormalizedLoginName) == "" {
 		return Account{}, NewPolicyError(ErrInvalidValue, "invalid_login_name", "normalized login name must not be empty")
+	}
+	// Reject a value that is not already canonical. Storing a non-normalized
+	// name would defeat the normalized_login_name uniqueness constraint and
+	// make a later lookup by the same name miss.
+	if facts.NormalizedLoginName != NormalizeLoginName(facts.NormalizedLoginName) {
+		return Account{}, NewPolicyError(ErrInvalidValue, "login_name_not_normalized",
+			"normalized login name must already be normalized with NormalizeLoginName")
 	}
 	if facts.PasswordHash.IsZero() {
 		return Account{}, NewPolicyError(ErrInvalidValue, "invalid_password_hash", "account must have a password hash")

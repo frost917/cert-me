@@ -39,6 +39,11 @@ type AccountRepository interface {
 	// own conflict error, not by pre-checking with this method.
 	GetAccountForUpdate(ctx context.Context, id domain.AccountID) (domain.Account, error)
 
+	// The name passed in MUST be the output of domain.NormalizeLoginName --
+	// the same transform accounts.normalized_login_name is stored with. A
+	// caller that normalizes differently, or not at all, silently fails to
+	// find an account that exists.
+	//
 	// FindAccountByLoginName resolves a login attempt's normalized login
 	// name to an account, without locking -- the same "unlocked resolve,
 	// then lock by ID inside the write" split FindSessionByHash/

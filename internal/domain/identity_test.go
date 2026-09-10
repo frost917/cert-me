@@ -636,3 +636,53 @@ func TestIdentityResetTransitionsBumpVersion(t *testing.T) {
 		t.Errorf("reissue version = %d, want %d", got.Int64(), want.Int64())
 	}
 }
+
+// Normalization must be the one place a login name becomes canonical. If the
+// account-creation path and the login-lookup path disagreed, a case variant
+// would either create a duplicate account or fail to log in, with no error.
+func TestNormalizeLoginName(t *testing.T) {
+	tests := map[string]string{
+		"Admin":        "admin",
+		"ADMIN":        "admin",
+		"admin":        "admin",
+		"  admin  ":    "admin",
+		"Ops.Team_1-A": "ops.team_1-a",
+		"":             "",
+	}
+	for raw, want := range tests {
+		if got := NormalizeLoginName(raw); got != want {
+			t.Errorf("NormalizeLoginName(%q) = %q, want %q", raw, got, want)
+		}
+	}
+	// The transform must be idempotent: applying it to an already-normalized
+	// value is what the Account constructor relies on to detect a bad input.
+	for raw := range tests {
+		once := NormalizeLoginName(raw)
+		if twice := NormalizeLoginName(once); twice != once {
+			t.Errorf("NormalizeLoginName is not idempotent for %q: %q then %q", raw, once, twice)
+		}
+	}
+}
+
+// An Account must not be constructible with a non-canonical login name:
+// storing one would defeat the normalized_login_name uniqueness constraint.
+func TestNewAccount_RejectsUnnormalizedLoginName(t *testing.T) {
+	hash, err := NewPasswordHash("$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$aGFzaA")
+	if err != nil {
+		t.Fatalf("NewPasswordHash: %v", err)
+	}
+	facts := AccountFacts{
+		ID:                  AccountID("11111111-1111-4111-8111-111111111111"),
+		NormalizedLoginName: "Admin",
+		PasswordHash:        hash,
+		State:               AccountStateActive,
+	}
+	if _, err := NewAccount(facts); err == nil {
+		t.Fatal("NewAccount accepted a login name that was not normalized")
+	}
+
+	facts.NormalizedLoginName = NormalizeLoginName("Admin")
+	if _, err := NewAccount(facts); err != nil {
+		t.Fatalf("NewAccount rejected a properly normalized login name: %v", err)
+	}
+}
