@@ -171,6 +171,11 @@ func (t Transition) SetTarget(targetAuthorityID AuthorityID, now Instant) (Trans
 	next := t
 	next.targetAuthorityID = targetAuthorityID
 	next.version = t.version.Next()
+	// now is accepted for signature uniformity with every other domain
+	// transition, but ca_transitions stores no timestamp beyond reported_at
+	// (data-model.md), so there is nothing here to stamp. This is a schema
+	// fact, not an oversight: if a closed_at/completed_at column is ever
+	// added, the value is already threaded in.
 	_ = now
 	return next, nil
 }
@@ -188,6 +193,11 @@ func (t Transition) ConfirmDeployment(now Instant) error {
 		return NewPolicyError(ErrInvalidTransition, "transition_not_in_progress",
 			"transition is no longer in_progress")
 	}
+	// now is accepted for signature uniformity with every other domain
+	// transition, but ca_transitions stores no timestamp beyond reported_at
+	// (data-model.md), so there is nothing here to stamp. This is a schema
+	// fact, not an oversight: if a closed_at/completed_at column is ever
+	// added, the value is already threaded in.
 	_ = now
 	return nil
 }
@@ -234,6 +244,11 @@ func (t Transition) Complete(facts TransitionClosureFacts, now Instant) (Transit
 	next := t
 	next.state = TransitionStateExternallyCompleted
 	next.version = t.version.Next()
+	// now is accepted for signature uniformity with every other domain
+	// transition, but ca_transitions stores no timestamp beyond reported_at
+	// (data-model.md), so there is nothing here to stamp. This is a schema
+	// fact, not an oversight: if a closed_at/completed_at column is ever
+	// added, the value is already threaded in.
 	_ = now
 	return next, nil
 }
@@ -272,6 +287,11 @@ func (t Transition) Close(facts TransitionTerminationFacts, now Instant) (Transi
 	next := t
 	next.state = TransitionStateClosed
 	next.version = t.version.Next()
+	// now is accepted for signature uniformity with every other domain
+	// transition, but ca_transitions stores no timestamp beyond reported_at
+	// (data-model.md), so there is nothing here to stamp. This is a schema
+	// fact, not an oversight: if a closed_at/completed_at column is ever
+	// added, the value is already threaded in.
 	_ = now
 	return next, nil
 }
