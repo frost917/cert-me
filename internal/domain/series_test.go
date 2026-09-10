@@ -6,18 +6,29 @@ import (
 	"time"
 )
 
-func baseSeriesFacts(rotateEvery int) LeafSeriesFacts {
+func baseSeriesFacts(t *testing.T, rotateEvery int) LeafSeriesFacts {
+	t.Helper()
 	return LeafSeriesFacts{
-		ID:                    SeriesID("66666666-6666-6666-6666-666666666666"),
-		Name:                  "web-frontend",
-		Purpose:               SeriesPurposeDistributed,
-		ManagementAuthorityID: AuthorityID("11111111-1111-1111-1111-111111111111"),
+		ID:                     SeriesID("66666666-6666-6666-6666-666666666666"),
+		Name:                   "web-frontend",
+		Purpose:                SeriesPurposeDistributed,
+		ManagementAuthorityID:  AuthorityID("11111111-1111-1111-1111-111111111111"),
+		CurrentKeyGenerationID: LeafKeyGenerationID("77777777-7777-7777-7777-777777777777"),
 		Policy: SeriesPolicy{
 			RotateEvery:         rotateEvery,
-			CertificateValidity: NewDuration(365 * 24 * time.Hour),
+			CertificateValidity: mustCalendarValidity(t, 1, ValidityUnitYears),
 		},
 		Version: 1,
 	}
+}
+
+func mustCalendarValidity(t *testing.T, value int, unit ValidityUnit) CalendarValidity {
+	t.Helper()
+	v, err := NewCalendarValidity(value, unit)
+	if err != nil {
+		t.Fatalf("NewCalendarValidity: %v", err)
+	}
+	return v
 }
 
 func baseKeyGeneration(t *testing.T, seriesID SeriesID, generationNo, renewalCount int) LeafKeyGeneration {
@@ -41,7 +52,7 @@ func baseKeyGeneration(t *testing.T, seriesID SeriesID, generationNo, renewalCou
 // key generation at renewal_count 0.
 // [certificate-lifecycle.md §갱신 횟수 계산; planning.md line 62]
 func TestPlanRenewal_RotateEveryThreeSequence(t *testing.T) {
-	series, err := NewLeafSeries(baseSeriesFacts(3))
+	series, err := NewLeafSeries(baseSeriesFacts(t, 3))
 	if err != nil {
 		t.Fatalf("NewLeafSeries: %v", err)
 	}
@@ -109,7 +120,7 @@ func TestPlanRenewal_RotateEveryThreeSequence(t *testing.T) {
 // issuer-covers-leaf-window rule from the LeafSeries side (in addition to
 // certificate_test.go's Authority/PlanIssuance coverage).
 func TestPlanRenewal_PeriodExceedingIssuerRejected(t *testing.T) {
-	series, err := NewLeafSeries(baseSeriesFacts(3))
+	series, err := NewLeafSeries(baseSeriesFacts(t, 3))
 	if err != nil {
 		t.Fatalf("NewLeafSeries: %v", err)
 	}
@@ -137,7 +148,7 @@ func TestPlanRenewal_PeriodExceedingIssuerRejected(t *testing.T) {
 //
 //	CA 전환만을 이유로 초기화하지 않는다"; planning.md line 72]
 func TestPlanRenewal_CAMoveAloneDoesNotResetCount(t *testing.T) {
-	series, err := NewLeafSeries(baseSeriesFacts(3))
+	series, err := NewLeafSeries(baseSeriesFacts(t, 3))
 	if err != nil {
 		t.Fatalf("NewLeafSeries: %v", err)
 	}
@@ -179,7 +190,7 @@ func TestPlanRenewal_CAMoveAloneDoesNotResetCount(t *testing.T) {
 //
 //	2라면 다음 갱신에서 교체한다"]
 func TestPlanRenewal_PolicyChangeAfterAccumulation(t *testing.T) {
-	series, err := NewLeafSeries(baseSeriesFacts(3))
+	series, err := NewLeafSeries(baseSeriesFacts(t, 3))
 	if err != nil {
 		t.Fatalf("NewLeafSeries: %v", err)
 	}
@@ -222,7 +233,7 @@ func TestPlanRenewal_PolicyChangeAfterAccumulation(t *testing.T) {
 // independent of the current ordinal or rotate_every.
 // [certificate-lifecycle.md §CA 키 유출 시 긴급 처리]
 func TestPlanRenewal_EmergencyAlwaysRotatesAndResets(t *testing.T) {
-	series, err := NewLeafSeries(baseSeriesFacts(100)) // very high cadence: would never rotate normally
+	series, err := NewLeafSeries(baseSeriesFacts(t, 100)) // very high cadence: would never rotate normally
 	if err != nil {
 		t.Fatalf("NewLeafSeries: %v", err)
 	}
@@ -251,7 +262,7 @@ func TestPlanRenewal_EmergencyAlwaysRotatesAndResets(t *testing.T) {
 }
 
 func TestPlanRenewal_KeyNotReadyRejected(t *testing.T) {
-	series, err := NewLeafSeries(baseSeriesFacts(3))
+	series, err := NewLeafSeries(baseSeriesFacts(t, 3))
 	if err != nil {
 		t.Fatalf("NewLeafSeries: %v", err)
 	}
@@ -300,20 +311,65 @@ func TestNewLeafKeyGeneration_ImportStartsAtZeroWithUnknownHistory(t *testing.T)
 }
 
 func TestLeafSeries_ChangePolicy_RejectsOutOfRangeRotateEvery(t *testing.T) {
-	series, err := NewLeafSeries(baseSeriesFacts(3))
+	series, err := NewLeafSeries(baseSeriesFacts(t, 3))
 	if err != nil {
 		t.Fatalf("NewLeafSeries: %v", err)
 	}
-	if _, err := series.ChangePolicy(SeriesPolicy{RotateEvery: 0, CertificateValidity: NewDuration(24 * time.Hour)}); !errors.Is(err, ErrInvalidValue) {
+	if _, err := series.ChangePolicy(SeriesPolicy{RotateEvery: 0, CertificateValidity: mustCalendarValidity(t, 1, ValidityUnitDays)}); !errors.Is(err, ErrInvalidValue) {
 		t.Fatalf("expected ErrInvalidValue for rotate_every=0, got %v", err)
 	}
-	if _, err := series.ChangePolicy(SeriesPolicy{RotateEvery: 101, CertificateValidity: NewDuration(24 * time.Hour)}); !errors.Is(err, ErrInvalidValue) {
+	if _, err := series.ChangePolicy(SeriesPolicy{RotateEvery: 101, CertificateValidity: mustCalendarValidity(t, 1, ValidityUnitDays)}); !errors.Is(err, ErrInvalidValue) {
 		t.Fatalf("expected ErrInvalidValue for rotate_every=101, got %v", err)
 	}
 }
 
+// TestPlanRenewal_RejectsStaleKeyGeneration is the P1 review regression: a
+// renewal must be planned against the series' *current* key generation
+// pointer, not merely any generation that shares the series ID. Without this
+// check, passing a stale (already-rotated-away) generation with
+// renewal_count reset to 0 would let a caller bypass the rotate_every count
+// and re-issue on a key the series has already moved past.
+func TestPlanRenewal_RejectsStaleKeyGeneration(t *testing.T) {
+	facts := baseSeriesFacts(t, 3)
+	facts.CurrentKeyGenerationID = LeafKeyGenerationID("77777777-7777-7777-7777-777777777777")
+	series, err := NewLeafSeries(facts)
+	if err != nil {
+		t.Fatalf("NewLeafSeries: %v", err)
+	}
+	now := NewInstant(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
+	issuerWindow := mustWindowFacts(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2035, 1, 1, 0, 0, 0, 0, time.UTC))
+	requestedWindow := mustWindowFacts(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC), time.Date(2027, 6, 1, 0, 0, 0, 0, time.UTC))
+
+	// stale generates a *different* key generation ID than the series'
+	// current pointer, sharing only the SeriesID, with renewal_count reset
+	// to 0 -- the shape of a past generation the series already rotated
+	// away from.
+	stale, err := NewLeafKeyGeneration(LeafKeyGenerationFacts{
+		ID:            LeafKeyGenerationID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+		SeriesID:      series.ID(),
+		KeyMaterialID: KeyMaterialID("88888888-8888-8888-8888-888888888888"),
+		GenerationNo:  1,
+		RenewalCount:  0,
+		Custody:       KeyCustodyClientHeld,
+	})
+	if err != nil {
+		t.Fatalf("NewLeafKeyGeneration: %v", err)
+	}
+
+	_, err = series.PlanRenewal(RenewalFacts{
+		CurrentGeneration:  stale,
+		TargetIssuerID:     series.ManagementAuthorityID(),
+		TargetIssuerWindow: issuerWindow,
+		RequestedWindow:    requestedWindow,
+		KeyReadyForRenewal: true,
+	}, now)
+	if !errors.Is(err, ErrPolicyViolation) {
+		t.Fatalf("expected ErrPolicyViolation for a stale key generation, got %v", err)
+	}
+}
+
 func TestLeafSeries_ChangePolicy_DoesNotMutateReceiver(t *testing.T) {
-	series, err := NewLeafSeries(baseSeriesFacts(3))
+	series, err := NewLeafSeries(baseSeriesFacts(t, 3))
 	if err != nil {
 		t.Fatalf("NewLeafSeries: %v", err)
 	}
@@ -326,5 +382,136 @@ func TestLeafSeries_ChangePolicy_DoesNotMutateReceiver(t *testing.T) {
 	}
 	if updated.Policy().RotateEvery != 5 {
 		t.Fatal("expected updated copy to carry the new rotate_every")
+	}
+}
+
+// TestCalendarValidity_OneYearDiffersFrom365DaysAcrossLeapDay is the P2
+// review regression: "1 year" and "365 days" must diverge when the window
+// crosses a leap day, since a fixed-duration policy cannot tell them apart.
+// [data-model.md §CA·인증서·갱신 계보: "유효기간은 연/월/일 의미를 잃지 않는
+// 버전형 정책으로 저장한다"]
+func TestCalendarValidity_OneYearDiffersFrom365DaysAcrossLeapDay(t *testing.T) {
+	// 2028 is a leap year, so 2027-03-01 + 365 days lands one day before
+	// 2028-03-01, while "1 year" lands exactly on 2028-03-01.
+	notBefore := NewInstant(time.Date(2027, 3, 1, 0, 0, 0, 0, time.UTC))
+
+	oneYear := mustCalendarValidity(t, 1, ValidityUnitYears)
+	oneYearWindow, err := oneYear.Window(notBefore)
+	if err != nil {
+		t.Fatalf("oneYear.Window: %v", err)
+	}
+	wantOneYear := time.Date(2028, 3, 1, 0, 0, 0, 0, time.UTC)
+	if got := oneYearWindow.NotAfter().Time(); !got.Equal(wantOneYear) {
+		t.Fatalf("1 year: expected not_after %v, got %v", wantOneYear, got)
+	}
+
+	days365 := mustCalendarValidity(t, 365, ValidityUnitDays)
+	days365Window, err := days365.Window(notBefore)
+	if err != nil {
+		t.Fatalf("days365.Window: %v", err)
+	}
+	wantDays365 := time.Date(2028, 2, 29, 0, 0, 0, 0, time.UTC)
+	if got := days365Window.NotAfter().Time(); !got.Equal(wantDays365) {
+		t.Fatalf("365 days: expected not_after %v, got %v", wantDays365, got)
+	}
+
+	if oneYearWindow.NotAfter().Equal(days365Window.NotAfter()) {
+		t.Fatal("expected 1 year and 365 days to diverge across the 2028 leap day, got the same not_after")
+	}
+}
+
+// TestCalendarValidity_LeapDayIssuanceOneYearClampsToFeb28 covers issuing on
+// February 29 with a 1-year policy: 2029 is not a leap year, so 2029-02-29
+// does not exist and must clamp to the last day of February per
+// data-model.md's month-end rule.
+func TestCalendarValidity_LeapDayIssuanceOneYearClampsToFeb28(t *testing.T) {
+	notBefore := NewInstant(time.Date(2028, 2, 29, 0, 0, 0, 0, time.UTC)) // 2028 is a leap year
+	oneYear := mustCalendarValidity(t, 1, ValidityUnitYears)
+
+	window, err := oneYear.Window(notBefore)
+	if err != nil {
+		t.Fatalf("Window: %v", err)
+	}
+	want := time.Date(2029, 2, 28, 0, 0, 0, 0, time.UTC)
+	if got := window.NotAfter().Time(); !got.Equal(want) {
+		t.Fatalf("expected not_after clamped to %v, got %v", want, got)
+	}
+}
+
+// TestCalendarValidity_MonthEndRenewalClampsToShorterMonth covers a
+// month-unit policy issued on a 31st: Jan 31 + 1 month has no Feb 31, so it
+// must clamp to Feb's last day (28 in a non-leap year), matching
+// AddDate's *different*, non-clamping rollover behavior which this policy
+// deliberately avoids.
+func TestCalendarValidity_MonthEndRenewalClampsToShorterMonth(t *testing.T) {
+	notBefore := NewInstant(time.Date(2027, 1, 31, 0, 0, 0, 0, time.UTC)) // 2027 is not a leap year
+	oneMonth := mustCalendarValidity(t, 1, ValidityUnitMonths)
+
+	window, err := oneMonth.Window(notBefore)
+	if err != nil {
+		t.Fatalf("Window: %v", err)
+	}
+	want := time.Date(2027, 2, 28, 0, 0, 0, 0, time.UTC)
+	if got := window.NotAfter().Time(); !got.Equal(want) {
+		t.Fatalf("expected not_after clamped to %v, got %v", want, got)
+	}
+
+	// Sanity-check that time.Time.AddDate's own rollover (which this policy
+	// must NOT use for years/months) would have produced a different date
+	// (March 2 or 3), confirming the clamp above is doing real work.
+	naive := notBefore.Time().AddDate(0, 1, 0)
+	if naive.Equal(want) {
+		t.Fatal("expected AddDate's rollover to differ from the clamped result, got the same date")
+	}
+	if naive.Month() != time.March {
+		t.Fatalf("expected AddDate to roll over into March, got %v", naive)
+	}
+}
+
+// TestCalendarValidity_MonthEndRenewalFromLongerMonth verifies a renewal
+// issued on March 31 with a 1-month policy clamps to April 30, and that a
+// subsequent renewal from that clamped date does not "recover" the 31st --
+// each window is computed fresh from its own notBefore, as certificate
+// windows are fixed per issuance rather than accumulated.
+func TestCalendarValidity_MonthEndRenewalFromLongerMonth(t *testing.T) {
+	notBefore := NewInstant(time.Date(2027, 3, 31, 0, 0, 0, 0, time.UTC))
+	oneMonth := mustCalendarValidity(t, 1, ValidityUnitMonths)
+
+	window, err := oneMonth.Window(notBefore)
+	if err != nil {
+		t.Fatalf("Window: %v", err)
+	}
+	want := time.Date(2027, 4, 30, 0, 0, 0, 0, time.UTC)
+	if got := window.NotAfter().Time(); !got.Equal(want) {
+		t.Fatalf("expected not_after %v, got %v", want, got)
+	}
+}
+
+// TestCalendarValidity_DaysUnitNeverClamps confirms the day unit never needs
+// or applies month-end clamping: it always lands on the calendar date 30
+// days later regardless of month boundaries crossed.
+func TestCalendarValidity_DaysUnitNeverClamps(t *testing.T) {
+	notBefore := NewInstant(time.Date(2027, 1, 31, 0, 0, 0, 0, time.UTC))
+	days := mustCalendarValidity(t, 30, ValidityUnitDays)
+
+	window, err := days.Window(notBefore)
+	if err != nil {
+		t.Fatalf("Window: %v", err)
+	}
+	want := time.Date(2027, 3, 2, 0, 0, 0, 0, time.UTC)
+	if got := window.NotAfter().Time(); !got.Equal(want) {
+		t.Fatalf("expected not_after %v, got %v", want, got)
+	}
+}
+
+func TestNewCalendarValidity_RejectsNonPositiveValueAndBadUnit(t *testing.T) {
+	if _, err := NewCalendarValidity(0, ValidityUnitYears); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("expected ErrInvalidValue for value 0, got %v", err)
+	}
+	if _, err := NewCalendarValidity(-1, ValidityUnitDays); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("expected ErrInvalidValue for negative value, got %v", err)
+	}
+	if _, err := NewCalendarValidity(1, ValidityUnit("weeks")); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("expected ErrInvalidValue for unsupported unit, got %v", err)
 	}
 }

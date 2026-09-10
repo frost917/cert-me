@@ -1,6 +1,9 @@
 package domain
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // SeriesPurpose classifies what a leaf series is used for.
 // [data-model.md: "purpose=distributed/internal_tls/bootstrap_tls"]
@@ -26,14 +29,122 @@ const (
 	maxRotateEvery = 100
 )
 
+// ValidityUnit is the calendar unit a CalendarValidity policy is expressed
+// in. [data-model.md §CA·인증서·갱신 계보: "유효기간은 연/월/일 의미를 잃지 않는
+// 버전형 정책으로 저장한다"]
+type ValidityUnit string
+
+const (
+	ValidityUnitYears  ValidityUnit = "years"
+	ValidityUnitMonths ValidityUnit = "months"
+	ValidityUnitDays   ValidityUnit = "days"
+)
+
+func (u ValidityUnit) Validate() error {
+	switch u {
+	case ValidityUnitYears, ValidityUnitMonths, ValidityUnitDays:
+		return nil
+	default:
+		return fmt.Errorf("%w: unsupported validity unit %q", ErrInvalidValue, string(u))
+	}
+}
+
+// CalendarValidity is a versioned validity policy that preserves calendar
+// meaning (a stored value plus its year/month/day unit) instead of
+// collapsing it into a fixed span of elapsed time. This matters because "1
+// year", "12 months" and "365 days" are not the same calendar span across a
+// leap day, and the product default is expressed in calendar terms.
+// [data-model.md §CA·인증서·갱신 계보: "유효기간은 연/월/일 의미를 잃지 않는
+// 버전형 정책으로 저장한다. 기본 1년은 발급 기준 UTC 시각의 달력상 1년 뒤이며
+// 존재하지 않는 날짜는 대상 월 말일로 맞춘다"; certificate-lifecycle.md §유효기간과
+// 계보: Leaf 기본 유효기간 "1년"]
+type CalendarValidity struct {
+	value int
+	unit  ValidityUnit
+}
+
+// NewCalendarValidity validates value and unit. value must be positive; the
+// window it describes is otherwise unbounded (a series' own RotateEvery and
+// the issuer-covers-leaf-window check in PlanRenewal bound it in practice).
+func NewCalendarValidity(value int, unit ValidityUnit) (CalendarValidity, error) {
+	if err := unit.Validate(); err != nil {
+		return CalendarValidity{}, err
+	}
+	if value <= 0 {
+		return CalendarValidity{}, fmt.Errorf("%w: validity value must be positive", ErrInvalidValue)
+	}
+	return CalendarValidity{value: value, unit: unit}, nil
+}
+
+func (v CalendarValidity) Value() int { return v.value }
+
+func (v CalendarValidity) Unit() ValidityUnit { return v.unit }
+
+func (v CalendarValidity) IsZero() bool { return v.value == 0 }
+
+// IsPositive mirrors Duration.IsPositive so SeriesPolicy.Validate reads the
+// same regardless of which concrete validity type it holds.
+func (v CalendarValidity) IsPositive() bool { return v.value > 0 }
+
+// Window computes the [notBefore, notAfter) certificate period for a
+// certificate issued at notBefore, per the calendar preservation rule: years
+// and months add whole calendar units and clamp a resulting nonexistent day
+// (e.g. Jan 31 + 1 month) to the last day of the target month; days advance
+// by exact 24h steps, which never produces a missing calendar date so no
+// clamp is needed there. time.Time.AddDate's own end-of-month rollover
+// behavior (Jan 31 + 1 month normalizing into March) does not implement this
+// clamp-to-month-end rule, so years/months are computed by hand instead of
+// calling AddDate directly for those units.
+func (v CalendarValidity) Window(notBefore Instant) (ValidityWindow, error) {
+	base := notBefore.Time()
+	var notAfter time.Time
+	switch v.unit {
+	case ValidityUnitYears:
+		notAfter = addCalendarMonths(base, v.value*12)
+	case ValidityUnitMonths:
+		notAfter = addCalendarMonths(base, v.value)
+	case ValidityUnitDays:
+		notAfter = base.AddDate(0, 0, v.value)
+	default:
+		return ValidityWindow{}, fmt.Errorf("%w: unsupported validity unit %q", ErrInvalidValue, string(v.unit))
+	}
+	return NewValidityWindow(notBefore, NewInstant(notAfter))
+}
+
+// addCalendarMonths adds months calendar-months to t, keeping the same
+// day-of-month unless the target month is shorter, in which case the day is
+// clamped to that month's last day (data-model.md's "존재하지 않는 날짜는
+// 대상 월 말일로 맞춘다").
+func addCalendarMonths(t time.Time, months int) time.Time {
+	y, m, d := t.Date()
+	totalMonths := (int(m) - 1) + months
+	ny := y + totalMonths/12
+	nm := totalMonths % 12
+	if nm < 0 {
+		nm += 12
+		ny--
+	}
+	targetMonth := time.Month(nm + 1)
+	if last := lastDayOfMonth(ny, targetMonth); d > last {
+		d = last
+	}
+	return time.Date(ny, targetMonth, d, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location())
+}
+
+// lastDayOfMonth returns the number of days in the given calendar month. Day
+// 0 of the following month is the last day of the requested one.
+func lastDayOfMonth(year int, month time.Month) int {
+	return time.Date(year, month+1, 0, 0, 0, 0, 0, time.UTC).Day()
+}
+
 // SeriesPolicy is the operator-configurable subset of a leaf series: the key
 // rotation cadence (in renewal counts, not calendar time) and the validity
-// duration new certificates in the series get. [certificate-lifecycle.md
+// policy new certificates in the series get. [certificate-lifecycle.md
 // §유효기간과 계보: "Leaf 유효기간과 키 교체 주기는 인증서 관리 단위에 저장하며
 // 갱신에 계승한다"]
 type SeriesPolicy struct {
 	RotateEvery         int
-	CertificateValidity Duration
+	CertificateValidity CalendarValidity
 }
 
 func (p SeriesPolicy) Validate() error {
@@ -302,6 +413,15 @@ func (s LeafSeries) PlanRenewal(facts RenewalFacts, now Instant) (RenewalPlan, e
 	}
 	if facts.CurrentGeneration.SeriesID() != s.id {
 		return RenewalPlan{}, fmt.Errorf("%w: key generation does not belong to this series", ErrInvalidValue)
+	}
+	// The renewal must be planned against the series' *current* key
+	// generation pointer. Accepting any past generation that merely shares
+	// the series ID would let a caller resubmit an already-rotated-away
+	// generation (typically with its own renewal_count reset to 0) and
+	// bypass the rotate_every/key-rotation rule the current pointer is
+	// meant to enforce.
+	if facts.CurrentGeneration.ID() != s.currentKeyGenerationID {
+		return RenewalPlan{}, fmt.Errorf("%w: key generation is not the series' current generation", ErrPolicyViolation)
 	}
 	if _, err := ParseAuthorityID(string(facts.TargetIssuerID)); err != nil {
 		return RenewalPlan{}, err
