@@ -13,26 +13,38 @@ type jobRepo struct{ s *state }
 
 var _ port.JobRepository = jobRepo{}
 
-// UpsertDemand merges a new demand into any pending job with the same dedup
-// key rather than queueing a second one. CRL work is deduplicated per CA key
-// this way (docs/backend-implementation.md §9: "CRL은 CA 키별 dedup_key로
-// 요구 generation을 병합한다"), so a burst of revocations produces one job.
+// UpsertDemand merges a new demand into whatever job row already holds the
+// same dedup key, pending or running, rather than queueing a second one.
+// docs/data-model.md:151 declares dedup_key UNIQUE across the whole jobs
+// table (not just among pending rows), so a real insert for a second row
+// sharing dedup_key with a running job would fail the constraint outright;
+// this double must reject that shape too, by never creating a second row
+// for a key that already has one in any state.
 //
-// A job that is already running is NOT merged into: its snapshot was taken
-// before this demand existed, so the demand must survive as a fresh pending
-// job (§9: "완료 시 처리한 generation보다 새 요구가 있으면 pending으로
-// 남긴다"). This double models that by keying the dedup index only on
-// pending rows.
+// A running row's lease is left untouched by the merge -- the merge only
+// updates the demand fields (Kind/PayloadVersion/Payload) and bumps
+// Version, it does not touch State/LeaseUntil/AttemptCount. Whether the
+// newer generation must survive as a fresh pending job once the running
+// attempt completes is the completing worker's decision, made by
+// re-reading this row and comparing the generation it processed against
+// what it finds (docs/data-model.md:159: "완료 시 처리한 generation보다 새
+// 요구가 있으면 pending으로 남긴다") -- UpsertDemand's only job is to make
+// sure that newer generation is durably recorded on the one row for this
+// key, never dropped and never split into a second row.
+//
+// Every merge bumps Version, including the already-existing pending-merge
+// path: without that, a worker that read the row before this merge landed
+// could Save with the pre-merge version and silently overwrite the newer
+// demand instead of losing the optimistic lock.
 func (r jobRepo) UpsertDemand(_ context.Context, dedupKey, kind string, payloadVersion int, payload []byte) error {
 	if id, ok := r.s.jobByDedup[dedupKey]; ok {
 		existing := r.s.jobs[id]
-		if existing.State == contract.JobStatePending {
-			existing.Kind = kind
-			existing.PayloadVersion = payloadVersion
-			existing.Payload = cloneBytes(payload)
-			r.s.jobs[id] = existing
-			return nil
-		}
+		existing.Kind = kind
+		existing.PayloadVersion = payloadVersion
+		existing.Payload = cloneBytes(payload)
+		existing.Version = existing.Version.Next()
+		r.s.jobs[id] = existing
+		return nil
 	}
 	id := domain.JobID(dedupKey + ":" + itoa(len(r.s.jobs)+1))
 	r.s.jobs[id] = port.Job{
@@ -50,13 +62,29 @@ func (r jobRepo) UpsertDemand(_ context.Context, dedupKey, kind string, payloadV
 // ClaimDue takes up to limit due jobs and stamps a lease on each. The lease
 // and the version are what let a second worker tell a live claim from one
 // abandoned by a killed process (docs/backend-implementation.md §9).
+//
+// A row is due under one of two separate conditions depending on its
+// current state, per this method's own doc comment on
+// port.JobRepository.ClaimDue ("A job whose lease has already expired is
+// due again for claiming, which is how a crashed worker's job gets picked
+// up after restart"): a pending row is due once its AvailableAt has passed,
+// a running row is due once its LeaseUntil has passed. Expiry is `now >= t`
+// project-wide (domain.Instant.IsExpiredAt), so a running row is only
+// reclaimed once its lease has actually lapsed, never while it is still
+// live.
 func (r jobRepo) ClaimDue(_ context.Context, now, leaseUntil domain.Instant, limit int) ([]port.Job, error) {
 	due := make([]port.Job, 0)
 	for _, job := range r.s.jobs {
-		if job.State != contract.JobStatePending {
-			continue
-		}
-		if !job.AvailableAt.IsZero() && !job.AvailableAt.IsExpiredAt(now) {
+		switch job.State {
+		case contract.JobStatePending:
+			if !job.AvailableAt.IsZero() && !job.AvailableAt.IsExpiredAt(now) {
+				continue
+			}
+		case contract.JobStateRunning:
+			if !job.LeaseUntil.IsExpiredAt(now) {
+				continue
+			}
+		default:
 			continue
 		}
 		due = append(due, job)

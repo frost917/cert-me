@@ -63,22 +63,33 @@ func (r tlsRepo) SaveChange(_ context.Context, change domain.TLSChange, expected
 	return nil
 }
 
-// SetActive moves the active pointer. Activate re-checks the version under
-// the process-wide TLS mutex and then commits this pointer move before
-// calling Installer.Apply (docs/backend-implementation.md §9), so the lock
-// check here is what makes a stale activation fail instead of silently
-// pointing production at an older candidate.
+// SetActive moves the installation's active_tls_version_id pointer to
+// versionID. Per port.TLSRepository.SetActive's doc comment, expectedVersion
+// guards the *installation* row's own version, not the TLSChange's --
+// Activate's sequence is "version 재검사 → DB committed 기록/활성 포인터
+// 변경 → Installer.Apply → DB applied 기록" (docs/backend-implementation.md
+// §9), and the installation pointer change is a separate optimistic-locked
+// write from the TLSChange row SaveChange advances alongside it. So this
+// checks and bumps r.s.installation.Version, and writes
+// Installation.ActiveTLSVersionID, leaving the TLSChange row itself
+// untouched (that row's own version is SaveChange's concern).
 func (r tlsRepo) SetActive(_ context.Context, expectedVersion domain.Version, versionID domain.TLSVersionID) error {
 	if _, ok := r.s.tlsVersions[versionID]; !ok {
 		return port.ErrNotFound
 	}
-	change, ok := r.s.tlsChanges[versionID]
-	if !ok {
+	if _, ok := r.s.tlsChanges[versionID]; !ok {
 		return port.ErrNotFound
 	}
-	if change.Version() != expectedVersion {
+	if !r.s.installationSet {
+		return port.ErrNotFound
+	}
+	if r.s.installation.Version != expectedVersion {
 		return ErrVersionConflict
 	}
+	installation := r.s.installation
+	installation.ActiveTLSVersionID = versionID
+	installation.Version = installation.Version.Next()
+	r.s.installation = installation
 	r.s.activeTLSChangeKey = versionID
 	return nil
 }
