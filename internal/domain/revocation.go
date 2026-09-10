@@ -204,6 +204,15 @@ func (r Revocation) Merge(incoming RevocationFacts) (Revocation, bool, error) {
 	return next, true, nil
 }
 
+// MaxCorrectClockSkew is the fixed tolerance a Correct's revokedAt may sit
+// ahead of the caller-supplied now before being rejected as implausible.
+// PR #1 reviewer decision: this is an MVP-fixed clock-skew allowance (not an
+// admin-configurable setting) — a correction whose revoked_at is more than
+// 5 minutes past now is refused as a policy violation rather than clamped;
+// there is no scheduled/future revocation feature, so an in-range time is
+// stored exactly as given.
+const MaxCorrectClockSkew = 5 * time.Minute
+
 // Correct is an explicit administrator correction: it is allowed to change
 // reason/time even over a conflict flag, but it can never remove the
 // revocation itself (certificate-lifecycle.md "폐기 해제 불가").
@@ -211,20 +220,20 @@ func (r Revocation) Merge(incoming RevocationFacts) (Revocation, bool, error) {
 // as a revocation_revisions row; the domain object itself does not retain
 // history.
 //
-// Correct takes no "now": the design signature is Correct(reason, time,
-// justification) with no clock input, and neither certificate-lifecycle.md
-// nor pki-import.md defines a rule against which a "future" revoked_at
-// would be judged. pki-import.md explicitly allows merging revocation
-// entries taken from an external, previously-running PKI's CRLs/records,
-// whose revoked_at was stamped by that system's clock, not cert-me's; a
-// hard now-based rejection here would have no documented tolerance for
-// clock skew between systems and could reject a legitimate correction that
-// restores an operator-verified external timestamp (see
-// TestRevocation_CorrectClearsReviewButNeverUnrevokes). If a plausibility
-// check on corrected times is ever wanted, it belongs in the service layer
-// where the import/operator context needed to define "future" actually
-// lives.
-func (r Revocation) Correct(reason RevocationReason, revokedAt Instant, justification string) (Revocation, error) {
+// now is an explicit argument rather than a read of a global clock: the
+// domain layer must not observe wall-clock time on its own. PR #1 reviewer
+// decision: a corrected revokedAt more than MaxCorrectClockSkew after now is
+// rejected as a policy violation; revokedAt is otherwise preserved exactly
+// as given (no clamping — revocation takes effect immediately, and there is
+// no scheduled-revocation feature). now itself must be set: a zero now
+// cannot bound revokedAt and is rejected the same way NewRevocation and
+// Merge reject zero-valued required inputs. This intentionally narrows the
+// far-future acceptance that a prior version of this method had (see the
+// former TestRevocation_CorrectAcceptsFarFutureRevokedAt, now
+// TestRevocation_CorrectRejectsFarFutureRevokedAt); import's original
+// preservation policy for NewRevocation is untouched — this check applies
+// only to operator corrections, not to restoring stored facts.
+func (r Revocation) Correct(reason RevocationReason, revokedAt Instant, justification string, now Instant) (Revocation, error) {
 	if err := reason.Validate(); err != nil {
 		return Revocation{}, err
 	}
@@ -234,10 +243,55 @@ func (r Revocation) Correct(reason RevocationReason, revokedAt Instant, justific
 	if justification == "" {
 		return Revocation{}, fmt.Errorf("%w: correction requires a justification", ErrInvalidValue)
 	}
+	if now.IsZero() {
+		return Revocation{}, fmt.Errorf("%w: correction requires now to be set", ErrInvalidValue)
+	}
+	if revokedAt.After(now.Add(NewDuration(MaxCorrectClockSkew))) {
+		return Revocation{}, NewPolicyError(ErrPolicyViolation, "revocation_correct_future_revoked_at",
+			"corrected revoked_at is further than the allowed clock-skew tolerance in the future")
+	}
 	next := r
 	next.reason = reason
 	next.revokedAt = revokedAt
 	next.needsReview = false
+	next.version = r.version.Next()
+	return next, nil
+}
+
+// StampChangeGeneration records the shared batch generation applyRevocations
+// assigned when persisting this row alongside others in the same commit.
+//
+// PR #1 reviewer decision: generation bookkeeping still lives in the app
+// layer (backend-implementation.md §5's applyRevocations locks CRLState and
+// picks one generation for the whole changed batch), but the *stamping* of
+// that number onto a Revocation belongs on the domain object rather than
+// being reconstructed ad hoc by the caller, so a dedicated method is added
+// instead of threading a generation parameter through Merge/Correct.
+//
+//   - generation must be positive and strictly greater than the current
+//     changeGeneration; equal or smaller values are rejected and the
+//     receiver is returned unchanged (by value, so it is never mutated).
+//   - Stamping changes a persisted field, so it advances version like any
+//     other transition. Calling this after Merge or Correct in the same
+//     flow can therefore advance version twice before the object is saved.
+//     That is expected: version here is an optimistic-lock token, not a
+//     count of database writes. The app layer is expected to keep the
+//     version it originally read as expectedVersion, perform one Save of
+//     the final object, and have the repository check
+//     WHERE version = expectedVersion while persisting the object's own
+//     final version value — never forcing finalVersion = expectedVersion+1.
+//     A newly inserted record in the same batch gets the same generation
+//     via this method too; a Merge that reported changed=false is not
+//     stamped or saved at all.
+func (r Revocation) StampChangeGeneration(generation int64) (Revocation, error) {
+	if generation <= 0 {
+		return Revocation{}, fmt.Errorf("%w: change generation must be positive", ErrInvalidValue)
+	}
+	if generation <= r.changeGeneration {
+		return Revocation{}, fmt.Errorf("%w: change generation must advance past the current value", ErrInvalidValue)
+	}
+	next := r
+	next.changeGeneration = generation
 	next.version = r.version.Next()
 	return next, nil
 }

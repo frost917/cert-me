@@ -134,7 +134,8 @@ func TestRevocation_CorrectClearsReviewButNeverUnrevokes(t *testing.T) {
 		t.Fatalf("merge: %v", err)
 	}
 
-	corrected, err := flagged.Correct(RevocationReasonSuperseded, conflictingTime, "operator verified import timestamp")
+	now := plus(conflictingTime, time.Hour)
+	corrected, err := flagged.Correct(RevocationReasonSuperseded, conflictingTime, "operator verified import timestamp", now)
 	if err != nil {
 		t.Fatalf("correct: %v", err)
 	}
@@ -149,8 +150,11 @@ func TestRevocation_CorrectClearsReviewButNeverUnrevokes(t *testing.T) {
 		t.Fatalf("revocation must remain in effect")
 	}
 
-	if _, err := flagged.Correct(RevocationReasonSuperseded, conflictingTime, ""); err == nil {
+	if _, err := flagged.Correct(RevocationReasonSuperseded, conflictingTime, "", now); err == nil {
 		t.Fatalf("expected correction without justification to be rejected")
+	}
+	if _, err := flagged.Correct(RevocationReasonSuperseded, conflictingTime, "ticket", Instant{}); err == nil {
+		t.Fatalf("expected correction with zero now to be rejected")
 	}
 }
 
@@ -199,27 +203,148 @@ func TestRevocation_MergeSignatureCarriesNoChangeGeneration(t *testing.T) {
 	}
 }
 
-// PR review (round 3): Correct previously took an unused "now" and let a
-// revoked_at set ~146,000 years in the future through with no error. The
-// design signature (backend-implementation.md §57) is Correct(reason, time,
-// justification) with no clock argument at all, and neither
-// certificate-lifecycle.md nor pki-import.md defines what counts as
-// "future" for an imported or corrected revocation (imported entries carry
-// an external system's clock, not cert-me's). So the fix removes the
-// parameter rather than adding an undocumented threshold. This pins that a
-// far-future revokedAt is still accepted by the domain (any plausibility
-// check belongs at the service/import layer, which has the context to
-// define one) and that Correct no longer takes a "now" at all.
-func TestRevocation_CorrectAcceptsFarFutureRevokedAt(t *testing.T) {
+// PR #1 reviewer decision (final round): Correct now takes an explicit now
+// and rejects a revokedAt more than MaxCorrectClockSkew (5 minutes, MVP
+// fixed value, no admin setting) past it, replacing the earlier round-3 fix
+// that let any far-future revokedAt through unchecked. This supersedes the
+// old TestRevocation_CorrectAcceptsFarFutureRevokedAt.
+func TestRevocation_CorrectRejectsFarFutureRevokedAt(t *testing.T) {
 	r := newRevocation(t, RevocationReasonSuperseded, t0())
-	farFuture := plus(t0(), 1<<62)
+	now := plus(t0(), 24*time.Hour)
+	farFuture := plus(now, 1<<40)
 
-	corrected, err := r.Correct(RevocationReasonSuperseded, farFuture, "ticket-2")
-	if err != nil {
-		t.Fatalf("expected far-future revoked_at to be accepted by the domain, got %v", err)
+	_, err := r.Correct(RevocationReasonSuperseded, farFuture, "ticket-2", now)
+	if err == nil {
+		t.Fatalf("expected far-future revoked_at to be rejected as a policy violation")
 	}
-	if !corrected.RevokedAt().Equal(farFuture) {
-		t.Fatalf("expected corrected revoked_at to be stored as given, got %v", corrected.RevokedAt())
+	if !errors.Is(err, ErrPolicyViolation) {
+		t.Fatalf("expected ErrPolicyViolation, got %v", err)
+	}
+}
+
+// Past and present revokedAt (relative to now) are always accepted and
+// stored exactly as given - no clamping, no scheduled revocation.
+func TestRevocation_CorrectAcceptsPastAndPresentRevokedAt(t *testing.T) {
+	r := newRevocation(t, RevocationReasonSuperseded, t0())
+	now := plus(t0(), 24*time.Hour)
+
+	past := plus(t0(), time.Hour)
+	corrected, err := r.Correct(RevocationReasonSuperseded, past, "ticket-past", now)
+	if err != nil {
+		t.Fatalf("expected past revoked_at to be accepted, got %v", err)
+	}
+	if !corrected.RevokedAt().Equal(past) {
+		t.Fatalf("expected revoked_at to be preserved exactly, got %v", corrected.RevokedAt())
+	}
+
+	present, err := r.Correct(RevocationReasonSuperseded, now, "ticket-present", now)
+	if err != nil {
+		t.Fatalf("expected revoked_at == now to be accepted, got %v", err)
+	}
+	if !present.RevokedAt().Equal(now) {
+		t.Fatalf("expected revoked_at to be preserved exactly, got %v", present.RevokedAt())
+	}
+}
+
+// The clock-skew boundary is exact: exactly now+5m is allowed, one
+// microsecond past it is rejected. Instant carries microsecond precision.
+func TestRevocation_CorrectClockSkewBoundaryIsExact(t *testing.T) {
+	r := newRevocation(t, RevocationReasonSuperseded, t0())
+	now := t0()
+
+	atBoundary := plus(now, MaxCorrectClockSkew)
+	corrected, err := r.Correct(RevocationReasonSuperseded, atBoundary, "ticket-boundary", now)
+	if err != nil {
+		t.Fatalf("expected revoked_at exactly at now+%v to be accepted, got %v", MaxCorrectClockSkew, err)
+	}
+	if !corrected.RevokedAt().Equal(atBoundary) {
+		t.Fatalf("expected revoked_at to be preserved exactly, got %v", corrected.RevokedAt())
+	}
+
+	oneMicroPast := plus(now, MaxCorrectClockSkew+time.Microsecond)
+	if _, err := r.Correct(RevocationReasonSuperseded, oneMicroPast, "ticket-boundary", now); err == nil {
+		t.Fatalf("expected revoked_at one microsecond past the boundary to be rejected")
+	}
+}
+
+// now itself is a required explicit input; a zero now cannot bound
+// revokedAt and must be rejected rather than silently skipping the check.
+func TestRevocation_CorrectRejectsZeroNow(t *testing.T) {
+	r := newRevocation(t, RevocationReasonSuperseded, t0())
+	if _, err := r.Correct(RevocationReasonSuperseded, t0(), "ticket", Instant{}); err == nil {
+		t.Fatalf("expected zero now to be rejected")
+	}
+}
+
+// PR #1 reviewer decision: StampChangeGeneration only accepts a value
+// strictly greater than the current changeGeneration, and only positive
+// values at all; every rejection leaves the receiver untouched, and an
+// accepted stamp also advances version (an optimistic-lock token, not a
+// count of saves - Merge/Correct followed by a stamp may bump version
+// twice before a single Save).
+func TestRevocation_StampChangeGeneration(t *testing.T) {
+	r, err := NewRevocation(RevocationFacts{
+		ID: mkRevocationID(t), IssuerID: mkCAKeyGenID(t), Serial: mkSerial(t, "1a"),
+		RevokedAt: t0(), Reason: RevocationReasonKeyCompromise, Source: RevocationSourceManual,
+		ChangeGeneration: 4,
+	})
+	if err != nil {
+		t.Fatalf("new revocation: %v", err)
+	}
+
+	stamped, err := r.StampChangeGeneration(5)
+	if err != nil {
+		t.Fatalf("stamp: %v", err)
+	}
+	if stamped.ChangeGeneration() != 5 {
+		t.Fatalf("expected changeGeneration to advance to 5, got %d", stamped.ChangeGeneration())
+	}
+	if stamped.Version() != r.Version().Next() {
+		t.Fatalf("expected stamp to advance version")
+	}
+
+	if _, err := r.StampChangeGeneration(4); err == nil {
+		t.Fatalf("expected stamping the same generation to be rejected")
+	}
+	if _, err := r.StampChangeGeneration(3); err == nil {
+		t.Fatalf("expected stamping a smaller generation to be rejected")
+	}
+	if _, err := r.StampChangeGeneration(0); err == nil {
+		t.Fatalf("expected stamping zero to be rejected")
+	}
+	if _, err := r.StampChangeGeneration(-1); err == nil {
+		t.Fatalf("expected stamping a negative generation to be rejected")
+	}
+
+	// Receiver is never mutated by a rejected or accepted call (value
+	// receiver + returned copy).
+	if r.ChangeGeneration() != 4 {
+		t.Fatalf("expected receiver's changeGeneration to remain 4, got %d", r.ChangeGeneration())
+	}
+
+	// Stamping after a Merge that changed the record can advance version
+	// twice before a single Save - version is a lock token, not a save
+	// counter.
+	merged, changed, err := r.Merge(RevocationFacts{
+		IssuerID:  r.IssuerID(),
+		Serial:    r.Serial(),
+		RevokedAt: plus(t0(), time.Hour),
+		Reason:    RevocationReasonSuperseded,
+		Source:    RevocationSourceImport,
+	})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if !changed {
+		t.Fatalf("expected conflicting merge to change the record")
+	}
+	stampedAfterMerge, err := merged.StampChangeGeneration(9)
+	if err != nil {
+		t.Fatalf("stamp after merge: %v", err)
+	}
+	if stampedAfterMerge.Version() != r.Version().Next().Next() {
+		t.Fatalf("expected version to have advanced twice (merge + stamp), got %v vs base %v",
+			stampedAfterMerge.Version(), r.Version())
 	}
 }
 

@@ -54,7 +54,7 @@ AuthorityID, CAKeyGenerationID, CertificateID, SeriesID, LeafKeyGenerationID, Ke
 | Delivery | CanConsume(now), Consume(now), Complete(now), Fail(code, now), Expire(now) | 전이마다 새 상태/오류 반환. 완료는 서버 전송 관측값 |
 | DownloadGrant | Validate(purpose, certificateID, deliveryID, now), Consume(now), Invalidate(now) | 토큰·권한·대상 결합. 원문 토큰 미보유 |
 | Account | CanLogin(), BeginReset(), CompleteReset(hash) | 상태·epoch 변경 반환. 세션 전체 삭제는 같은 트랜잭션의 서비스 책임 |
-| Revocation | Merge(incoming), Correct(reason,time,justification) | 동일 기록 무변경, 충돌 자동 덮어쓰기 금지, 해제 없음 |
+| Revocation | Merge(incoming), StampChangeGeneration(generation), Correct(reason,time,justification,now) | 동일 기록 무변경, 충돌 자동 덮어쓰기 금지, 해제 없음. stamp는 현재 값보다 큰 양수만 허용. 정정은 `revokedAt <= now + 5분`만 허용하고 now 미설정을 거부 |
 | CRLState | CanPublish(number,generation), MarkPublished(...) | 번호·반영 세대 후퇴 금지 |
 | Transition | SetTarget(...), ConfirmDeployment(...), Complete(ClosureFacts) | 긴급 영향과 개별 폐기 분리, 수동 확인 보존 |
 
@@ -182,6 +182,10 @@ Write callback 내부 순서는 인증/권한 확인 → 요청 결과 재확인
 | Maintenance | KeyEngine, RuntimeGate; CRL 후속 작업은 JobStore로 기록 |
 
 app 내부 `applyRevocations(ctx, tx, changes, meta)`는 폐기 병합·generation 증가·CRL 작업·감사 추가를 함께 수행한다. Distribution의 실패/만료, Transition의 부모 CA 폐기, Import의 CRL 병합, RevocationService가 이 함수를 사용한다. 자체 트랜잭션을 열지 않는다. 여러 항목은 issuer별 generation을 한 번 증가시키고 같은 generation을 부여할 수 있다.
+
+generation은 issuer의 CRLState를 잠그고 batch당 한 번 계산하며 `Revocation.StampChangeGeneration(generation)`으로 각 레코드에 부여한다. 저장소에 별도 generation 인자를 두어 객체와 다른 값을 저장하지 않는다. 신규 레코드도 같은 batch generation을 받는다. `Merge`가 `changed=false`를 반환한 레코드는 stamp와 저장 대상에서 제외하며, batch 전체가 무변경이면 issuer generation과 CRL 작업 요구도 증가시키지 않는다.
+
+version은 DB 저장 횟수가 아니라 낙관적 잠금 토큰이다. 도메인 전이는 저장 필드를 바꿀 때마다 version을 올리므로 Merge/Correct 뒤 stamp하면 한 요청에서 두 번 증가할 수 있다. app은 DB에서 읽은 최초 version을 expectedVersion으로 보존하고 최종 객체를 한 번 Save한다. 저장소는 `WHERE version=expectedVersion`으로 검사하고 객체의 최종 version을 그대로 저장하며 `finalVersion=expectedVersion+1`을 강제하지 않는다. 레코드·CRLState·정정 이력·CRL 작업 요구·감사는 동일 트랜잭션에 커밋한다. 생성자에 Facts를 다시 조립하는 방식을 업무 전이의 대체 수단으로 사용하지 않는다.
 
 인증서 서명 공통 함수는 `prepareCertificate(plan, keyRef)`로 두고 Authority/Issuance/TLS가 사용한다. 내부 TLS 발급이 일반 Leaf 발급 서비스를 호출해 delivery를 만든 뒤 삭제하는 방식은 금지한다. 계획의 custody가 처음부터 internal이며 response에 download grant가 없다.
 
