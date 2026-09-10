@@ -55,4 +55,10 @@ type TxStores interface {
 	Secrets() SecretRepository
 	Jobs() JobRepository
 	Audit() AuditRepository
+	// Imports is not in §4's original table -- it was added by §13's closing
+	// paragraph, which named import batch/takeover storage as a contract
+	// gap: "계약 완결성 검토에는 ... import batch/takeover 저장·조회 ...
+	// 포함한다." §13's governing rule is explicit that §4's table is not a
+	// ceiling on TxStores' methods.
+	Imports() ImportRepository
 }
