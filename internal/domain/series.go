@@ -364,11 +364,17 @@ const (
 //	받은 Leaf를 새 CA에서 재발급할 때 갱신 횟수와 관계없이 새 개인키를
 //	생성한다... 새 키 세대로 전환하고 갱신 횟수를 초기화한다"]
 type RenewalFacts struct {
-	CurrentGeneration   LeafKeyGeneration
-	TargetIssuerID      AuthorityID
-	TargetIssuerWindow  ValidityWindow // the target issuer's own certificate window, for the period-covers check
-	RequestedWindow     ValidityWindow // desired window for the renewed certificate
-	KeyReadyForRenewal  bool           // false while the current key is pending_delivery/transferring or revoked/compromise-impacted
+	CurrentGeneration  LeafKeyGeneration
+	TargetIssuerID     AuthorityID
+	TargetIssuerWindow ValidityWindow // the target issuer's own certificate window, for the period-covers check
+	// RequestedWindow is the caller's proposed window for the renewed
+	// certificate. Only its NotBefore is actually honored: PlanRenewal
+	// recomputes NotAfter from the series' own CalendarValidity policy (the
+	// same derivation PlanLeafWindow uses for issuance) and rejects the
+	// request if its NotAfter does not exactly match, so the stored policy --
+	// not the caller -- governs the actual result.
+	RequestedWindow     ValidityWindow
+	KeyReadyForRenewal  bool // false while the current key is pending_delivery/transferring or revoked/compromise-impacted
 	IsEmergencyReissue  bool
 	NextKeyGenerationNo int // generation_no to use if this renewal rotates the key
 }
@@ -429,7 +435,23 @@ func (s LeafSeries) PlanRenewal(facts RenewalFacts, now Instant) (RenewalPlan, e
 	if facts.RequestedWindow.IsZero() {
 		return RenewalPlan{}, fmt.Errorf("%w: renewal requested window must be set", ErrInvalidValue)
 	}
-	if !facts.TargetIssuerWindow.IsZero() && !facts.TargetIssuerWindow.Covers(facts.RequestedWindow) {
+	// The stored calendar policy, not whatever window the caller happens to
+	// pass in, decides the renewed certificate's period: recompute it from
+	// the policy and the requested notBefore (mirroring PlanLeafWindow's
+	// issuance-side derivation) and reject a RequestedWindow that does not
+	// exactly match. Without this, a caller could carry a policy of "1 year"
+	// while actually renewing for whatever span it liked, which is exactly
+	// the gap this closes: the policy must govern the actual result, not
+	// merely sit next to it unused. This check runs before the branch split
+	// below so it applies uniformly to reuse, rotation and emergency reissue.
+	policyWindow, err := s.policy.PlanWindow(facts.RequestedWindow.NotBefore())
+	if err != nil {
+		return RenewalPlan{}, err
+	}
+	if !facts.RequestedWindow.NotAfter().Equal(policyWindow.NotAfter()) {
+		return RenewalPlan{}, fmt.Errorf("%w: requested window does not match the series' calendar validity policy", ErrPolicyViolation)
+	}
+	if !facts.TargetIssuerWindow.IsZero() && !facts.TargetIssuerWindow.Covers(policyWindow) {
 		return RenewalPlan{}, fmt.Errorf("%w: requested validity exceeds issuer certificate period", ErrPolicyViolation)
 	}
 
@@ -442,7 +464,7 @@ func (s LeafSeries) PlanRenewal(facts RenewalFacts, now Instant) (RenewalPlan, e
 			NextRenewalCount:    0,
 			NextKeyGenerationNo: facts.NextKeyGenerationNo,
 			TargetIssuerID:      facts.TargetIssuerID,
-			Window:              facts.RequestedWindow,
+			Window:              policyWindow,
 		}, nil
 	}
 
@@ -460,7 +482,7 @@ func (s LeafSeries) PlanRenewal(facts RenewalFacts, now Instant) (RenewalPlan, e
 			NextRenewalCount:    0,
 			NextKeyGenerationNo: facts.NextKeyGenerationNo,
 			TargetIssuerID:      facts.TargetIssuerID,
-			Window:              facts.RequestedWindow,
+			Window:              policyWindow,
 		}, nil
 	}
 
@@ -469,7 +491,7 @@ func (s LeafSeries) PlanRenewal(facts RenewalFacts, now Instant) (RenewalPlan, e
 		NextRenewalCount: nextOrdinal,
 		KeyGenerationID:  facts.CurrentGeneration.ID(),
 		TargetIssuerID:   facts.TargetIssuerID,
-		Window:           facts.RequestedWindow,
+		Window:           policyWindow,
 	}, nil
 }
 

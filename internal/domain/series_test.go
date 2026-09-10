@@ -283,6 +283,136 @@ func TestPlanRenewal_KeyNotReadyRejected(t *testing.T) {
 	}
 }
 
+// TestPlanRenewal_MismatchedWindowRejected is the P2 review regression: the
+// stored calendar policy must govern PlanRenewal's actual result, not just
+// sit alongside it unused. A 1-year policy with notBefore=2028-01-01 must
+// produce not_after=2029-01-01; requesting a fixed 365-day span
+// (2028-12-31, the review's exact reproduction) diverges from that by a day
+// because 2028 is a leap year, and must be rejected rather than silently
+// approved. Covers all three PlanRenewal branches: normal reuse, normal
+// rotation (via a high renewal_count ordinal) and emergency reissue.
+func TestPlanRenewal_MismatchedWindowRejected(t *testing.T) {
+	series, err := NewLeafSeries(baseSeriesFacts(t, 3))
+	if err != nil {
+		t.Fatalf("NewLeafSeries: %v", err)
+	}
+	now := NewInstant(time.Date(2028, 1, 1, 0, 0, 0, 0, time.UTC))
+	issuerWindow := mustWindowFacts(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2035, 1, 1, 0, 0, 0, 0, time.UTC))
+	// The policy is 1 year: notBefore=2028-01-01 must produce
+	// not_after=2029-01-01. This mismatched window instead asks for exactly
+	// 365 days (2028-12-31), reproducing the review's exact scenario.
+	mismatchedWindow := mustWindowFacts(time.Date(2028, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2028, 12, 31, 0, 0, 0, 0, time.UTC))
+
+	// Branch 1: normal reuse (ordinal 1 < rotate_every 3).
+	reuseGen := baseKeyGeneration(t, series.ID(), 1, 0)
+	_, err = series.PlanRenewal(RenewalFacts{
+		CurrentGeneration:  reuseGen,
+		TargetIssuerID:     series.ManagementAuthorityID(),
+		TargetIssuerWindow: issuerWindow,
+		RequestedWindow:    mismatchedWindow,
+		KeyReadyForRenewal: true,
+	}, now)
+	if !errors.Is(err, ErrPolicyViolation) {
+		t.Fatalf("reuse branch: expected ErrPolicyViolation for mismatched window, got %v", err)
+	}
+
+	// Branch 2: normal rotation (ordinal 3 >= rotate_every 3).
+	rotateGen := baseKeyGeneration(t, series.ID(), 1, 2)
+	_, err = series.PlanRenewal(RenewalFacts{
+		CurrentGeneration:   rotateGen,
+		TargetIssuerID:      series.ManagementAuthorityID(),
+		TargetIssuerWindow:  issuerWindow,
+		RequestedWindow:     mismatchedWindow,
+		KeyReadyForRenewal:  true,
+		NextKeyGenerationNo: rotateGen.GenerationNo() + 1,
+	}, now)
+	if !errors.Is(err, ErrPolicyViolation) {
+		t.Fatalf("rotate branch: expected ErrPolicyViolation for mismatched window, got %v", err)
+	}
+
+	// Branch 3: emergency reissue.
+	emergencyGen := baseKeyGeneration(t, series.ID(), 1, 0)
+	_, err = series.PlanRenewal(RenewalFacts{
+		CurrentGeneration:   emergencyGen,
+		TargetIssuerID:      series.ManagementAuthorityID(),
+		TargetIssuerWindow:  issuerWindow,
+		RequestedWindow:     mismatchedWindow,
+		KeyReadyForRenewal:  false,
+		IsEmergencyReissue:  true,
+		NextKeyGenerationNo: emergencyGen.GenerationNo() + 1,
+	}, now)
+	if !errors.Is(err, ErrPolicyViolation) {
+		t.Fatalf("emergency branch: expected ErrPolicyViolation for mismatched window, got %v", err)
+	}
+}
+
+// TestPlanRenewal_ComputesWindowFromPolicy verifies the positive path: a
+// RequestedWindow whose NotAfter exactly matches the policy's calendar
+// computation succeeds and RenewalPlan.Window carries that policy-derived
+// window, across reuse, rotation and emergency branches. It also exercises
+// the policy computation through the actual PlanRenewal call (not
+// PlanLeafWindow in isolation) for a leap-day notBefore so the month-end
+// clamp rule is checked on this path too.
+func TestPlanRenewal_ComputesWindowFromPolicy(t *testing.T) {
+	series, err := NewLeafSeries(baseSeriesFacts(t, 3))
+	if err != nil {
+		t.Fatalf("NewLeafSeries: %v", err)
+	}
+	now := NewInstant(time.Date(2028, 2, 29, 0, 0, 0, 0, time.UTC)) // leap day
+	issuerWindow := mustWindowFacts(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2035, 1, 1, 0, 0, 0, 0, time.UTC))
+	// 2029 is not a leap year, so the 1-year policy clamps to Feb 28.
+	wantNotAfter := time.Date(2029, 2, 28, 0, 0, 0, 0, time.UTC)
+	correctWindow := mustWindowFacts(time.Date(2028, 2, 29, 0, 0, 0, 0, time.UTC), wantNotAfter)
+
+	reuseGen := baseKeyGeneration(t, series.ID(), 1, 0)
+	reusePlan, err := series.PlanRenewal(RenewalFacts{
+		CurrentGeneration:  reuseGen,
+		TargetIssuerID:     series.ManagementAuthorityID(),
+		TargetIssuerWindow: issuerWindow,
+		RequestedWindow:    correctWindow,
+		KeyReadyForRenewal: true,
+	}, now)
+	if err != nil {
+		t.Fatalf("reuse branch: PlanRenewal: %v", err)
+	}
+	if got := reusePlan.Window.NotAfter().Time(); !got.Equal(wantNotAfter) {
+		t.Fatalf("reuse branch: expected not_after %v, got %v", wantNotAfter, got)
+	}
+
+	rotateGen := baseKeyGeneration(t, series.ID(), 1, 2)
+	rotatePlan, err := series.PlanRenewal(RenewalFacts{
+		CurrentGeneration:   rotateGen,
+		TargetIssuerID:      series.ManagementAuthorityID(),
+		TargetIssuerWindow:  issuerWindow,
+		RequestedWindow:     correctWindow,
+		KeyReadyForRenewal:  true,
+		NextKeyGenerationNo: rotateGen.GenerationNo() + 1,
+	}, now)
+	if err != nil {
+		t.Fatalf("rotate branch: PlanRenewal: %v", err)
+	}
+	if got := rotatePlan.Window.NotAfter().Time(); !got.Equal(wantNotAfter) {
+		t.Fatalf("rotate branch: expected not_after %v, got %v", wantNotAfter, got)
+	}
+
+	emergencyGen := baseKeyGeneration(t, series.ID(), 1, 0)
+	emergencyPlan, err := series.PlanRenewal(RenewalFacts{
+		CurrentGeneration:   emergencyGen,
+		TargetIssuerID:      series.ManagementAuthorityID(),
+		TargetIssuerWindow:  issuerWindow,
+		RequestedWindow:     correctWindow,
+		KeyReadyForRenewal:  false,
+		IsEmergencyReissue:  true,
+		NextKeyGenerationNo: emergencyGen.GenerationNo() + 1,
+	}, now)
+	if err != nil {
+		t.Fatalf("emergency branch: PlanRenewal: %v", err)
+	}
+	if got := emergencyPlan.Window.NotAfter().Time(); !got.Equal(wantNotAfter) {
+		t.Fatalf("emergency branch: expected not_after %v, got %v", wantNotAfter, got)
+	}
+}
+
 // TestNewLeafKeyGeneration_ImportStartsAtZeroWithUnknownHistory verifies the
 // import registration rule.
 // [certificate-lifecycle.md §갱신 횟수 계산: "가져온 Leaf는 등록 시 cert-me가

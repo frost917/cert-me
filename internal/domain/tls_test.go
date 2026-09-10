@@ -249,3 +249,167 @@ func mkKeyMaterialID(t *testing.T) KeyMaterialID {
 	}
 	return id
 }
+
+func mkRecoveryRequiredChange(t *testing.T, previousSuffix, candidateSuffix byte) TLSChange {
+	t.Helper()
+	c, err := NewCandidateTLSChange(mkTLSVersionID(t, previousSuffix), mkTLSVersionID(t, candidateSuffix))
+	if err != nil {
+		t.Fatalf("new candidate: %v", err)
+	}
+	validated, err := c.ValidateCandidate(passingFacts())
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	committed, err := validated.Commit(t0())
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	recovery, err := committed.MarkRecoveryRequired("apply_result_unknown", t0())
+	if err != nil {
+		t.Fatalf("mark recovery required: %v", err)
+	}
+	return recovery
+}
+
+// Reproduces the reviewer's dead end: from recovery_required, both Apply and
+// RollbackApply refuse because the phase is not committed, and
+// ValidateCandidate/Commit refuse because the phase is not prepared. Without
+// an explicit recovery-completing transition there is no way out.
+func TestTLSChange_RecoveryRequiredIsADeadEndWithoutReconcile(t *testing.T) {
+	recovery := mkRecoveryRequiredChange(t, '1', '2')
+
+	if _, err := recovery.Apply(t0()); err == nil {
+		t.Fatalf("expected Apply from recovery_required to be refused")
+	}
+	if _, err := recovery.RollbackApply("x", t0()); err == nil {
+		t.Fatalf("expected RollbackApply from recovery_required to be refused")
+	}
+	if _, err := recovery.ValidateCandidate(passingFacts()); err == nil {
+		t.Fatalf("expected ValidateCandidate from recovery_required to be refused")
+	}
+	if _, err := recovery.Commit(t0()); err == nil {
+		t.Fatalf("expected Commit from recovery_required to be refused")
+	}
+}
+
+// Case (1): the recorded candidate re-validates against a stored snapshot ->
+// Reconcile completes the change as applied.
+func TestTLSChange_ReconcileCandidateRevalidatesCompletesApplied(t *testing.T) {
+	recovery := mkRecoveryRequiredChange(t, '1', '2')
+
+	resolved, err := recovery.Reconcile(TLSReconcileFacts{
+		CandidateVersionID: recovery.CandidateVersionID(),
+		CandidateFacts:     passingFacts(),
+	}, t0())
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if resolved.Phase() != TLSChangePhaseApplied {
+		t.Fatalf("expected applied phase, got %s", resolved.Phase())
+	}
+	if !resolved.IsActive() {
+		t.Fatalf("expected reconciled candidate to be active")
+	}
+}
+
+// Case (2): the candidate cannot be used, but the recorded previous version
+// re-validates -> Reconcile completes the change as rolled_back.
+func TestTLSChange_ReconcileCandidateUnusableRollsBackToPrevious(t *testing.T) {
+	recovery := mkRecoveryRequiredChange(t, '1', '2')
+
+	failingCandidate := passingFacts()
+	failingCandidate.ChainVerified = false
+
+	resolved, err := recovery.Reconcile(TLSReconcileFacts{
+		CandidateVersionID: recovery.CandidateVersionID(),
+		CandidateFacts:     failingCandidate,
+		PreviousVersionID:  recovery.PreviousVersionID(),
+		PreviousFacts:      passingFacts(),
+	}, t0())
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if resolved.Phase() != TLSChangePhaseRolledBack {
+		t.Fatalf("expected rolled_back phase, got %s", resolved.Phase())
+	}
+	if resolved.IsActive() {
+		t.Fatalf("rolled back change must not be active")
+	}
+}
+
+// Case (3): neither the candidate nor the previous version can be
+// re-validated -> the change must stay recovery_required (maintenance), not
+// silently flip to any success outcome.
+func TestTLSChange_ReconcileBothUnusableStaysRecoveryRequired(t *testing.T) {
+	recovery := mkRecoveryRequiredChange(t, '1', '2')
+
+	failing := passingFacts()
+	failing.ChainVerified = false
+
+	resolved, err := recovery.Reconcile(TLSReconcileFacts{
+		CandidateVersionID: recovery.CandidateVersionID(),
+		CandidateFacts:     failing,
+		PreviousVersionID:  recovery.PreviousVersionID(),
+		PreviousFacts:      failing,
+	}, t0())
+	if err == nil {
+		t.Fatalf("expected reconcile to report that nothing could be resolved")
+	}
+	if resolved.Phase() != TLSChangePhaseRecoveryRequired {
+		t.Fatalf("expected change to remain recovery_required, got %s", resolved.Phase())
+	}
+}
+
+// Reconcile must not let an unrelated version id complete this change's
+// recovery, even if that unrelated version would itself validate cleanly.
+func TestTLSChange_ReconcileRejectsMismatchedTargetVersion(t *testing.T) {
+	recovery := mkRecoveryRequiredChange(t, '1', '2')
+	wrongVersion := mkTLSVersionID(t, '9')
+
+	if _, err := recovery.Reconcile(TLSReconcileFacts{
+		CandidateVersionID: wrongVersion,
+		CandidateFacts:     passingFacts(),
+	}, t0()); err == nil {
+		t.Fatalf("expected reconcile with a mismatched candidate version id to be refused")
+	}
+
+	if _, err := recovery.Reconcile(TLSReconcileFacts{
+		CandidateVersionID: recovery.CandidateVersionID(),
+		CandidateFacts:     func() TLSValidationFacts { f := passingFacts(); f.ChainVerified = false; return f }(),
+		PreviousVersionID:  wrongVersion,
+		PreviousFacts:      passingFacts(),
+	}, t0()); err == nil {
+		t.Fatalf("expected reconcile with a mismatched previous version id to be refused")
+	}
+}
+
+// §9: Reconcile never activates a merely prepared candidate. Reconcile must
+// refuse a prepared (not recovery_required) change outright.
+func TestTLSChange_ReconcileRefusesPreparedCandidate(t *testing.T) {
+	c, err := NewCandidateTLSChange(mkTLSVersionID(t, '1'), mkTLSVersionID(t, '2'))
+	if err != nil {
+		t.Fatalf("new candidate: %v", err)
+	}
+	if _, err := c.Reconcile(TLSReconcileFacts{
+		CandidateVersionID: c.CandidateVersionID(),
+		CandidateFacts:     passingFacts(),
+	}, t0()); err == nil {
+		t.Fatalf("expected reconcile of a merely prepared change to be refused")
+	}
+
+	// Also refused once merely committed (not yet stuck in recovery).
+	validated, err := c.ValidateCandidate(passingFacts())
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	committed, err := validated.Commit(t0())
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if _, err := committed.Reconcile(TLSReconcileFacts{
+		CandidateVersionID: committed.CandidateVersionID(),
+		CandidateFacts:     passingFacts(),
+	}, t0()); err == nil {
+		t.Fatalf("expected reconcile of a committed (not recovery_required) change to be refused")
+	}
+}

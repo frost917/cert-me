@@ -347,6 +347,75 @@ func (c TLSChange) MarkRecoveryRequired(errorCode string, now Instant) (TLSChang
 	return next, nil
 }
 
+// TLSReconcileFacts are the outcome of Reconcile re-checking stored,
+// validated snapshots for one recovery_required change
+// (backend-implementation.md §9 "committed 상태는 저장된 후보를 다시
+// 검증해 적용한 뒤 applied로 완결한다. 후보가 사용할 수 없으면 이전 정상
+// 버전을 검증해 rollback한다. ... DB의 검증된 snapshot만 사용한다.").
+// The adapter fills in which stored version it re-validated as which role;
+// the domain only trusts a role whose ID matches the version this specific
+// change actually recorded for that role, so an unrelated version's facts
+// can never complete someone else's recovery.
+//
+// A zero CandidateVersionID/PreviousVersionID means that role was not
+// re-checked at all (e.g. there is no previous version to fall back to).
+type TLSReconcileFacts struct {
+	CandidateVersionID TLSVersionID
+	CandidateFacts     TLSValidationFacts
+	PreviousVersionID  TLSVersionID
+	PreviousFacts      TLSValidationFacts
+}
+
+// Reconcile completes a recovery_required change per §9: it never activates
+// a merely prepared candidate, it never trusts an unvalidated live file, and
+// it never lets an arbitrary version id stand in for this change's own
+// candidate/previous version. Exactly one of three outcomes results:
+//
+//   - the recorded candidate re-validates -> applied (candidate wins);
+//   - the candidate cannot be used but the recorded previous version
+//     re-validates -> rolled_back;
+//   - neither re-validates -> the change stays recovery_required
+//     (maintenance) and Reconcile reports that nothing could be resolved.
+func (c TLSChange) Reconcile(facts TLSReconcileFacts, now Instant) (TLSChange, error) {
+	if c.phase != TLSChangePhaseRecoveryRequired {
+		return TLSChange{}, NewPolicyError(ErrInvalidTransition, "tls_change_not_recovery_required",
+			fmt.Sprintf("tls change is %s, not recovery_required", c.phase))
+	}
+	if facts.CandidateVersionID != "" && facts.CandidateVersionID != c.candidateVersionID {
+		return TLSChange{}, NewPolicyError(ErrInvalidValue, "tls_recovery_target_mismatch",
+			"reconciled candidate version does not match this change's own candidate")
+	}
+	if facts.PreviousVersionID != "" && facts.PreviousVersionID != c.previousVersionID {
+		return TLSChange{}, NewPolicyError(ErrInvalidValue, "tls_recovery_target_mismatch",
+			"reconciled previous version does not match this change's own previous version")
+	}
+
+	if facts.CandidateVersionID != "" && facts.CandidateVersionID == c.candidateVersionID && facts.CandidateFacts.allPass() {
+		next := c
+		next.validated = true
+		next.errorCode = ""
+		next.phase = TLSChangePhaseApplied
+		next.version = c.version.Next()
+		_ = now
+		return next, nil
+	}
+
+	if facts.PreviousVersionID != "" && facts.PreviousVersionID == c.previousVersionID && facts.PreviousFacts.allPass() {
+		next := c
+		next.phase = TLSChangePhaseRolledBack
+		next.errorCode = "tls_recovery_rolled_back_to_previous"
+		next.version = c.version.Next()
+		_ = now
+		return next, nil
+	}
+
+	// Neither the candidate nor the previous version could be re-validated
+	// from stored snapshots: stay recovery_required (maintenance) rather
+	// than guessing a success outcome.
+	return c, NewPolicyError(ErrPolicyViolation, "tls_recovery_unresolved",
+		"neither the candidate nor the previous version could be re-validated; change stays recovery_required")
+}
+
 // CanActivate reports whether this change is ready for the installer swap
 // step (i.e. Activate's "committed" precondition).
 func (c TLSChange) CanActivate() bool { return c.phase == TLSChangePhaseCommitted }
