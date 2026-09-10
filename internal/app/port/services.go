@@ -78,23 +78,22 @@ func (s AuthorizationScope) AuthorityIDs() []domain.AuthorityID {
 // instead of a compile error or a caught validation failure.
 //
 // The constants below are the service.Method pairs docs/backend-
-// implementation.md §3's table names explicitly and unambiguously. Two
-// parts of §3 do NOT let this file pin a complete set, and are deliberately
-// left out rather than guessed at:
-//   - QueryService's row lists its methods only as the combinatorial
-//     "List/Get Authority, Series, Certificate, Revocation, Transition,
-//     Import, Job, Audit" plus GetCRLStatus/ReadPublicCA -- it does not
-//     spell out whether List and Get on each noun are one action or two,
-//     or what the exact method name is for each.
-//   - TLSService's row lists "Bootstrap/Reconcile → 내부 결과" as a single
-//     slash-joined cell, which does not say whether Bootstrap and Reconcile
-//     are one action or two, or confirm their exact spelling.
+// implementation.md §3's table names explicitly and unambiguously, plus the
+// QueryService and TLS internal actions docs/backend-implementation.md §13
+// ruling 5 has since settled:
+//   - QueryService gets one Action per List/Get pair the ruling names --
+//     Authority, Series, Certificate, Revocation, Transition, Import, Job --
+//     plus separate ListAudit/ExportAudit (not List+Get; there is no
+//     single-item Audit read in the real API) and GetCRLStatus/ReadPublicCA.
+//     Ruling 5 is explicit that no single-audit-get action is added for
+//     symmetry with the others: "실제 API에 없는 단일 Audit 조회는 신설하지
+//     않는다".
+//   - TLS.Bootstrap and TLS.Reconcile are separate actions, each gated to
+//     its one matching contract.InternalOperation -- see
+//     actionInternalOperations below.
 //
-// Declaring a guessed name for either would be inventing product behavior
-// this interface's implementers would then be held to, which is exactly
-// what finding P4 flags ProfileValidator's comment for doing elsewhere in
-// this file -- so QueryService's and TLSService's internal actions are
-// absent here rather than filled in with an invented name.
+// Ruling 5's closing sentence, "미정의 Action은 거부한다", is Validate's
+// existing default-deny behavior; it did not need a new action.
 type Action string
 
 const (
@@ -144,7 +143,62 @@ const (
 	ActionMaintenanceFinalizeRestore  Action = "Maintenance.FinalizeRestore"
 	ActionMaintenanceRecoverTransfers Action = "Maintenance.RecoverTransfers"
 	ActionMaintenancePruneAudit       Action = "Maintenance.PruneAudit"
+
+	// TLS.Bootstrap/TLS.Reconcile: internal-only, each paired to exactly one
+	// contract.InternalOperation via actionInternalOperations
+	// (docs/backend-implementation.md §13 ruling 5 "TLS.Bootstrap과
+	// TLS.Reconcile도 별도 Action이며 대응 내부 operation만 허용한다").
+	ActionTLSBootstrap Action = "TLS.Bootstrap"
+	ActionTLSReconcile Action = "TLS.Reconcile"
+
+	// Query actions (docs/backend-implementation.md §13 ruling 5). Each
+	// List/Get pair on a noun is two separate actions; Audit is the named
+	// exception with ListAudit/ExportAudit instead of ListAudit/GetAudit,
+	// matching the real API's audit export endpoint.
+	ActionQueryListAuthority   Action = "Query.ListAuthority"
+	ActionQueryGetAuthority    Action = "Query.GetAuthority"
+	ActionQueryListSeries      Action = "Query.ListSeries"
+	ActionQueryGetSeries       Action = "Query.GetSeries"
+	ActionQueryListCertificate Action = "Query.ListCertificate"
+	ActionQueryGetCertificate  Action = "Query.GetCertificate"
+	ActionQueryListRevocation  Action = "Query.ListRevocation"
+	ActionQueryGetRevocation   Action = "Query.GetRevocation"
+	ActionQueryListTransition  Action = "Query.ListTransition"
+	ActionQueryGetTransition   Action = "Query.GetTransition"
+	ActionQueryListImport      Action = "Query.ListImport"
+	ActionQueryGetImport       Action = "Query.GetImport"
+	ActionQueryListJob         Action = "Query.ListJob"
+	ActionQueryGetJob          Action = "Query.GetJob"
+	ActionQueryListAudit       Action = "Query.ListAudit"
+	ActionQueryExportAudit     Action = "Query.ExportAudit"
+	ActionQueryGetCRLStatus    Action = "Query.GetCRLStatus"
+	ActionQueryReadPublicCA    Action = "Query.ReadPublicCA"
 )
+
+// actionInternalOperations pairs an internal-only Action to the single
+// contract.InternalOperation an internal principal must hold to exercise
+// it (docs/backend-implementation.md §13 ruling 5 "대응 내부 operation만
+// 허용한다"). An Authorizer implementation checks this pairing --
+// principal.Can(op) for the op this map names -- rather than each
+// implementation inventing its own Action<->InternalOperation guess; a
+// principal minted for InternalOperationTLSBootstrap has Can(TLSBootstrap)
+// true and Can(TLSReconcile) false (contract.Principal.Can/
+// InternalPrincipalFactory.Principal already enforce a principal carries
+// only the operation(s) it was minted for), so pairing ActionTLSReconcile
+// to a *different* operation here is what makes that principal unable to
+// exercise ActionTLSReconcile.
+var actionInternalOperations = map[Action]contract.InternalOperation{
+	ActionTLSBootstrap: contract.InternalOperationTLSBootstrap,
+	ActionTLSReconcile: contract.InternalOperationTLSReconcile,
+}
+
+// RequiredInternalOperation reports the single contract.InternalOperation
+// an internal principal must hold to exercise a, and whether a is paired to
+// one at all (most actions are not internal-only and have no entry).
+func (a Action) RequiredInternalOperation() (contract.InternalOperation, bool) {
+	op, ok := actionInternalOperations[a]
+	return op, ok
+}
 
 // definedActions backs Validate. It is not exported: callers compare
 // against the constants above, not against membership in this set directly.
@@ -166,8 +220,18 @@ var definedActions = map[Action]bool{
 	ActionCRLRequestPublication: true, ActionCRLPublish: true,
 	ActionTLSStatus: true, ActionTLSUploadCandidate: true, ActionTLSIssueCandidate: true,
 	ActionTLSReload: true, ActionTLSActivate: true,
+	ActionTLSBootstrap: true, ActionTLSReconcile: true,
 	ActionMaintenanceRotate: true, ActionMaintenanceFinalizeRestore: true,
 	ActionMaintenanceRecoverTransfers: true, ActionMaintenancePruneAudit: true,
+	ActionQueryListAuthority: true, ActionQueryGetAuthority: true,
+	ActionQueryListSeries: true, ActionQueryGetSeries: true,
+	ActionQueryListCertificate: true, ActionQueryGetCertificate: true,
+	ActionQueryListRevocation: true, ActionQueryGetRevocation: true,
+	ActionQueryListTransition: true, ActionQueryGetTransition: true,
+	ActionQueryListImport: true, ActionQueryGetImport: true,
+	ActionQueryListJob: true, ActionQueryGetJob: true,
+	ActionQueryListAudit: true, ActionQueryExportAudit: true,
+	ActionQueryGetCRLStatus: true, ActionQueryReadPublicCA: true,
 }
 
 // Validate reports an error for any Action outside the fixed constant set
@@ -374,47 +438,148 @@ type URLValidator interface {
 	Validate(ctx context.Context, rawURL string) error
 }
 
-// ImportBundleInput is the raw uploaded import material: a certificate (and
-// optional chain) plus an optional private key whose passphrase, if any,
-// arrives as a secret.Input the parser uses synchronously and does not
-// retain.
-//
-// S1 fix: PrivateKey used to be a public PrivateKeyDER []byte field. Unlike
-// the certificate/chain DER (public by construction), an uploaded private
-// key is exactly the plaintext B02's acceptance criterion "비밀 JSON/로그
-// 차단" is about, so it now carries the same secret.Input discipline
-// Passphrase already had: used synchronously through Use inside PKIParser,
-// not retained, and refused by json.Marshal/fmt/slog.
-//
-// This type's exact shape is under-specified by docs/backend-
-// implementation.md §5, which names PKIParser as an Import dependency but
-// gives no method signatures (unlike KeyEngine/CertificateSigner/CRLSigner
-// in §6, which are literal code). This is this file's own best-effort
-// completion of that gap, flagged for the lead in the B02 report rather than
-// treated as settled product behavior.
-type ImportBundleInput struct {
-	CertificateDER []byte
-	ChainDER       [][]byte
-	PrivateKey     *secret.Input // nil when no private key was uploaded
-	Passphrase     *secret.Input
+// ParsedCertificateFacts is one certificate's parsed, public facts.
+// Deliberately absent: any storage identifier (CertificateID,
+// KeyMaterialID, IssuerCAKeyGenerationID, CreatedByAccountID, Version) and
+// any issuer *relationship* -- docs/backend-implementation.md §13 ruling 4
+// "파서가 DB ID나 issuer 관계를 임의 생성하지 않고 app이 검증 후 연결한다".
+// IssuerSubject/AuthorityKeyID/SubjectKeyID are raw facts read off the DER
+// (not a resolved relationship) so the app can look up the matching stored
+// Authority itself, inside a transaction, instead of trusting a parser-
+// picked ID. SPKIFingerprint is the normalized-SPKI hash docs/pki-import.md
+// "중복·충돌 처리" uses for public-key-duplicate detection; it is a pure
+// function of PublicKey so computing it here does not mint anything.
+type ParsedCertificateFacts struct {
+	DER             []byte
+	PublicKey       domain.PublicKey
+	SPKIFingerprint domain.Fingerprint
+	KeyAlgorithm    domain.KeyAlgorithm
+	Serial          domain.SerialNumber
+	Validity        domain.ValidityWindow
+	Subject         domain.Subject
+	SANs            []domain.SAN
+	Kind            domain.CertificateKind // from the BasicConstraints CA boolean, not assigned by the parser
+	IssuerSubject   domain.Subject         // the DER's own issuer DN, for the app's own issuer lookup
+	AuthorityKeyID  []byte                 // raw AKI keyIdentifier, nil if the extension is absent
+	SubjectKeyID    []byte                 // raw SKI, nil if the extension is absent
 }
 
-// ImportBundleFacts is PKIParser's validated output: the parsed certificate
-// facts plus, when a private key was supplied and matches the certificate's
-// public key, the validated key input KeyEngine.ImportCA/ImportTLS expects.
-type ImportBundleFacts struct {
-	Certificate domain.CertificateFacts
-	CAKey       *ValidatedCAKeyInput  // nil when no private key was uploaded, or it was not a CA key
-	TLSKey      *ValidatedTLSKeyInput // nil unless the caller specifically requested the internal_tls import path
+// CertificateBundleInput is a raw upload of one or more PEM- or DER-encoded
+// certificates (docs/backend-implementation.md §13 ruling 4 "인증서 PEM/DER
+// 묶음"). Format/encoding limits are docs/pki-import.md's "지원 범위와 반영
+// 계약" and "import 자원·공개 기록 경계" sections, not restated here.
+type CertificateBundleInput struct {
+	Data []byte
 }
 
-// PKIParser parses an uploaded import bundle into validated facts. It only
-// accepts the fixed set of supported format/encryption combinations
+// CertificateBundleFacts is ParseCertificateBundle's output: one
+// ParsedCertificateFacts per certificate found in Data, in upload order.
+type CertificateBundleFacts struct {
+	Certificates []ParsedCertificateFacts
+}
+
+// RevokedEntryFacts is one CRL entry's public facts. It carries no
+// RevocationID or CAKeyGenerationID -- those are the app's to assign after
+// it has matched the CRL's issuer to a stored Authority
+// (docs/backend-implementation.md §13 ruling 4).
+type RevokedEntryFacts struct {
+	Serial    domain.SerialNumber
+	RevokedAt domain.Instant
+	Reason    domain.RevocationReason
+}
+
+// CRLInput is a raw upload of one PEM- or DER-encoded CRL
+// (docs/backend-implementation.md §13 ruling 4 "CRL PEM/DER").
+type CRLInput struct {
+	Data []byte
+}
+
+// ParsedCRLFacts is ParseCRL's output. DER is the exact signed bytes the CRL
+// arrived as, kept so the app can re-verify (or hand to a signature
+// verifier) the issuer/signature relationship against whichever stored
+// Authority it matches IssuerSubject/AuthorityKeyID to -- the parser itself
+// does not decide that relationship (ruling 4 "CRL의 issuer·서명 검증에
+// 필요한 정보 ... 를 포함한다" plus the same "파서가 ... issuer 관계를 임의
+// 생성하지 않는다" restriction that applies to certificates). Number,
+// ThisUpdate/NextUpdate and Revoked are the "번호·기간·폐기 항목" the ruling
+// names explicitly.
+type ParsedCRLFacts struct {
+	DER            []byte
+	IssuerSubject  domain.Subject
+	AuthorityKeyID []byte // raw AKI keyIdentifier off the CRL, nil if absent
+	Number         domain.CRLNumber
+	ThisUpdate     domain.Instant
+	NextUpdate     domain.Instant
+	Revoked        []RevokedEntryFacts
+}
+
+// CAKeyInput is an uploaded CA private key plus the certificate public key
+// it must match. Data is the raw PEM or DER key material (public by
+// construction: it is still encrypted-or-plaintext key bytes, never a
+// secret.Input by itself, since the passphrase -- not the ciphertext -- is
+// what must never be retained). Passphrase is nil for an unencrypted key.
+// ExpectedPublicKey is normally the PublicKey a prior ParseCertificateBundle
+// call returned for the certificate this key is claimed to belong to.
+type CAKeyInput struct {
+	Data              []byte
+	Passphrase        *secret.Input
+	ExpectedPublicKey domain.PublicKey
+}
+
+// TLSKeyInput is CAKeyInput's internal_tls-purpose counterpart.
+type TLSKeyInput struct {
+	Data              []byte
+	Passphrase        *secret.Input
+	ExpectedPublicKey domain.PublicKey
+}
+
+// PKIParser parses uploaded import material into validated, public facts.
+// It only accepts the fixed set of supported format/encryption combinations
 // (docs/backend-implementation.md §6 "PKIParser는 지원 형식·암호화 조합만
 // 받아들이며 라이브러리의 더 넓은 지원 목록을 그대로 노출하지 않는다. 임의
-// OID나 scrypt로 자동 fallback하지 않는다").
+// OID나 scrypt로 자동 fallback하지 않는다"); the numeric format, encryption
+// and resource limits themselves are docs/pki-import.md's "지원 범위와 반영
+// 계약" and "import 자원·공개 기록 경계" sections and are not restated here.
+//
+// The four material kinds -- certificate bundle, CRL, CA private key,
+// internal TLS private key -- are separate typed methods rather than one
+// polymorphic Parse, per docs/backend-implementation.md §13 ruling 4
+// ("인증서 PEM/DER 묶음, CRL PEM/DER, CA 개인키, 내부 TLS 개인키를 구분하는
+// typed 입력/출력 메서드"). There is deliberately no method for an ordinary
+// leaf private key: ruling 4's "일반 leaf 개인키 import는 허용하지 않는다"
+// is expressed structurally here, not just documented -- ParseCAKey and
+// ParseInternalTLSKey are the only two ways to hand this interface a
+// private key at all, and each hardcodes its own KeySpec purpose
+// (ca_signing/bootstrap_ca or internal_tls) internally rather than
+// accepting a caller-supplied domain.SecretPurpose that could be set to
+// leaf_delivery or anything else. A caller wanting to import a leaf key has
+// no method on this interface to call; there is no third, purpose-parameterized
+// method whose argument could be misused to reach a leaf import path.
 type PKIParser interface {
-	Parse(ctx context.Context, input ImportBundleInput) (ImportBundleFacts, error)
+	// ParseCertificateBundle parses every certificate in input.Data.
+	ParseCertificateBundle(ctx context.Context, input CertificateBundleInput) (CertificateBundleFacts, error)
+
+	// ParseCRL parses one CRL.
+	ParseCRL(ctx context.Context, input CRLInput) (ParsedCRLFacts, error)
+
+	// ParseCAKey decrypts (if input.Passphrase is set) and validates a CA
+	// private key, checking that its derived public key equals
+	// input.ExpectedPublicKey (docs/backend-implementation.md §13 ruling 4
+	// "키 입력은 secret.Input이고 CA/internal_tls 목적과 인증서 공개키
+	// 일치를 검증한다"). On success the returned ValidatedCAKeyInput.PrivateKey
+	// is a secret.Input this call created; the caller takes ownership of it,
+	// passes it to KeyEngine.ImportCA, and Closes it once that call returns
+	// (docs/backend-implementation.md §13 ruling 4 "검증된 키 입력은
+	// 호출자가 KeyEngine.Import 후 Close"). On error -- including a public
+	// key mismatch discovered only after the key was already decrypted into
+	// a secret.Input -- ParseCAKey must Close any secret.Input it created
+	// before returning, rather than leaking it to a caller that has nothing
+	// to Close (ruling 4 "중간 실패 시 파서가 이미 만든 비밀을 닫는다").
+	ParseCAKey(ctx context.Context, input CAKeyInput) (ValidatedCAKeyInput, error)
+
+	// ParseInternalTLSKey is ParseCAKey's internal_tls-purpose counterpart,
+	// with the identical validation and close-on-failure ownership contract.
+	ParseInternalTLSKey(ctx context.Context, input TLSKeyInput) (ValidatedTLSKeyInput, error)
 }
 
 // ChainValidator verifies that a leaf certificate chains to a trusted root
