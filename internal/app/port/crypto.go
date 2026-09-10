@@ -92,7 +92,7 @@ type KeyEngine interface {
 	// re-encrypts it under keys.TargetGenerationID, without ever exposing
 	// the plaintext to the caller. MaintenanceService.Rotate calls this once
 	// per stored secret and per verifier inside one UnitOfWork.
-	Reencrypt(ctx context.Context, secret domain.EncryptedSecret, keys RotationKeys) (domain.EncryptedSecret, error)
+	Reencrypt(ctx context.Context, encrypted domain.EncryptedSecret, keys RotationKeys) (domain.EncryptedSecret, error)
 }
 
 // CertificateSigner signs a prepared issuance plan with an already-encrypted

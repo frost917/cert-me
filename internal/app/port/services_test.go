@@ -25,3 +25,69 @@ func TestAuthorizationScope_EmptyIsNil(t *testing.T) {
 		t.Fatalf("an empty scope must report a nil id list, got %v", got)
 	}
 }
+
+func TestEncodedBundle_CloseZeroesData(t *testing.T) {
+	bundle := EncodedBundle{Data: []byte{1, 2, 3, 4}, ContentType: "application/x-pem-file"}
+	bundle.Close()
+
+	if bundle.Data != nil {
+		t.Fatalf("Close must drop the reference, got %v", bundle.Data)
+	}
+}
+
+func TestEncodedBundle_CloseIsIdempotent(t *testing.T) {
+	bundle := EncodedBundle{Data: []byte{1, 2, 3, 4}}
+	bundle.Close()
+	bundle.Close() // must not panic on an already-zeroed/nil Data
+
+	if bundle.Data != nil {
+		t.Fatalf("Data must stay nil after a second Close, got %v", bundle.Data)
+	}
+}
+
+func TestEncodedBundle_CloseOnZeroValue(t *testing.T) {
+	var bundle EncodedBundle
+	bundle.Close() // must not panic on a zero value
+
+	var nilBundle *EncodedBundle
+	nilBundle.Close() // must not panic on a nil receiver
+}
+
+func TestEncodedBundle_CloseActuallyOverwritesBytes(t *testing.T) {
+	data := []byte{0xAA, 0xBB, 0xCC, 0xDD}
+	bundle := EncodedBundle{Data: data}
+	bundle.Close()
+
+	// The original backing array (still reachable via the pre-Close local
+	// variable) must have been overwritten with zeros, not merely detached.
+	for i, b := range data {
+		if b != 0 {
+			t.Fatalf("byte %d not zeroed: got %#x", i, b)
+		}
+	}
+}
+
+func TestAction_Validate(t *testing.T) {
+	tests := []struct {
+		name    string
+		action  Action
+		wantErr bool
+	}{
+		{"known action", ActionIssuanceIssue, false},
+		{"another known action", ActionAuthorityDestroyKey, false},
+		{"empty action", Action(""), true},
+		{"typo of a known action", Action("Issuance.Issu"), true},
+		{"invented action", Action("Issuance.SuperAdminOverride"), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.action.Validate()
+			if tt.wantErr && err == nil {
+				t.Fatalf("Validate(%q): want error, got nil", tt.action)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("Validate(%q): want nil, got %v", tt.action, err)
+			}
+		})
+	}
+}

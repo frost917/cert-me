@@ -2,6 +2,7 @@ package port
 
 import (
 	"context"
+	"fmt"
 
 	"cert-me/internal/app/contract"
 	"cert-me/internal/domain"
@@ -67,13 +68,122 @@ func (s AuthorizationScope) AuthorityIDs() []domain.AuthorityID {
 	return out
 }
 
+// Action names one authorization check. It is a named type rather than a
+// bare string precisely because every other enum in this codebase already
+// gets that treatment (docs/backend-implementation.md §2's domain ID types,
+// domain.KeyAlgorithm, domain.SecretPurpose, ...): an unvalidated string
+// typo silently becomes a *different*, possibly-passing permission check
+// instead of a compile error or a caught validation failure.
+//
+// The constants below are the service.Method pairs docs/backend-
+// implementation.md §3's table names explicitly and unambiguously. Two
+// parts of §3 do NOT let this file pin a complete set, and are deliberately
+// left out rather than guessed at:
+//   - QueryService's row lists its methods only as the combinatorial
+//     "List/Get Authority, Series, Certificate, Revocation, Transition,
+//     Import, Job, Audit" plus GetCRLStatus/ReadPublicCA -- it does not
+//     spell out whether List and Get on each noun are one action or two,
+//     or what the exact method name is for each.
+//   - TLSService's row lists "Bootstrap/Reconcile → 내부 결과" as a single
+//     slash-joined cell, which does not say whether Bootstrap and Reconcile
+//     are one action or two, or confirm their exact spelling.
+//
+// Declaring a guessed name for either would be inventing product behavior
+// this interface's implementers would then be held to, which is exactly
+// what finding P4 flags ProfileValidator's comment for doing elsewhere in
+// this file -- so QueryService's and TLSService's internal actions are
+// absent here rather than filled in with an invented name.
+type Action string
+
+const (
+	ActionSetupStatus                 Action = "Setup.Status"
+	ActionSetupCreateAdmin            Action = "Setup.CreateAdmin"
+	ActionSetupComplete               Action = "Setup.Complete"
+	ActionIdentityLogin               Action = "Identity.Login"
+	ActionIdentityLogout              Action = "Identity.Logout"
+	ActionIdentityAuthenticate        Action = "Identity.Authenticate"
+	ActionIdentityBeginReset          Action = "Identity.BeginReset"
+	ActionIdentityCompleteReset       Action = "Identity.CompleteReset"
+	ActionIdentityIssueCSRF           Action = "Identity.IssueCSRF"
+	ActionSettingsGet                 Action = "Settings.Get"
+	ActionSettingsUpdate              Action = "Settings.Update"
+	ActionAuthorityCreate             Action = "Authority.Create"
+	ActionAuthorityRename             Action = "Authority.Rename"
+	ActionAuthoritySetIssuanceState   Action = "Authority.SetIssuanceState"
+	ActionAuthorityDestroyKey         Action = "Authority.DestroyKey"
+	ActionAuthorityArchive            Action = "Authority.Archive"
+	ActionIssuanceIssue               Action = "Issuance.Issue"
+	ActionIssuanceRenew               Action = "Issuance.Renew"
+	ActionIssuanceReissue             Action = "Issuance.Reissue"
+	ActionIssuanceUpdateSeries        Action = "Issuance.UpdateSeries"
+	ActionIssuanceArchiveSeries       Action = "Issuance.ArchiveSeries"
+	ActionDistributionCreateLink      Action = "Distribution.CreateLink"
+	ActionDistributionDeliver         Action = "Distribution.Deliver"
+	ActionDistributionReportFailure   Action = "Distribution.ReportFailure"
+	ActionRevocationRevoke            Action = "Revocation.Revoke"
+	ActionRevocationCompromise        Action = "Revocation.Compromise"
+	ActionRevocationCorrect           Action = "Revocation.Correct"
+	ActionImportPreview               Action = "Import.Preview"
+	ActionImportCommit                Action = "Import.Commit"
+	ActionImportAttachSigningKey      Action = "Import.AttachSigningKey"
+	ActionImportConfirmTakeover       Action = "Import.ConfirmTakeover"
+	ActionTransitionCreate            Action = "Transition.Create"
+	ActionTransitionSetTarget         Action = "Transition.SetTarget"
+	ActionTransitionConfirmDeployment Action = "Transition.ConfirmDeployment"
+	ActionTransitionComplete          Action = "Transition.Complete"
+	ActionCRLRequestPublication       Action = "CRL.RequestPublication"
+	ActionCRLPublish                  Action = "CRL.Publish"
+	ActionTLSStatus                   Action = "TLS.Status"
+	ActionTLSUploadCandidate          Action = "TLS.UploadCandidate"
+	ActionTLSIssueCandidate           Action = "TLS.IssueCandidate"
+	ActionTLSReload                   Action = "TLS.Reload"
+	ActionTLSActivate                 Action = "TLS.Activate"
+	ActionMaintenanceRotate           Action = "Maintenance.Rotate"
+	ActionMaintenanceFinalizeRestore  Action = "Maintenance.FinalizeRestore"
+	ActionMaintenanceRecoverTransfers Action = "Maintenance.RecoverTransfers"
+	ActionMaintenancePruneAudit       Action = "Maintenance.PruneAudit"
+)
+
+// definedActions backs Validate. It is not exported: callers compare
+// against the constants above, not against membership in this set directly.
+var definedActions = map[Action]bool{
+	ActionSetupStatus: true, ActionSetupCreateAdmin: true, ActionSetupComplete: true,
+	ActionIdentityLogin: true, ActionIdentityLogout: true, ActionIdentityAuthenticate: true,
+	ActionIdentityBeginReset: true, ActionIdentityCompleteReset: true, ActionIdentityIssueCSRF: true,
+	ActionSettingsGet: true, ActionSettingsUpdate: true,
+	ActionAuthorityCreate: true, ActionAuthorityRename: true, ActionAuthoritySetIssuanceState: true,
+	ActionAuthorityDestroyKey: true, ActionAuthorityArchive: true,
+	ActionIssuanceIssue: true, ActionIssuanceRenew: true, ActionIssuanceReissue: true,
+	ActionIssuanceUpdateSeries: true, ActionIssuanceArchiveSeries: true,
+	ActionDistributionCreateLink: true, ActionDistributionDeliver: true, ActionDistributionReportFailure: true,
+	ActionRevocationRevoke: true, ActionRevocationCompromise: true, ActionRevocationCorrect: true,
+	ActionImportPreview: true, ActionImportCommit: true, ActionImportAttachSigningKey: true,
+	ActionImportConfirmTakeover: true,
+	ActionTransitionCreate:      true, ActionTransitionSetTarget: true, ActionTransitionConfirmDeployment: true,
+	ActionTransitionComplete:    true,
+	ActionCRLRequestPublication: true, ActionCRLPublish: true,
+	ActionTLSStatus: true, ActionTLSUploadCandidate: true, ActionTLSIssueCandidate: true,
+	ActionTLSReload: true, ActionTLSActivate: true,
+	ActionMaintenanceRotate: true, ActionMaintenanceFinalizeRestore: true,
+	ActionMaintenanceRecoverTransfers: true, ActionMaintenancePruneAudit: true,
+}
+
+// Validate reports an error for any Action outside the fixed constant set
+// above -- an empty or typo'd value included.
+func (a Action) Validate() error {
+	if !definedActions[a] {
+		return fmt.Errorf("port: invalid action %q", string(a))
+	}
+	return nil
+}
+
 // Authorizer decides whether principal may perform action against scope.
 // MVP Authorization only allows the global admin
 // (docs/backend-implementation.md §2 "MVP Authorization은 전체 관리자만
 // 허용한다"), but the interface itself does not encode that restriction so a
 // later role model can implement it without a signature change.
 type Authorizer interface {
-	Authorize(ctx context.Context, principal contract.Principal, action string, scope AuthorizationScope) error
+	Authorize(ctx context.Context, principal contract.Principal, action Action, scope AuthorizationScope) error
 }
 
 // PasswordHasher hashes and verifies administrator passwords. It never sees
@@ -130,13 +240,42 @@ type DeliveryEncodeInput struct {
 	PKCS12Password *secret.Input
 }
 
-// EncodedBundle is the completed, in-memory download payload
-// (docs/backend-implementation.md §7 "encoder가 메모리 payload를 완성한다").
-// It is produced before the consuming transaction commits and only handed to
-// a DownloadSink after that commit succeeds.
+// EncodedBundle is the completed, in-memory download payload -- a DECRYPTED
+// leaf private-key bundle -- (docs/backend-implementation.md §7 "encoder가
+// 메모리 payload를 완성한다"). It is produced before the consuming
+// transaction commits and only handed to a DownloadSink after that commit
+// succeeds.
+//
+// Ownership: DeliveryEncoder.Encode's caller (DistributionService.Deliver)
+// owns the returned EncodedBundle from the moment Encode returns. It must
+// call Close in a defer covering every path out of Deliver -- the ordinary
+// return after sink.Send, the pre-commit failure path, and a panic -- so
+// that Data never outlives step 5 of §7's Deliver sequence: "Send가 반환하거나
+// panic하면 payload를 정리한다." No other component may retain a reference to
+// Data past that point.
+//
+// This mirrors the non-retention/zeroing contract secret.Input already
+// documents (internal/secret/input.go: "Close()는 소유 버퍼를 지우고 참조를
+// 끊으며 여러 번 호출해도 안전하다"): Close zeroes the owned buffer and drops
+// the reference, and is safe to call more than once, including on a zero
+// value. As with secret.Input, zeroing removes the value from this buffer;
+// it is not an absolute guarantee of memory-safe erasure, since the runtime
+// may have copied the bytes before Close ever gets a chance to run.
 type EncodedBundle struct {
 	Data        []byte
 	ContentType string
+}
+
+// Close zeroes Data and drops the reference. Safe to call more than once and
+// safe on a zero-value EncodedBundle.
+func (b *EncodedBundle) Close() {
+	if b == nil {
+		return
+	}
+	for i := range b.Data {
+		b.Data[i] = 0
+	}
+	b.Data = nil
 }
 
 // DeliveryEncoder turns a certificate and its encrypted private key into the
@@ -147,10 +286,17 @@ type DeliveryEncoder interface {
 
 // ProfileValidator checks a requested certificate profile/SAN/algorithm
 // combination against operator-configured policy beyond the fixed shape
-// rules domain.ValidateSANsForProfile already enforces (e.g. an allowed-SAN
-// domain allowlist, or a disabled key algorithm) -- product-configurable
-// checks that do not belong in the domain package because they can change
-// per installation.
+// rules domain.ValidateSANsForProfile already enforces
+// (docs/backend-implementation.md §5 lists ProfileValidator as an
+// Authority/Issuance dependency, alongside KeyEngine and
+// CertificateSigner). Neither docs/backend-implementation.md nor
+// api/openapi.json's Settings schema currently defines what that
+// operator-configurable policy consists of -- there is no allowed-SAN
+// domain allowlist or per-algorithm enable/disable field anywhere in
+// Settings today. The concrete policy set this interface will check is
+// therefore not yet specified; this comment intentionally does not guess
+// at one so a B05 implementer is not held to product behavior nobody has
+// actually decided on.
 type ProfileValidator interface {
 	Validate(ctx context.Context, profile domain.CertificateProfile, sans []domain.SAN, algorithm domain.KeyAlgorithm) error
 }
