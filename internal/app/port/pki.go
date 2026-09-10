@@ -168,6 +168,43 @@ type PKIRepository interface {
 	// 모두 폐기").
 	ListCertificatesUsingKey(ctx context.Context, keyMaterialID domain.KeyMaterialID) ([]domain.Certificate, error)
 
+	// GetKeyMaterial looks up a key_material row by its own id -- the
+	// ID-based read §13's closing paragraph names as a gap ("PKI의 키 유출
+	// 표시·ID 기반 조회도 포함한다"). FindKeyBySPKI is a same-public-key
+	// dedup lookup by content hash; it cannot serve a caller that already
+	// knows the id (e.g. Certificate.KeyMaterialID from a certificate
+	// ListCertificatesUsingKey returned) and wants the current row,
+	// including CompromisedAt, without also having the public key bytes in
+	// hand. It returns ErrNotFound when id is unknown.
+	GetKeyMaterial(ctx context.Context, id domain.KeyMaterialID) (KeyMaterial, error)
+
+	// MarkCompromised sets key_materials.compromised_at for id, the write
+	// §13's closing paragraph names as a gap ("PKI의 키 유출 표시"). A
+	// previous round deliberately did not add a general SaveKeyMaterial,
+	// reasoning that the compromise cascade revokes certificates via
+	// ListCertificatesUsingKey rather than mutating the key row; that
+	// reasoning covered the cascade's revocation side, not the fact of the
+	// leak itself, which docs/data-model.md's own transition rule requires
+	// recording precisely: "key_material.compromised_at은 실제 해당 키
+	// 유출에만 설정하며 상위 CA 영향만으로 Leaf 개인키가 유출됐다고 기록하지
+	// 않는다" (line 140) -- there must be a way to set it for the actual
+	// leaked key, distinct from the CA-impact marking a transition records
+	// on affected descendant authorities. docs/certificate-lifecycle.md line
+	// 67's "개인키 유출 | 같은 키를 사용하는 유효 인증서 모두 폐기, 새
+	// 키·인증서 발급" is the flow this unblocks: mark the key, then look up
+	// and revoke every certificate ListCertificatesUsingKey returns.
+	//
+	// key_materials has no version column (docs/data-model.md's row lists
+	// none), so this takes no expectedVersion -- the same reasoning
+	// SaveLeafKeyGeneration documents. It is idempotent: calling it again
+	// with the same id simply overwrites CompromisedAt. GAP: neither
+	// certificate-lifecycle.md nor data-model.md says whether re-marking an
+	// already-compromised key with a different timestamp should be rejected
+	// or should keep the earliest mark; this method does not invent an
+	// ordering rule the docs do not state. Flagged for the lead rather than
+	// guessed at.
+	MarkCompromised(ctx context.Context, id domain.KeyMaterialID, compromisedAt domain.Instant) error
+
 	// ListAffectedDescendants returns every authority whose management
 	// chain descends from authorityID, the set an emergency transition marks
 	// affected/stops issuance for

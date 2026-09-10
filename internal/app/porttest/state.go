@@ -150,6 +150,17 @@ type state struct {
 	jobByDedup map[string]domain.JobID
 
 	auditEvents []auditRow
+
+	// importBatches/takeovers back port.ImportRepository (added for the B02
+	// contract-completeness round, docs/backend-implementation.md §13
+	// closing paragraph: "import batch/takeover 저장·조회"). pendingTakeover
+	// indexes the current pending row per CA key generation, the lookup
+	// GetPendingTakeoverForUpdate needs and the same shape as the real
+	// schema's ix_ca_takeovers_1 (ca_key_generation_id,state) index; it is
+	// deleted once a takeover moves off "pending".
+	importBatches   map[domain.ImportBatchID]port.ImportBatch
+	takeovers       map[domain.TakeoverID]port.Takeover
+	pendingTakeover map[domain.CAKeyGenerationID]domain.TakeoverID
 }
 
 // auditRow bundles one stored audit event with the scopes it was appended
@@ -192,6 +203,9 @@ func newState() *state {
 		secrets:             map[secretKey]domain.EncryptedSecret{},
 		jobs:                map[domain.JobID]port.Job{},
 		jobByDedup:          map[string]domain.JobID{},
+		importBatches:       map[domain.ImportBatchID]port.ImportBatch{},
+		takeovers:           map[domain.TakeoverID]port.Takeover{},
+		pendingTakeover:     map[domain.CAKeyGenerationID]domain.TakeoverID{},
 	}
 }
 
@@ -242,6 +256,9 @@ func (s *state) clone() *state {
 		jobs:                    make(map[domain.JobID]port.Job, len(s.jobs)),
 		jobByDedup:              make(map[string]domain.JobID, len(s.jobByDedup)),
 		auditEvents:             append([]auditRow(nil), s.auditEvents...),
+		importBatches:           make(map[domain.ImportBatchID]port.ImportBatch, len(s.importBatches)),
+		takeovers:               make(map[domain.TakeoverID]port.Takeover, len(s.takeovers)),
+		pendingTakeover:         make(map[domain.CAKeyGenerationID]domain.TakeoverID, len(s.pendingTakeover)),
 	}
 	for k, v := range s.accounts {
 		n.accounts[k] = v
@@ -329,6 +346,15 @@ func (s *state) clone() *state {
 	}
 	for k, v := range s.jobByDedup {
 		n.jobByDedup[k] = v
+	}
+	for k, v := range s.importBatches {
+		n.importBatches[k] = v
+	}
+	for k, v := range s.takeovers {
+		n.takeovers[k] = v
+	}
+	for k, v := range s.pendingTakeover {
+		n.pendingTakeover[k] = v
 	}
 	return n
 }

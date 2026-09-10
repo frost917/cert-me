@@ -182,6 +182,30 @@ func (r pkiRepo) SaveAuthority(_ context.Context, authority domain.Authority, ex
 	return nil
 }
 
+// GetKeyMaterial looks up a key_material row by its own id, the ID-based
+// read FindKeyBySPKI cannot serve (see port.PKIRepository.GetKeyMaterial's
+// doc comment).
+func (r pkiRepo) GetKeyMaterial(_ context.Context, id domain.KeyMaterialID) (port.KeyMaterial, error) {
+	m, ok := r.s.keyMaterials[id]
+	if !ok {
+		return port.KeyMaterial{}, port.ErrNotFound
+	}
+	return m, nil
+}
+
+// MarkCompromised sets CompromisedAt on the stored key_material row (see
+// port.PKIRepository.MarkCompromised's doc comment for why this takes no
+// expectedVersion and is idempotent).
+func (r pkiRepo) MarkCompromised(_ context.Context, id domain.KeyMaterialID, compromisedAt domain.Instant) error {
+	m, ok := r.s.keyMaterials[id]
+	if !ok {
+		return port.ErrNotFound
+	}
+	m.CompromisedAt = compromisedAt
+	r.s.keyMaterials[id] = m
+	return nil
+}
+
 // ListCertificatesUsingKey backs the compromise path, which must revoke every
 // valid certificate sharing a leaked public key
 // (docs/certificate-lifecycle.md). Results are ordered by id so a test can
