@@ -156,10 +156,16 @@ func (r Revocation) sameKey(issuerID CAKeyGenerationID, serial SerialNumber) boo
 //     기록 유지 후 관리자 확인 대상으로 표시한다."
 //   - There is no un-revoke: once revoked, Merge cannot clear the record.
 //
-// nextChangeGeneration is the generation to stamp on a record that actually
-// changes (the CRL-affecting counter is bumped by the caller under the
-// issuer's CRLState lock); it is ignored when nothing changes.
-func (r Revocation) Merge(incoming RevocationFacts, nextChangeGeneration int64) (Revocation, bool, error) {
+// Merge itself does not take or stamp a change generation. backend-
+// implementation.md §5 assigns generation bookkeeping to app's
+// applyRevocations: it locks the issuer's CRLState, decides one shared
+// generation number for the whole batch of changed rows (see
+// CRLState.BumpRevocationGeneration), and persists that number on each row
+// together with this method's result, in the same commit. Threading a
+// caller-computed number through Merge would only create a second, easily
+// stale copy of that value and a signature that departs from the design's
+// Merge(incoming).
+func (r Revocation) Merge(incoming RevocationFacts) (Revocation, bool, error) {
 	if err := incoming.Reason.Validate(); err != nil {
 		return Revocation{}, false, err
 	}
@@ -204,7 +210,21 @@ func (r Revocation) Merge(incoming RevocationFacts, nextChangeGeneration int64) 
 // justification is required and is expected to be preserved by the caller
 // as a revocation_revisions row; the domain object itself does not retain
 // history.
-func (r Revocation) Correct(reason RevocationReason, revokedAt Instant, justification string, now Instant) (Revocation, error) {
+//
+// Correct takes no "now": the design signature is Correct(reason, time,
+// justification) with no clock input, and neither certificate-lifecycle.md
+// nor pki-import.md defines a rule against which a "future" revoked_at
+// would be judged. pki-import.md explicitly allows merging revocation
+// entries taken from an external, previously-running PKI's CRLs/records,
+// whose revoked_at was stamped by that system's clock, not cert-me's; a
+// hard now-based rejection here would have no documented tolerance for
+// clock skew between systems and could reject a legitimate correction that
+// restores an operator-verified external timestamp (see
+// TestRevocation_CorrectClearsReviewButNeverUnrevokes). If a plausibility
+// check on corrected times is ever wanted, it belongs in the service layer
+// where the import/operator context needed to define "future" actually
+// lives.
+func (r Revocation) Correct(reason RevocationReason, revokedAt Instant, justification string) (Revocation, error) {
 	if err := reason.Validate(); err != nil {
 		return Revocation{}, err
 	}

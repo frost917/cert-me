@@ -60,7 +60,7 @@ func TestRevocation_MergeIdenticalIsNoop(t *testing.T) {
 		RevokedAt: revokedAt,
 		Reason:    RevocationReasonKeyCompromise,
 		Source:    RevocationSourceImport,
-	}, r.ChangeGeneration()+1)
+	})
 	if err != nil {
 		t.Fatalf("merge: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestRevocation_MergeConflictKeepsExistingAndFlagsReview(t *testing.T) {
 		RevokedAt: conflictingTime,
 		Reason:    RevocationReasonKeyCompromise,
 		Source:    RevocationSourceImport,
-	}, r.ChangeGeneration()+1)
+	})
 	if err != nil {
 		t.Fatalf("merge: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestRevocation_MergeConflictKeepsExistingAndFlagsReview(t *testing.T) {
 		RevokedAt: revokedAt,
 		Reason:    RevocationReasonSuperseded,
 		Source:    RevocationSourceImport,
-	}, r.ChangeGeneration()+1)
+	})
 	if err != nil {
 		t.Fatalf("merge: %v", err)
 	}
@@ -129,12 +129,12 @@ func TestRevocation_CorrectClearsReviewButNeverUnrevokes(t *testing.T) {
 	flagged, _, err := r.Merge(RevocationFacts{
 		IssuerID: r.IssuerID(), Serial: r.Serial(), RevokedAt: conflictingTime,
 		Reason: RevocationReasonKeyCompromise, Source: RevocationSourceImport,
-	}, r.ChangeGeneration()+1)
+	})
 	if err != nil {
 		t.Fatalf("merge: %v", err)
 	}
 
-	corrected, err := flagged.Correct(RevocationReasonSuperseded, conflictingTime, "operator verified import timestamp", plus(revokedAt, 2*time.Hour))
+	corrected, err := flagged.Correct(RevocationReasonSuperseded, conflictingTime, "operator verified import timestamp")
 	if err != nil {
 		t.Fatalf("correct: %v", err)
 	}
@@ -149,8 +149,77 @@ func TestRevocation_CorrectClearsReviewButNeverUnrevokes(t *testing.T) {
 		t.Fatalf("revocation must remain in effect")
 	}
 
-	if _, err := flagged.Correct(RevocationReasonSuperseded, conflictingTime, "", plus(revokedAt, 2*time.Hour)); err == nil {
+	if _, err := flagged.Correct(RevocationReasonSuperseded, conflictingTime, ""); err == nil {
 		t.Fatalf("expected correction without justification to be rejected")
+	}
+}
+
+// PR review (round 3): Merge previously took a caller-computed
+// nextChangeGeneration and silently discarded it on every path - a record
+// with changeGeneration=4 stayed at 4 even when the caller passed 9 and the
+// merge produced a real, needs-review-flagging change. Per
+// backend-implementation.md §5, generation bookkeeping is applyRevocations'
+// job (it locks CRLState and stamps the shared batch generation when it
+// persists), so Merge was changed to match the design's Merge(incoming)
+// signature instead of taking a generation argument it could not honor.
+// This pins that Merge no longer accepts or needs such a value.
+func TestRevocation_MergeSignatureCarriesNoChangeGeneration(t *testing.T) {
+	revokedAt := t0()
+	r, err := NewRevocation(RevocationFacts{
+		ID: mkRevocationID(t), IssuerID: mkCAKeyGenID(t), Serial: mkSerial(t, "1a"),
+		RevokedAt: revokedAt, Reason: RevocationReasonKeyCompromise, Source: RevocationSourceManual,
+		ChangeGeneration: 4,
+	})
+	if err != nil {
+		t.Fatalf("new revocation: %v", err)
+	}
+
+	merged, changed, err := r.Merge(RevocationFacts{
+		IssuerID:  r.IssuerID(),
+		Serial:    r.Serial(),
+		RevokedAt: plus(revokedAt, time.Hour),
+		Reason:    RevocationReasonSuperseded,
+		Source:    RevocationSourceImport,
+	})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if !changed || !merged.NeedsReview() {
+		t.Fatalf("expected conflicting merge to change the record and flag review")
+	}
+	if merged.Version() != r.Version().Next() {
+		t.Fatalf("expected version to advance on the conflict change")
+	}
+	// changeGeneration is untouched by Merge; the caller (applyRevocations)
+	// is responsible for persisting the batch generation it computed under
+	// the CRLState lock alongside this result.
+	if merged.ChangeGeneration() != r.ChangeGeneration() {
+		t.Fatalf("expected Merge to leave changeGeneration alone, got %d want %d",
+			merged.ChangeGeneration(), r.ChangeGeneration())
+	}
+}
+
+// PR review (round 3): Correct previously took an unused "now" and let a
+// revoked_at set ~146,000 years in the future through with no error. The
+// design signature (backend-implementation.md §57) is Correct(reason, time,
+// justification) with no clock argument at all, and neither
+// certificate-lifecycle.md nor pki-import.md defines what counts as
+// "future" for an imported or corrected revocation (imported entries carry
+// an external system's clock, not cert-me's). So the fix removes the
+// parameter rather than adding an undocumented threshold. This pins that a
+// far-future revokedAt is still accepted by the domain (any plausibility
+// check belongs at the service/import layer, which has the context to
+// define one) and that Correct no longer takes a "now" at all.
+func TestRevocation_CorrectAcceptsFarFutureRevokedAt(t *testing.T) {
+	r := newRevocation(t, RevocationReasonSuperseded, t0())
+	farFuture := plus(t0(), 1<<62)
+
+	corrected, err := r.Correct(RevocationReasonSuperseded, farFuture, "ticket-2")
+	if err != nil {
+		t.Fatalf("expected far-future revoked_at to be accepted by the domain, got %v", err)
+	}
+	if !corrected.RevokedAt().Equal(farFuture) {
+		t.Fatalf("expected corrected revoked_at to be stored as given, got %v", corrected.RevokedAt())
 	}
 }
 
