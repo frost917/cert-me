@@ -190,6 +190,114 @@ func TestAuthority_CanSignCRL_RequiresKeyAvailable(t *testing.T) {
 	}
 }
 
+// TestAuthority_CanIssue_FullValidityWindow covers P1 finding #2: CanIssue
+// must reject issuance both before the CA's own notBefore and at/after its
+// notAfter, and must reject a missing (zero) certificate window outright.
+func TestAuthority_CanIssue_FullValidityWindow(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(AuthorityFacts) AuthorityFacts
+		now    time.Time
+	}{
+		{
+			name: "notBefore not yet reached",
+			mutate: func(f AuthorityFacts) AuthorityFacts {
+				f.CertificateWindow = mustWindowFacts(time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2028, 1, 1, 0, 0, 0, 0, time.UTC))
+				return f
+			},
+			now: time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "notAfter reached",
+			mutate: func(f AuthorityFacts) AuthorityFacts {
+				f.CertificateWindow = mustWindowFacts(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+				return f
+			},
+			now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), // == notAfter: expired under project rule
+		},
+		{
+			name: "missing certificate window",
+			mutate: func(f AuthorityFacts) AuthorityFacts {
+				f.CertificateWindow = ValidityWindow{}
+				return f
+			},
+			now: time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			facts := tc.mutate(baseAuthorityFacts())
+			authority, err := NewAuthority(facts)
+			if err != nil {
+				t.Fatalf("NewAuthority: %v", err)
+			}
+			now := NewInstant(tc.now)
+			err = authority.CanIssue(IssuerContext{}, now)
+			if !errors.Is(err, ErrNotPermitted) {
+				t.Fatalf("expected ErrNotPermitted, got %v", err)
+			}
+		})
+	}
+}
+
+// TestAuthority_CanSignCRL_EnforcesValidityWindow covers P1 finding #2: CRL
+// signing must also check the CA certificate's own window (notBefore and
+// notAfter), while remaining allowed for a stopped-but-valid authority.
+func TestAuthority_CanSignCRL_EnforcesValidityWindow(t *testing.T) {
+	t.Run("notBefore not yet reached rejected", func(t *testing.T) {
+		facts := baseAuthorityFacts()
+		facts.CertificateWindow = mustWindowFacts(time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2028, 1, 1, 0, 0, 0, 0, time.UTC))
+		authority, err := NewAuthority(facts)
+		if err != nil {
+			t.Fatalf("NewAuthority: %v", err)
+		}
+		now := NewInstant(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
+		if err := authority.CanSignCRL(now); !errors.Is(err, ErrNotPermitted) {
+			t.Fatalf("expected ErrNotPermitted, got %v", err)
+		}
+	})
+
+	t.Run("notAfter reached rejected", func(t *testing.T) {
+		facts := baseAuthorityFacts()
+		facts.CertificateWindow = mustWindowFacts(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+		authority, err := NewAuthority(facts)
+		if err != nil {
+			t.Fatalf("NewAuthority: %v", err)
+		}
+		now := NewInstant(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+		if err := authority.CanSignCRL(now); !errors.Is(err, ErrNotPermitted) {
+			t.Fatalf("expected ErrNotPermitted, got %v", err)
+		}
+	})
+
+	t.Run("missing certificate window rejected", func(t *testing.T) {
+		facts := baseAuthorityFacts()
+		facts.CertificateWindow = ValidityWindow{}
+		authority, err := NewAuthority(facts)
+		if err != nil {
+			t.Fatalf("NewAuthority: %v", err)
+		}
+		now := NewInstant(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
+		if err := authority.CanSignCRL(now); !errors.Is(err, ErrNotPermitted) {
+			t.Fatalf("expected ErrNotPermitted, got %v", err)
+		}
+	})
+
+	t.Run("stopped but still valid CA can still sign crls", func(t *testing.T) {
+		facts := baseAuthorityFacts()
+		facts.IssuanceState = IssuanceStateStopped
+		authority, err := NewAuthority(facts)
+		if err != nil {
+			t.Fatalf("NewAuthority: %v", err)
+		}
+		now := NewInstant(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
+		if err := authority.CanSignCRL(now); err != nil {
+			t.Fatalf("expected stopped-but-valid authority to sign crls, got %v", err)
+		}
+	})
+}
+
 func TestAuthority_CanDestroyKey(t *testing.T) {
 	now := NewInstant(time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC))
 

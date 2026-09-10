@@ -2,6 +2,7 @@ package domain
 
 import (
 	"fmt"
+	"net/netip"
 	"net/url"
 	"strings"
 )
@@ -113,6 +114,12 @@ func NewSAN(kind SANType, value string) (SAN, error) {
 		if err := validateDNSSANValue(v); err != nil {
 			return SAN{}, err
 		}
+	case SANTypeIP:
+		normalized, err := normalizeIPSANValue(v)
+		if err != nil {
+			return SAN{}, err
+		}
+		v = normalized
 	case SANTypeURI:
 		parsed, err := url.Parse(v)
 		if err != nil || !parsed.IsAbs() {
@@ -122,7 +129,16 @@ func NewSAN(kind SANType, value string) (SAN, error) {
 	return SAN{kind: kind, value: v}, nil
 }
 
+// maxDNSSANLength matches the RFC 1035/1123 whole-name limit.
+const maxDNSSANLength = 253
+
+// maxDNSLabelLength matches the RFC 1035/1123 per-label limit.
+const maxDNSLabelLength = 63
+
 func validateDNSSANValue(v string) error {
+	if len(v) > maxDNSSANLength {
+		return fmt.Errorf("%w: dns san must be at most %d characters", ErrInvalidValue, maxDNSSANLength)
+	}
 	labels := strings.Split(v, ".")
 	for i, label := range labels {
 		if label == "" {
@@ -138,11 +154,50 @@ func validateDNSSANValue(v string) error {
 		if strings.Contains(label, "*") {
 			return fmt.Errorf("%w: wildcard may only replace the entire leftmost label", ErrInvalidValue)
 		}
+		if !isValidDNSLabel(label) {
+			return fmt.Errorf("%w: dns san label %q is not a valid dns label", ErrInvalidValue, label)
+		}
 	}
 	if len(labels) < 2 {
 		return fmt.Errorf("%w: dns san must contain at least one dot", ErrInvalidValue)
 	}
 	return nil
+}
+
+// isValidDNSLabel enforces the RFC 1035/1123 label grammar: 1-63 characters,
+// ASCII letters/digits/hyphen only, and no leading or trailing hyphen. This
+// is what rejects both malformed characters (e.g. a space) and oversized
+// labels that would otherwise pass through as a bare "present" SAN.
+func isValidDNSLabel(label string) bool {
+	if len(label) < 1 || len(label) > maxDNSLabelLength {
+		return false
+	}
+	if label[0] == '-' || label[len(label)-1] == '-' {
+		return false
+	}
+	for i := 0; i < len(label); i++ {
+		c := label[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// normalizeIPSANValue parses v as an IPv4 or IPv6 literal with net/netip and
+// returns its canonical string form, so a bogus value like "not-an-ip" is
+// rejected instead of being carried through as an opaque, untrusted string.
+func normalizeIPSANValue(v string) (string, error) {
+	addr, err := netip.ParseAddr(v)
+	if err != nil {
+		return "", fmt.Errorf("%w: ip san must be a valid ipv4 or ipv6 address", ErrInvalidValue)
+	}
+	return addr.String(), nil
 }
 
 func (s SAN) Type() SANType  { return s.kind }
@@ -209,6 +264,29 @@ func (o CertificateOrigin) Validate() error {
 	}
 }
 
+// CertificateKind distinguishes the two certificates subtypes that share the
+// certificates table: a CA certificate (Root/Intermediate/bootstrap, tracked
+// in ca_certificates) or a Leaf certificate (tracked in leaf_certificates).
+// A CA certificate has no Leaf issuance profile and no required SANs; the
+// Leaf profile/SAN policy in ValidateSANsForProfile only applies to Leaf
+// certificates. [data-model.md §핵심 관계: "certificates 한 행은 CA 또는 Leaf
+// subtype 정확히 하나를 갖는다"]
+type CertificateKind string
+
+const (
+	CertificateKindCA   CertificateKind = "ca"
+	CertificateKindLeaf CertificateKind = "leaf"
+)
+
+func (k CertificateKind) Validate() error {
+	switch k {
+	case CertificateKindCA, CertificateKindLeaf:
+		return nil
+	default:
+		return fmt.Errorf("%w: unsupported certificate kind %q", ErrInvalidValue, string(k))
+	}
+}
+
 // Certificate is the immutable signed original: raw DER plus the identifiers
 // and period an adapter's cryptographic parser extracted from it. The domain
 // never parses ASN.1/x509 itself -- CertificateFacts is produced by the
@@ -223,6 +301,7 @@ type Certificate struct {
 	validity                ValidityWindow
 	subject                 Subject
 	sans                    []SAN
+	kind                    CertificateKind
 	profile                 CertificateProfile
 	keyAlgorithm            KeyAlgorithm
 	origin                  CertificateOrigin
@@ -243,7 +322,8 @@ type CertificateFacts struct {
 	Validity                ValidityWindow
 	Subject                 Subject
 	SANs                    []SAN
-	Profile                 CertificateProfile
+	Kind                    CertificateKind
+	Profile                 CertificateProfile // Leaf-only; must be empty for CertificateKindCA
 	KeyAlgorithm            KeyAlgorithm
 	Origin                  CertificateOrigin
 	CreatedByAccountID      AccountID // empty for import/system-created certificates
@@ -274,8 +354,24 @@ func NewCertificate(facts CertificateFacts) (Certificate, error) {
 	if facts.Subject.CommonName() == "" {
 		return Certificate{}, fmt.Errorf("%w: certificate subject must be set", ErrInvalidValue)
 	}
-	if err := ValidateSANsForProfile(facts.Profile, facts.SANs); err != nil {
+	if err := facts.Kind.Validate(); err != nil {
 		return Certificate{}, err
+	}
+	switch facts.Kind {
+	case CertificateKindLeaf:
+		// The server_tls/client_mtls/dual profile and its SAN requirement
+		// are a Leaf-only concept; every Leaf certificate must carry one.
+		if err := ValidateSANsForProfile(facts.Profile, facts.SANs); err != nil {
+			return Certificate{}, err
+		}
+	case CertificateKindCA:
+		// Root/Intermediate certificates have no Leaf issuance profile: a
+		// real CA certificate must be constructible/restorable with no SANs
+		// and without illegitimately being given some Leaf profile.
+		// [data-model.md §핵심 관계]
+		if facts.Profile != "" {
+			return Certificate{}, fmt.Errorf("%w: ca certificate must not carry a leaf issuance profile", ErrInvalidValue)
+		}
 	}
 	if err := facts.KeyAlgorithm.Validate(); err != nil {
 		return Certificate{}, err
@@ -292,6 +388,7 @@ func NewCertificate(facts CertificateFacts) (Certificate, error) {
 		validity:                facts.Validity,
 		subject:                 facts.Subject,
 		sans:                    append([]SAN(nil), facts.SANs...),
+		kind:                    facts.Kind,
 		profile:                 facts.Profile,
 		keyAlgorithm:            facts.KeyAlgorithm,
 		origin:                  facts.Origin,
@@ -308,6 +405,7 @@ func (c Certificate) Serial() SerialNumber                       { return c.seri
 func (c Certificate) Validity() ValidityWindow                   { return c.validity }
 func (c Certificate) Subject() Subject                           { return c.subject }
 func (c Certificate) SANs() []SAN                                { return append([]SAN(nil), c.sans...) }
+func (c Certificate) Kind() CertificateKind                      { return c.kind }
 func (c Certificate) Profile() CertificateProfile                { return c.profile }
 func (c Certificate) KeyAlgorithm() KeyAlgorithm                 { return c.keyAlgorithm }
 func (c Certificate) Origin() CertificateOrigin                  { return c.origin }
@@ -334,14 +432,34 @@ type IssuanceRequest struct {
 
 // Validate checks the request's own shape, independent of any issuer.
 func (r IssuanceRequest) Validate() error {
-	if err := r.Profile.Validate(); err != nil {
+	return r.ValidateFor(IssuanceIntentLeaf)
+}
+
+// ValidateFor applies the checks that belong to the requested issuance path. A
+// Leaf request carries a profile and the SANs that profile demands; a
+// subordinate CA request carries neither, matching the CA/Leaf subtype split
+// in docs/data-model.md rather than forcing a CA through Leaf profile rules.
+func (r IssuanceRequest) ValidateFor(intent IssuanceIntent) error {
+	if _, err := intent.requiredIssuerKind(); err != nil {
 		return err
 	}
 	if r.Subject.CommonName() == "" {
 		return fmt.Errorf("%w: issuance request subject must be set", ErrInvalidValue)
 	}
-	if err := ValidateSANsForProfile(r.Profile, r.SANs); err != nil {
-		return err
+	if intent == IssuanceIntentSubordinateCA {
+		if r.Profile != "" {
+			return fmt.Errorf("%w: a subordinate ca request must not carry a leaf profile", ErrInvalidValue)
+		}
+		if len(r.SANs) > 0 {
+			return fmt.Errorf("%w: a subordinate ca request must not carry leaf sans", ErrInvalidValue)
+		}
+	} else {
+		if err := r.Profile.Validate(); err != nil {
+			return err
+		}
+		if err := ValidateSANsForProfile(r.Profile, r.SANs); err != nil {
+			return err
+		}
 	}
 	if err := r.KeyAlgorithm.Validate(); err != nil {
 		return err
@@ -375,10 +493,44 @@ type IssuancePlan struct {
 // 만료일을 넘지 않는다. 초과 요청은 자동 축소하지 않고 가능한 기간을 안내한다."
 // The request is rejected outright, never silently shrunk.
 func PlanIssuance(issuer Authority, req IssuanceRequest, now Instant) (IssuancePlan, error) {
-	if err := req.Validate(); err != nil {
+	return planIssuance(issuer, req, now, IssuerContext{Intent: IssuanceIntentLeaf})
+}
+
+// PlanBootstrapIssuance is the distinct bootstrap_tls issuance path: it is
+// never reached by an ordinary Leaf request. It requires a bootstrap-kind
+// issuer instead of the Intermediate that PlanIssuance requires -- the two
+// are kept as separate entry points on purpose rather than one path that
+// happens to also let bootstrap through. [architecture.md: 임시 HTTPS
+// bootstrap 정책; data-model.md: "bootstrap_tls만 bootstrap issuer를 허용한다"]
+func PlanBootstrapIssuance(issuer Authority, req IssuanceRequest, now Instant) (IssuancePlan, error) {
+	return planIssuance(issuer, req, now, IssuerContext{Intent: IssuanceIntentBootstrapTLS})
+}
+
+// PlanLeafWindow derives the requested window for a leaf issuance from the
+// series policy and the intended notBefore, so that a caller cannot silently
+// substitute a window the stored calendar policy would not produce. The
+// issuer-period check in CanIssue then runs against this window.
+func PlanLeafWindow(policy SeriesPolicy, notBefore Instant) (ValidityWindow, error) {
+	if err := policy.Validate(); err != nil {
+		return ValidityWindow{}, err
+	}
+	return policy.PlanWindow(notBefore)
+}
+
+// PlanSubordinateCAIssuance is the Intermediate CA path: only a Root may sign
+// it. AuthorityService.Create uses this so that creating an Intermediate
+// re-checks its parent's state, key and period through the same policy as
+// every other issuance rather than a separate rule.
+// [backend-implementation.md §8 CA 생성: "parent 권한·상태·기간 재확인"]
+func PlanSubordinateCAIssuance(issuer Authority, req IssuanceRequest, now Instant) (IssuancePlan, error) {
+	return planIssuance(issuer, req, now, IssuerContext{Intent: IssuanceIntentSubordinateCA})
+}
+
+func planIssuance(issuer Authority, req IssuanceRequest, now Instant, ctx IssuerContext) (IssuancePlan, error) {
+	if err := req.ValidateFor(ctx.Intent); err != nil {
 		return IssuancePlan{}, err
 	}
-	ctx := IssuerContext{RequestedWindow: req.Window}
+	ctx.RequestedWindow = req.Window
 	if err := issuer.CanIssue(ctx, now); err != nil {
 		return IssuancePlan{}, err
 	}

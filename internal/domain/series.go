@@ -472,3 +472,13 @@ func (s LeafSeries) PlanRenewal(facts RenewalFacts, now Instant) (RenewalPlan, e
 		Window:           facts.RequestedWindow,
 	}, nil
 }
+
+// PlanWindow computes the validity window this policy produces for a
+// certificate whose notBefore is the given instant. Issuance and renewal both
+// derive the requested window this way so that the stored calendar policy --
+// not a fixed microsecond span -- decides not_after, and the issuer-period
+// check then runs against the result.
+// [data-model.md: "최종 notBefore/notAfter와 사용한 정책은 인증서마다 고정한다"]
+func (p SeriesPolicy) PlanWindow(notBefore Instant) (ValidityWindow, error) {
+	return p.CertificateValidity.Window(notBefore)
+}

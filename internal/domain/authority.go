@@ -153,6 +153,46 @@ func (a Authority) IsExpired(now Instant) bool {
 	return a.certificateWindow.NotAfter().IsExpiredAt(now)
 }
 
+// hasValidCertificateWindowAt reports whether the authority's own signing
+// certificate has a window set at all and now falls within it -- both the
+// not-yet-valid side (now before notBefore) and the expired side (now >=
+// notAfter) are enforced, plus a missing window is never treated as valid.
+// [data-model.md: CRL 발행/발급 모두 유효한 CA 인증서가 있어야 함]
+func (a Authority) hasValidCertificateWindowAt(now Instant) bool {
+	return !a.certificateWindow.IsZero() && a.certificateWindow.ContainsAt(now)
+}
+
+// IssuanceIntent distinguishes the issuance paths that differ in which
+// issuer kind may sign. The zero value is the ordinary Leaf path, so a caller
+// that forgets to set it gets the most restricted rule rather than a bypass.
+type IssuanceIntent string
+
+const (
+	// IssuanceIntentLeaf is an ordinary server_tls/client_mtls/dual Leaf.
+	// Only an Intermediate may sign it; a Root never signs a Leaf directly.
+	IssuanceIntentLeaf IssuanceIntent = ""
+	// IssuanceIntentBootstrapTLS is the temporary HTTPS exception. Only the
+	// bootstrap authority may sign it.
+	IssuanceIntentBootstrapTLS IssuanceIntent = "bootstrap_tls"
+	// IssuanceIntentSubordinateCA is an Intermediate CA certificate. Only a
+	// Root may sign it, which keeps AuthorityService.Create able to check its
+	// parent through the same policy as every other issuance.
+	IssuanceIntentSubordinateCA IssuanceIntent = "subordinate_ca"
+)
+
+func (i IssuanceIntent) requiredIssuerKind() (AuthorityKind, error) {
+	switch i {
+	case IssuanceIntentLeaf:
+		return AuthorityKindIntermediate, nil
+	case IssuanceIntentBootstrapTLS:
+		return AuthorityKindBootstrap, nil
+	case IssuanceIntentSubordinateCA:
+		return AuthorityKindRoot, nil
+	default:
+		return "", fmt.Errorf("%w: unsupported issuance intent %q", ErrInvalidValue, string(i))
+	}
+}
+
 // IssuerContext carries the facts about the requested issuance that an
 // Authority cannot know about itself: the exact period being requested (so
 // CanIssue can enforce that the issuer's own window covers it) and whether a
@@ -161,6 +201,14 @@ func (a Authority) IsExpired(now Instant) bool {
 type IssuerContext struct {
 	RequestedWindow   ValidityWindow // zero value skips the period-covers check
 	TakeoverConfirmed bool
+	// Intent names which of the three issuance paths this is. The permitted
+	// issuer kind differs per path, so it is an explicit choice rather than a
+	// flag: an ordinary Leaf requires an Intermediate, bootstrap_tls requires
+	// the bootstrap authority, and a subordinate CA requires a Root.
+	// [data-model.md: "관리 parent는 MVP에서 Root→Intermediate만 허용하고
+	// 루프를 거부한다. 일반 Leaf issuer는 Intermediate, bootstrap_tls만
+	// bootstrap issuer를 허용한다"]
+	Intent IssuanceIntent
 }
 
 // CanIssue reports whether the authority may sign a new certificate (initial
@@ -178,6 +226,16 @@ func (a Authority) CanIssue(ctx IssuerContext, now Instant) error {
 	if a.IsArchived() {
 		return fmt.Errorf("%w: authority is archived", ErrNotPermitted)
 	}
+	// The permitted issuer kind depends on what is being issued, so an
+	// unknown intent is rejected rather than defaulted.
+	requiredKind, err := ctx.Intent.requiredIssuerKind()
+	if err != nil {
+		return err
+	}
+	if a.kind != requiredKind {
+		return fmt.Errorf("%w: %s issuance requires a %s issuer, not %s",
+			ErrNotPermitted, ctx.Intent.describe(), string(requiredKind), string(a.kind))
+	}
 	if a.issuanceState != IssuanceStateEnabled {
 		return fmt.Errorf("%w: authority issuance state is %s", ErrNotPermitted, string(a.issuanceState))
 	}
@@ -190,8 +248,8 @@ func (a Authority) CanIssue(ctx IssuerContext, now Instant) error {
 	if a.pendingTakeover && !ctx.TakeoverConfirmed {
 		return fmt.Errorf("%w: imported authority takeover is not confirmed", ErrNotPermitted)
 	}
-	if a.IsExpired(now) {
-		return fmt.Errorf("%w: authority certificate has expired", ErrNotPermitted)
+	if !a.hasValidCertificateWindowAt(now) {
+		return fmt.Errorf("%w: authority certificate is not within its validity window", ErrNotPermitted)
 	}
 	if !ctx.RequestedWindow.IsZero() && !a.certificateWindow.IsZero() && !a.certificateWindow.Covers(ctx.RequestedWindow) {
 		return fmt.Errorf("%w: requested validity exceeds issuer certificate period", ErrPolicyViolation)
@@ -210,6 +268,14 @@ func (a Authority) CanSignCRL(now Instant) error {
 	}
 	if !a.keyAvailable {
 		return fmt.Errorf("%w: authority signing key has been destroyed", ErrNotPermitted)
+	}
+	// CRL signing still requires a valid CA certificate right now -- both
+	// sides of the window matter (not yet started, or already ended) -- but
+	// deliberately does not look at issuance_state: a stopped authority
+	// keeps signing CRLs as long as its own certificate remains valid.
+	// [data-model.md: CRL 발행에도 유효한 CA 인증서가 필요]
+	if !a.hasValidCertificateWindowAt(now) {
+		return fmt.Errorf("%w: authority certificate is not within its validity window", ErrNotPermitted)
 	}
 	return nil
 }
@@ -304,4 +370,18 @@ func (a Authority) Rename(policy AuthorityPolicy) (Authority, error) {
 	next.name = policy.Name
 	next.version = a.version.Next()
 	return next, nil
+}
+
+// describe names the intent for an error message.
+func (i IssuanceIntent) describe() string {
+	switch i {
+	case IssuanceIntentLeaf:
+		return "ordinary leaf"
+	case IssuanceIntentBootstrapTLS:
+		return "bootstrap_tls"
+	case IssuanceIntentSubordinateCA:
+		return "subordinate ca"
+	default:
+		return string(i)
+	}
 }

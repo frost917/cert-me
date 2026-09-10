@@ -515,3 +515,33 @@ func TestNewCalendarValidity_RejectsNonPositiveValueAndBadUnit(t *testing.T) {
 		t.Fatalf("expected ErrInvalidValue for unsupported unit, got %v", err)
 	}
 }
+
+// TestPlanLeafWindow_UsesCalendarPolicy checks that the issuance window comes
+// from the stored calendar policy, including the month-end clamp, rather than
+// a fixed span the caller supplies.
+func TestPlanLeafWindow_UsesCalendarPolicy(t *testing.T) {
+	policy := SeriesPolicy{
+		RotateEvery:         3,
+		CertificateValidity: mustCalendarValidity(t, 1, ValidityUnitYears),
+	}
+
+	// A leap day notBefore clamps to Feb 28 a calendar year later.
+	notBefore := NewInstant(time.Date(2028, 2, 29, 12, 0, 0, 0, time.UTC))
+	window, err := PlanLeafWindow(policy, notBefore)
+	if err != nil {
+		t.Fatalf("PlanLeafWindow: %v", err)
+	}
+	got := window.NotAfter().Time()
+	want := time.Date(2029, 2, 28, 12, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("not_after = %s, want %s", got.Format(time.RFC3339), want.Format(time.RFC3339))
+	}
+	if !window.NotBefore().Equal(notBefore) {
+		t.Errorf("not_before = %s, want %s", window.NotBefore(), notBefore)
+	}
+
+	// An invalid policy is rejected before a window is produced.
+	if _, err := PlanLeafWindow(SeriesPolicy{}, notBefore); err == nil {
+		t.Error("PlanLeafWindow with an empty policy succeeded, want an error")
+	}
+}
