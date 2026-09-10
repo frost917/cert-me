@@ -3,6 +3,8 @@ package port
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 
 	"cert-me/internal/app/contract"
 	"cert-me/internal/domain"
@@ -260,37 +262,86 @@ type DeliveryEncodeInput struct {
 // transaction commits and only handed to a DownloadSink after that commit
 // succeeds.
 //
+// S1 fix: the payload used to be a public Data []byte field, which
+// json.Marshal would happily base64-encode and which fmt/slog would print
+// verbatim -- neither is acceptable for B02's acceptance criterion "비밀
+// JSON/로그 차단" (docs/backend-implementation.md §11's B02 row), and holding
+// a decrypted leaf key is explicitly the case this type documents. The
+// plaintext is now reachable only through Use, exactly like
+// internal/secret/input.go's Input: a synchronous callback that must not
+// retain the slice, plus String/GoString/Format/LogValue that are always
+// redacted and a MarshalJSON that always errors.
+//
 // Ownership: DeliveryEncoder.Encode's caller (DistributionService.Deliver)
 // owns the returned EncodedBundle from the moment Encode returns. It must
 // call Close in a defer covering every path out of Deliver -- the ordinary
 // return after sink.Send, the pre-commit failure path, and a panic -- so
-// that Data never outlives step 5 of §7's Deliver sequence: "Send가 반환하거나
-// panic하면 payload를 정리한다." No other component may retain a reference to
-// Data past that point.
-//
-// This mirrors the non-retention/zeroing contract secret.Input already
-// documents (internal/secret/input.go: "Close()는 소유 버퍼를 지우고 참조를
-// 끊으며 여러 번 호출해도 안전하다"): Close zeroes the owned buffer and drops
-// the reference, and is safe to call more than once, including on a zero
-// value. As with secret.Input, zeroing removes the value from this buffer;
-// it is not an absolute guarantee of memory-safe erasure, since the runtime
-// may have copied the bytes before Close ever gets a chance to run.
+// that the plaintext never outlives step 5 of §7's Deliver sequence: "Send가
+// 반환하거나 panic하면 payload를 정리한다." No other component may retain a
+// reference to the plaintext past that point.
 type EncodedBundle struct {
-	Data        []byte
+	payload     *secret.Input
 	ContentType string
 }
 
-// Close zeroes Data and drops the reference. Safe to call more than once and
-// safe on a zero-value EncodedBundle.
+// NewEncodedBundle takes ownership of data (not copied) and returns a bundle
+// that only releases it through Use, mirroring secret.New's ownership rule.
+func NewEncodedBundle(data []byte, contentType string) EncodedBundle {
+	return EncodedBundle{payload: secret.New(data), ContentType: contentType}
+}
+
+// Use grants synchronous access to the decrypted bundle bytes. The callback
+// must not retain the slice; see secret.Input.Use for the exact contract
+// (this type delegates to one). A zero-value EncodedBundle behaves as
+// already closed.
+func (b EncodedBundle) Use(fn func([]byte) error) error {
+	return b.payload.Use(fn)
+}
+
+// Len reports the plaintext length, which is not itself secret.
+func (b EncodedBundle) Len() int { return b.payload.Len() }
+
+// Close zeroes the owned plaintext and drops the reference. Safe to call
+// more than once and safe on a zero-value or nil-receiver EncodedBundle.
 func (b *EncodedBundle) Close() {
 	if b == nil {
 		return
 	}
-	for i := range b.Data {
-		b.Data[i] = 0
-	}
-	b.Data = nil
+	_ = b.payload.Close()
 }
+
+// String, GoString, Format and LogValue are always redacted so no format
+// verb or slog attribute can reach the plaintext -- the same discipline
+// secret.Input applies, restated here because EncodedBundle is a struct
+// with its own exported ContentType field rather than a bare *secret.Input.
+func (b EncodedBundle) String() string   { return secretRedacted }
+func (b EncodedBundle) GoString() string { return secretRedacted }
+
+func (b EncodedBundle) Format(f fmt.State, verb rune) {
+	switch verb {
+	case 'q':
+		fmt.Fprintf(f, "%q", secretRedacted)
+	default:
+		_, _ = io.WriteString(f, secretRedacted)
+	}
+}
+
+func (b EncodedBundle) LogValue() slog.Value { return slog.StringValue(secretRedacted) }
+
+// MarshalJSON always fails: the decrypted bundle is written to a
+// DownloadSink through Use, never marshalled as part of a command or result.
+func (b EncodedBundle) MarshalJSON() ([]byte, error) { return nil, secret.ErrNotSerializable }
+
+// secretRedacted is the fixed textual form every plaintext-carrying port
+// type produces, matching internal/secret/input.go's own constant so a log
+// line looks the same regardless of which type produced it.
+const secretRedacted = "<redacted>"
+
+var (
+	_ fmt.Formatter  = EncodedBundle{}
+	_ fmt.Stringer   = EncodedBundle{}
+	_ slog.LogValuer = EncodedBundle{}
+)
 
 // DeliveryEncoder turns a certificate and its encrypted private key into the
 // bundle format the client asked for.
@@ -328,6 +379,13 @@ type URLValidator interface {
 // arrives as a secret.Input the parser uses synchronously and does not
 // retain.
 //
+// S1 fix: PrivateKey used to be a public PrivateKeyDER []byte field. Unlike
+// the certificate/chain DER (public by construction), an uploaded private
+// key is exactly the plaintext B02's acceptance criterion "비밀 JSON/로그
+// 차단" is about, so it now carries the same secret.Input discipline
+// Passphrase already had: used synchronously through Use inside PKIParser,
+// not retained, and refused by json.Marshal/fmt/slog.
+//
 // This type's exact shape is under-specified by docs/backend-
 // implementation.md §5, which names PKIParser as an Import dependency but
 // gives no method signatures (unlike KeyEngine/CertificateSigner/CRLSigner
@@ -337,7 +395,7 @@ type URLValidator interface {
 type ImportBundleInput struct {
 	CertificateDER []byte
 	ChainDER       [][]byte
-	PrivateKeyDER  []byte // empty when no private key was uploaded
+	PrivateKey     *secret.Input // nil when no private key was uploaded
 	Passphrase     *secret.Input
 }
 
@@ -367,15 +425,68 @@ type ChainValidator interface {
 	Validate(ctx context.Context, leafDER []byte, chainDER [][]byte, now domain.Instant) error
 }
 
-// PreparedTLSConfig is the in-memory, ready-to-swap-in HTTPS configuration
-// TLSInstaller.Prepare produces. It is a sealed marker interface rather than
-// a struct: only a TLSInstaller implementation may produce one, so app code
-// can never fabricate a "prepared" config and hand it straight to Apply
-// without it having actually been built and validated by the installer
+// S2 fix: PreparedTLSConfig used to be a marker interface with an unexported
+// method (sealedPreparedTLSConfig), which meant nothing outside this package
+// -- including the real B05 TLS installer in adapter/tls -- could ever
+// construct a value satisfying it. There was also no constructor inside
+// port itself, so no concrete "prepared" value existed anywhere. The type
+// was unimplementable by the very adapter docs/backend-implementation.md §9
+// requires to implement TLSInstaller.
+//
+// The guarantee that actually matters is not "no one outside package port
+// can name the type" (unimplementable achieves that only by accident,
+// alongside making it useless); it is "Apply only accepts a handle that was
+// really built by calling Prepare, not one app code fabricated by hand"
 // (docs/backend-implementation.md §9 "준비한 후보를 TLSInstaller.Prepare에
-// 넣어 실제 적용 가능한 메모리 설정을 먼저 만든다").
-type PreparedTLSConfig interface {
-	sealedPreparedTLSConfig()
+// 넣어 실제 적용 가능한 메모리 설정을 먼저 만든다"). That is what this
+// replacement enforces, and it is enforced by Apply's own logic, not by
+// Go's type system: PreparedTLSConfig is now a concrete struct anyone can
+// construct via NewPreparedTLSConfig, but it carries the TLSPrepareToken it
+// was stamped with, and a real Apply implementation calls
+// token.Verify(prepared) before trusting it -- so a hand-built or
+// foreign-installer handle is rejected at that check, not by a compile-time
+// wall. See TestPreparedTLSConfig_ApplyRejectsAForeignHandle and
+// TestPreparedTLSConfig_ApplyRejectsAZeroValueHandle in the external
+// port_test package for the enforced behavior; a TLSInstaller
+// implementation that skips the Verify call does not get this guarantee for
+// free.
+type PreparedTLSConfig struct {
+	token   TLSPrepareToken
+	Payload any
+}
+
+// TLSPrepareToken is an opaque, comparable identity a TLSInstaller
+// implementation mints once -- typically in its own constructor -- and
+// keeps for the lifetime of the listener it manages. The same token must be
+// used both to stamp every PreparedTLSConfig that installer's Prepare
+// returns (via NewPreparedTLSConfig) and to check every PreparedTLSConfig
+// its own Apply receives (via Verify); mixing tokens between two installer
+// instances, or never minting one at all, is what lets Verify tell a
+// genuine handle apart from a foreign or hand-built one.
+type TLSPrepareToken struct{ id *byte }
+
+// NewTLSPrepareToken mints a fresh token, distinct from every other token
+// ever minted (it wraps a freshly allocated pointer, so equality is
+// identity, not value equality). The pointee is a byte, not a zero-size
+// struct{} -- the Go runtime is free to hand out the same address for every
+// zero-size allocation, which would make two independently minted tokens
+// compare equal and defeat Verify entirely.
+func NewTLSPrepareToken() TLSPrepareToken { return TLSPrepareToken{id: new(byte)} }
+
+// NewPreparedTLSConfig builds a handle stamped with token and carrying
+// payload -- the installer's own real in-memory config. Call it only from
+// inside the Prepare that just finished validating and building payload;
+// TLSInstaller.Prepare's doc comment says as much.
+func NewPreparedTLSConfig(token TLSPrepareToken, payload any) PreparedTLSConfig {
+	return PreparedTLSConfig{token: token, Payload: payload}
+}
+
+// Verify reports whether prepared was stamped with this exact token. A
+// TLSInstaller's Apply must call this on its own token before trusting
+// prepared; a zero-value PreparedTLSConfig (never passed through
+// NewPreparedTLSConfig) always fails Verify, since its token has a nil id.
+func (t TLSPrepareToken) Verify(prepared PreparedTLSConfig) bool {
+	return t.id != nil && prepared.token.id == t.id
 }
 
 // TLSInstaller separates building a candidate's in-memory configuration from
@@ -386,12 +497,18 @@ type PreparedTLSConfig interface {
 type TLSInstaller interface {
 	// Prepare validates candidate and its decrypted key long enough to build
 	// a ready-to-apply in-memory configuration, then re-encrypts/discards
-	// any plaintext it touched. It does not change the live listener.
+	// any plaintext it touched. It does not change the live listener. The
+	// returned PreparedTLSConfig must be built with NewPreparedTLSConfig
+	// using a TLSPrepareToken this same implementation holds, so its own
+	// Apply can Verify it later.
 	Prepare(ctx context.Context, candidate domain.TLSVersion, key domain.EncryptedSecret) (PreparedTLSConfig, error)
 
 	// Apply swaps the live listener onto a previously prepared
-	// configuration. A failure here must leave the previously active
-	// configuration serving traffic unchanged
+	// configuration. It must call its TLSPrepareToken.Verify(prepared)
+	// before trusting prepared, rejecting a handle that was never built by
+	// this installer's own Prepare -- app code must never be able to
+	// fabricate one and have it accepted. A failure here must leave the
+	// previously active configuration serving traffic unchanged
 	// (docs/backend-implementation.md §9 "Apply 실패는 DB/메모리 모두
 	// 원복한다").
 	Apply(ctx context.Context, prepared PreparedTLSConfig) error
