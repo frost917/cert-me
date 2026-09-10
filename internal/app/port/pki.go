@@ -196,13 +196,16 @@ type PKIRepository interface {
 	//
 	// key_materials has no version column (docs/data-model.md's row lists
 	// none), so this takes no expectedVersion -- the same reasoning
-	// SaveLeafKeyGeneration documents. It is idempotent: calling it again
-	// with the same id simply overwrites CompromisedAt. GAP: neither
-	// certificate-lifecycle.md nor data-model.md says whether re-marking an
-	// already-compromised key with a different timestamp should be rejected
-	// or should keep the earliest mark; this method does not invent an
-	// ordering rule the docs do not state. Flagged for the lead rather than
-	// guessed at.
+	// SaveLeafKeyGeneration documents.
+	//
+	// Repeated reports are idempotent and the EARLIEST report wins: a later
+	// compromisedAt is accepted and ignored rather than rejected. No doc
+	// settles this directly, but a compromise cannot be walked back anywhere
+	// else in this system -- a revocation has no release
+	// (docs/certificate-lifecycle.md) and CRL numbers and generations never
+	// regress -- and moving compromised_at later would narrow the window in
+	// which certificates on this key are treated as untrustworthy. The safe
+	// direction is therefore the only one implemented.
 	MarkCompromised(ctx context.Context, id domain.KeyMaterialID, compromisedAt domain.Instant) error
 
 	// ListAffectedDescendants returns every authority whose management

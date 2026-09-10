@@ -201,8 +201,16 @@ func (r pkiRepo) MarkCompromised(_ context.Context, id domain.KeyMaterialID, com
 	if !ok {
 		return port.ErrNotFound
 	}
-	m.CompromisedAt = compromisedAt
-	r.s.keyMaterials[id] = m
+	// Keep the earliest report. A key's compromise is not something that can
+	// be walked back: revocation has no release and CRL numbers/generations
+	// never regress, and moving compromised_at later would narrow the window
+	// in which certificates on this key are treated as untrustworthy. Later
+	// reports are therefore accepted and ignored rather than rejected, which
+	// keeps repeated reports of the same leak idempotent.
+	if m.CompromisedAt.IsZero() || compromisedAt.Before(m.CompromisedAt) {
+		m.CompromisedAt = compromisedAt
+		r.s.keyMaterials[id] = m
+	}
 	return nil
 }
 

@@ -343,3 +343,46 @@ func TestPKIRepository_MarkCompromised_RollsBackOnCallbackError(t *testing.T) {
 		t.Fatalf("read after rollback: %v", err)
 	}
 }
+
+// A compromise cannot be walked back: a later report must not move
+// compromised_at forward, because that would narrow the window in which
+// certificates on this key are treated as untrustworthy.
+func TestPKIRepository_MarkCompromisedKeepsTheEarliestReport(t *testing.T) {
+	store := porttest.NewStore()
+	ctx := context.Background()
+
+	keyID := domain.KeyMaterialID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+	pub, err := domain.NewPublicKey(domain.KeyAlgorithmECDSAP256, []byte("spki-bytes-for-compromise-test"))
+	if err != nil {
+		t.Fatalf("NewPublicKey: %v", err)
+	}
+	if err := store.Write(ctx, func(tx port.TxStores) error {
+		return tx.PKI().InsertKeyMaterial(ctx, port.KeyMaterial{ID: keyID, PublicKey: pub, Origin: "generated"})
+	}); err != nil {
+		t.Fatalf("insert key material: %v", err)
+	}
+
+	early := domain.InstantFromUnixMicro(1_000_000_000)
+	late := domain.InstantFromUnixMicro(2_000_000_000)
+
+	// Report the later time first, then the earlier one: the earlier must win.
+	for _, at := range []domain.Instant{late, early, late} {
+		if err := store.Write(ctx, func(tx port.TxStores) error {
+			return tx.PKI().MarkCompromised(ctx, keyID, at)
+		}); err != nil {
+			t.Fatalf("MarkCompromised(%v): %v", at, err)
+		}
+	}
+
+	var got port.KeyMaterial
+	if err := store.Read(ctx, func(tx port.TxStores) error {
+		var readErr error
+		got, readErr = tx.PKI().GetKeyMaterial(ctx, keyID)
+		return readErr
+	}); err != nil {
+		t.Fatalf("GetKeyMaterial: %v", err)
+	}
+	if !got.CompromisedAt.Equal(early) {
+		t.Fatalf("compromised_at is %v, want the earliest report %v", got.CompromisedAt, early)
+	}
+}
