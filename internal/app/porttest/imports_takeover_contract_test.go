@@ -386,3 +386,294 @@ func TestPKIRepository_MarkCompromisedKeepsTheEarliestReport(t *testing.T) {
 		t.Fatalf("compromised_at is %v, want the earliest report %v", got.CompromisedAt, early)
 	}
 }
+
+// sampleImportResult builds an ImportResultView exercising every mutable
+// field the reviewer's [P2] finding names transitively: Items (each with a
+// nested ExistingID pointer), CertificateIDs, AuthorityIDs, and the
+// CommittedAt pointer.
+func sampleImportResult(t *testing.T) contract.ImportResultView {
+	t.Helper()
+	committedAt := domain.NewInstant(time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC))
+	existing := importCertIDA
+	return contract.ImportResultView{
+		ID:          string(importBatchIDA),
+		State:       contract.ImportResultStateCommitted,
+		CommittedAt: &committedAt,
+		Items: []contract.ImportItemView{
+			{
+				FileID:     "root.pem",
+				SHA256:     mustFingerprint(t, 0x10),
+				Kind:       contract.ImportFileKindCertificate,
+				Status:     contract.ImportItemStatusDuplicate,
+				ExistingID: &existing,
+			},
+		},
+		CertificateIDs: []domain.CertificateID{importCertIDA},
+		AuthorityIDs:   []domain.AuthorityID{domain.AuthorityID("c0000000-0000-0000-0000-0000000000aa")},
+	}
+}
+
+// TestImportRepository_InsertBatch_MutatingCallerValueAfterInsertIsIsolated
+// proves InsertBatch copies in: mutating the caller's batch (including its
+// nested Manifest.Files, Result.Items[].ExistingID and Result.CommittedAt
+// pointees) after Insert returns must not reach the stored row.
+func TestImportRepository_InsertBatch_MutatingCallerValueAfterInsertIsIsolated(t *testing.T) {
+	store := porttest.NewStore()
+	ctx := context.Background()
+
+	batch := port.ImportBatch{
+		ID:          importBatchIDA,
+		RequestedBy: importRequestedBy,
+		Manifest:    samplePublicManifest(t),
+		State:       port.ImportBatchStateCommitted,
+		Result:      sampleImportResult(t),
+	}
+
+	if err := store.Write(ctx, func(tx port.TxStores) error {
+		return tx.Imports().InsertBatch(ctx, batch)
+	}); err != nil {
+		t.Fatalf("InsertBatch: %v", err)
+	}
+
+	// Mutate every reachable slice/pointer on the caller's own copy.
+	batch.Manifest.Files[0].FileID = "mutated.pem"
+	*batch.Result.CommittedAt = domain.NewInstant(time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC))
+	*batch.Result.Items[0].ExistingID = domain.CertificateID("c0000000-0000-0000-0000-0000000000ff")
+	batch.Result.Items[0].FileID = "mutated-item"
+	batch.Result.CertificateIDs[0] = domain.CertificateID("c0000000-0000-0000-0000-0000000000ff")
+	batch.Result.AuthorityIDs[0] = domain.AuthorityID("c0000000-0000-0000-0000-0000000000ff")
+
+	if err := store.Read(ctx, func(tx port.TxStores) error {
+		got, err := tx.Imports().GetBatch(ctx, importBatchIDA)
+		if err != nil {
+			return err
+		}
+		if got.Manifest.Files[0].FileID != "root.pem" {
+			t.Errorf("stored manifest file id = %q, want unaffected %q", got.Manifest.Files[0].FileID, "root.pem")
+		}
+		if got.Result.CommittedAt.Equal(domain.NewInstant(time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC))) {
+			t.Errorf("stored CommittedAt was mutated through the caller's pointer")
+		}
+		if *got.Result.Items[0].ExistingID != importCertIDA {
+			t.Errorf("stored ExistingID = %q, want unaffected %q", *got.Result.Items[0].ExistingID, importCertIDA)
+		}
+		if got.Result.Items[0].FileID != "root.pem" {
+			t.Errorf("stored item file id = %q, want unaffected %q", got.Result.Items[0].FileID, "root.pem")
+		}
+		if got.Result.CertificateIDs[0] != importCertIDA {
+			t.Errorf("stored certificate id = %q, want unaffected %q", got.Result.CertificateIDs[0], importCertIDA)
+		}
+		if got.Result.AuthorityIDs[0] != domain.AuthorityID("c0000000-0000-0000-0000-0000000000aa") {
+			t.Errorf("stored authority id = %q, want unaffected", got.Result.AuthorityIDs[0])
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read after mutation: %v", err)
+	}
+}
+
+// TestImportRepository_GetBatch_MutatingReturnedValueIsIsolated proves
+// GetBatch copies out: mutating a value returned by GetBatch must not
+// change the stored row, whether the mutation happens through the direct
+// slice/pointer fields or Result's nested ones.
+func TestImportRepository_GetBatch_MutatingReturnedValueIsIsolated(t *testing.T) {
+	store := porttest.NewStore()
+	ctx := context.Background()
+
+	batch := port.ImportBatch{
+		ID:          importBatchIDA,
+		RequestedBy: importRequestedBy,
+		Manifest:    samplePublicManifest(t),
+		State:       port.ImportBatchStateCommitted,
+		Result:      sampleImportResult(t),
+	}
+	if err := store.Write(ctx, func(tx port.TxStores) error {
+		return tx.Imports().InsertBatch(ctx, batch)
+	}); err != nil {
+		t.Fatalf("InsertBatch: %v", err)
+	}
+
+	if err := store.Read(ctx, func(tx port.TxStores) error {
+		got, err := tx.Imports().GetBatch(ctx, importBatchIDA)
+		if err != nil {
+			return err
+		}
+		got.Manifest.Files[0].FileID = "mutated.pem"
+		*got.Result.CommittedAt = domain.NewInstant(time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC))
+		*got.Result.Items[0].ExistingID = domain.CertificateID("c0000000-0000-0000-0000-0000000000ff")
+		got.Result.CertificateIDs[0] = domain.CertificateID("c0000000-0000-0000-0000-0000000000ff")
+		got.Result.AuthorityIDs[0] = domain.AuthorityID("c0000000-0000-0000-0000-0000000000ff")
+		return nil
+	}); err != nil {
+		t.Fatalf("read+mutate: %v", err)
+	}
+
+	if err := store.Read(ctx, func(tx port.TxStores) error {
+		got, err := tx.Imports().GetBatch(ctx, importBatchIDA)
+		if err != nil {
+			return err
+		}
+		if got.Manifest.Files[0].FileID != "root.pem" {
+			t.Errorf("stored manifest file id = %q, want unaffected %q", got.Manifest.Files[0].FileID, "root.pem")
+		}
+		if got.Result.CommittedAt.Equal(domain.NewInstant(time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC))) {
+			t.Errorf("stored CommittedAt was mutated through a previously-returned pointer")
+		}
+		if *got.Result.Items[0].ExistingID != importCertIDA {
+			t.Errorf("stored ExistingID = %q, want unaffected %q", *got.Result.Items[0].ExistingID, importCertIDA)
+		}
+		if got.Result.CertificateIDs[0] != importCertIDA {
+			t.Errorf("stored certificate id = %q, want unaffected %q", got.Result.CertificateIDs[0], importCertIDA)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify read: %v", err)
+	}
+}
+
+// TestImportRepository_GetBatch_MutateThenRollbackLeavesStoredValueUnchanged
+// reproduces the reviewer's exact scenario: commit a batch, then in a LATER
+// Write call GetBatch, mutate Manifest.Files[0], and return an error so the
+// callback rolls back. The originally stored value must be unchanged --
+// this is B02's core rollback guarantee, and a shared slice/pointer would
+// punch straight through it regardless of the rollback machinery itself.
+func TestImportRepository_GetBatch_MutateThenRollbackLeavesStoredValueUnchanged(t *testing.T) {
+	store := porttest.NewStore()
+	ctx := context.Background()
+	sentinel := errors.New("callback failed after mutating the fetched batch")
+
+	batch := port.ImportBatch{
+		ID:          importBatchIDA,
+		RequestedBy: importRequestedBy,
+		Manifest:    samplePublicManifest(t),
+		State:       port.ImportBatchStateCommitted,
+		Result:      sampleImportResult(t),
+	}
+	if err := store.Write(ctx, func(tx port.TxStores) error {
+		return tx.Imports().InsertBatch(ctx, batch)
+	}); err != nil {
+		t.Fatalf("InsertBatch: %v", err)
+	}
+
+	err := store.Write(ctx, func(tx port.TxStores) error {
+		got, err := tx.Imports().GetBatch(ctx, importBatchIDA)
+		if err != nil {
+			return err
+		}
+		got.Manifest.Files[0].FileID = "mutated-during-rollback.pem"
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Write returned %v, want the callback's error", err)
+	}
+
+	if err := store.Read(ctx, func(tx port.TxStores) error {
+		got, err := tx.Imports().GetBatch(ctx, importBatchIDA)
+		if err != nil {
+			return err
+		}
+		if got.Manifest.Files[0].FileID != "root.pem" {
+			t.Errorf("stored manifest file id = %q after rollback, want unaffected %q", got.Manifest.Files[0].FileID, "root.pem")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read after rollback: %v", err)
+	}
+}
+
+// TestTakeoverRepository_InsertTakeover_MutatingCallerValueAfterInsertIsIsolated
+// proves InsertTakeover copies in Evidence.CRLSHA256Hex, the other slice
+// field the reviewer named directly.
+func TestTakeoverRepository_InsertTakeover_MutatingCallerValueAfterInsertIsIsolated(t *testing.T) {
+	store := porttest.NewStore()
+	ctx := context.Background()
+
+	takeover := port.Takeover{
+		ID:                   takeoverIDA,
+		CAKeyGenerationID:    takeoverCAGenID,
+		State:                contract.TakeoverStatePending,
+		HistoryAssertion:     contract.TakeoverHistoryCRLsProvided,
+		PreviousMaxNumberHex: "1",
+		Evidence: contract.TakeoverEvidence{
+			SchemaVersion:          1,
+			CRLSHA256Hex:           []string{mustFingerprint(t, 0x20).Hex()},
+			IssuanceRecordsChecked: true,
+			CRLRoutesChecked:       true,
+		},
+		Version: 1,
+	}
+
+	if err := store.Write(ctx, func(tx port.TxStores) error {
+		return tx.Imports().InsertTakeover(ctx, takeover)
+	}); err != nil {
+		t.Fatalf("InsertTakeover: %v", err)
+	}
+
+	takeover.Evidence.CRLSHA256Hex[0] = "mutated"
+
+	if err := store.Read(ctx, func(tx port.TxStores) error {
+		got, err := tx.Imports().GetPendingTakeoverForUpdate(ctx, takeoverCAGenID)
+		if err != nil {
+			return err
+		}
+		if got.Evidence.CRLSHA256Hex[0] != mustFingerprint(t, 0x20).Hex() {
+			t.Errorf("stored evidence crl_sha256[0] = %q, want unaffected", got.Evidence.CRLSHA256Hex[0])
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read after mutation: %v", err)
+	}
+}
+
+// TestTakeoverRepository_GetPendingTakeoverForUpdate_MutatingReturnedValueIsIsolated
+// proves the read side copies out Evidence.CRLSHA256Hex too, and that
+// SaveTakeover's own copy-in holds even across the pending->confirmed
+// transition.
+func TestTakeoverRepository_GetPendingTakeoverForUpdate_MutatingReturnedValueIsIsolated(t *testing.T) {
+	store := porttest.NewStore()
+	ctx := context.Background()
+
+	takeover := port.Takeover{
+		ID:                   takeoverIDA,
+		CAKeyGenerationID:    takeoverCAGenID,
+		State:                contract.TakeoverStatePending,
+		HistoryAssertion:     contract.TakeoverHistoryCRLsProvided,
+		PreviousMaxNumberHex: "1",
+		Evidence: contract.TakeoverEvidence{
+			SchemaVersion:          1,
+			CRLSHA256Hex:           []string{mustFingerprint(t, 0x21).Hex()},
+			IssuanceRecordsChecked: true,
+			CRLRoutesChecked:       true,
+		},
+		Version: 1,
+	}
+	if err := store.Write(ctx, func(tx port.TxStores) error {
+		return tx.Imports().InsertTakeover(ctx, takeover)
+	}); err != nil {
+		t.Fatalf("InsertTakeover: %v", err)
+	}
+
+	if err := store.Write(ctx, func(tx port.TxStores) error {
+		locked, err := tx.Imports().GetPendingTakeoverForUpdate(ctx, takeoverCAGenID)
+		if err != nil {
+			return err
+		}
+		locked.Evidence.CRLSHA256Hex[0] = "mutated-in-place"
+		return nil // deliberately does not Save -- proves the mutation never touched storage
+	}); err != nil {
+		t.Fatalf("read-mutate write: %v", err)
+	}
+
+	if err := store.Read(ctx, func(tx port.TxStores) error {
+		got, err := tx.Imports().GetPendingTakeoverForUpdate(ctx, takeoverCAGenID)
+		if err != nil {
+			return err
+		}
+		if got.Evidence.CRLSHA256Hex[0] != mustFingerprint(t, 0x21).Hex() {
+			t.Errorf("stored evidence crl_sha256[0] = %q, want unaffected", got.Evidence.CRLSHA256Hex[0])
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read after mutation: %v", err)
+	}
+}

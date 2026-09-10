@@ -20,7 +20,11 @@ func (r importRepo) InsertBatch(_ context.Context, batch port.ImportBatch) error
 	if _, ok := r.s.importBatches[batch.ID]; ok {
 		return ErrDuplicate
 	}
-	r.s.importBatches[batch.ID] = batch
+	// Clone on the way in: batch.Manifest.Files/Result's slices and nested
+	// pointers are public and mutable, so storing batch as-is would let the
+	// caller mutate published state after Insert returns (the reviewer's
+	// [P2] finding).
+	r.s.importBatches[batch.ID] = cloneImportBatch(batch)
 	return nil
 }
 
@@ -30,7 +34,12 @@ func (r importRepo) GetBatch(_ context.Context, id domain.ImportBatchID) (port.I
 	if !ok {
 		return port.ImportBatch{}, port.ErrNotFound
 	}
-	return b, nil
+	// Clone on the way out for the same reason as InsertBatch: a caller
+	// mutating the returned batch's Manifest.Files or Result must not reach
+	// the map's stored value, even (per the reviewer's exact scenario) when
+	// the mutation happens inside a later Write whose callback then errors
+	// and rolls back.
+	return cloneImportBatch(b), nil
 }
 
 // InsertTakeover creates a new ca_takeovers row and, when it starts pending,
@@ -41,7 +50,9 @@ func (r importRepo) InsertTakeover(_ context.Context, takeover port.Takeover) er
 	if _, ok := r.s.takeovers[takeover.ID]; ok {
 		return ErrDuplicate
 	}
-	r.s.takeovers[takeover.ID] = takeover
+	// Clone on the way in: Evidence.CRLSHA256Hex is a public mutable slice
+	// (the reviewer's other named field).
+	r.s.takeovers[takeover.ID] = cloneTakeover(takeover)
 	if takeover.State == contract.TakeoverStatePending {
 		r.s.pendingTakeover[takeover.CAKeyGenerationID] = takeover.ID
 	}
@@ -59,7 +70,7 @@ func (r importRepo) GetPendingTakeoverForUpdate(_ context.Context, caKeyGenerati
 	if !ok {
 		return port.Takeover{}, port.ErrNotFound
 	}
-	return t, nil
+	return cloneTakeover(t), nil
 }
 
 // SaveTakeover persists takeover under the standard optimistic-lock
@@ -74,7 +85,7 @@ func (r importRepo) SaveTakeover(_ context.Context, takeover port.Takeover, expe
 	if existing.Version != expectedVersion {
 		return ErrVersionConflict
 	}
-	r.s.takeovers[takeover.ID] = takeover
+	r.s.takeovers[takeover.ID] = cloneTakeover(takeover)
 	if takeover.State == contract.TakeoverStatePending {
 		r.s.pendingTakeover[takeover.CAKeyGenerationID] = takeover.ID
 	} else if r.s.pendingTakeover[takeover.CAKeyGenerationID] == takeover.ID {
