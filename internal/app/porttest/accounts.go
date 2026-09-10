@@ -19,6 +19,19 @@ func (r accountRepo) GetAccountForUpdate(_ context.Context, id domain.AccountID)
 	return a, nil
 }
 
+// FindAccountByLoginName mirrors InsertAccount's own uniqueness scan: there
+// is exactly one account per normalized login name, so a linear scan over
+// the small accounts map is the same shape of lookup InsertAccount already
+// does, not a new index this test double needs to keep in sync.
+func (r accountRepo) FindAccountByLoginName(_ context.Context, normalizedLoginName string) (domain.Account, error) {
+	for _, a := range r.s.accounts {
+		if a.NormalizedLoginName() == normalizedLoginName {
+			return a, nil
+		}
+	}
+	return domain.Account{}, port.ErrNotFound
+}
+
 func (r accountRepo) FindSessionByHash(_ context.Context, hash domain.TokenHash) (domain.SessionState, error) {
 	id, ok := r.s.sessionsByHash[hash.Hex()]
 	if !ok {
@@ -121,6 +134,19 @@ func (r accountRepo) InvalidateResetTokens(_ context.Context, accountID domain.A
 	return nil
 }
 
+func (r accountRepo) GetRateLimit(_ context.Context, kind string, subjectHash domain.Fingerprint, windowStart domain.Instant) (port.RateLimitRecord, error) {
+	key := rateLimitKey{
+		kind:        kind,
+		subjectHash: subjectHash.Hex(),
+		windowStart: windowStart.UnixMicro(),
+	}
+	rec, ok := r.s.rateLimits[key]
+	if !ok {
+		return port.RateLimitRecord{}, port.ErrNotFound
+	}
+	return rec, nil
+}
+
 func (r accountRepo) SaveRateLimit(_ context.Context, record port.RateLimitRecord) error {
 	key := rateLimitKey{
 		kind:        record.Kind,
@@ -128,5 +154,37 @@ func (r accountRepo) SaveRateLimit(_ context.Context, record port.RateLimitRecor
 		windowStart: record.WindowStart.UnixMicro(),
 	}
 	r.s.rateLimits[key] = record
+	return nil
+}
+
+// SaveSession overwrites an existing session row (e.g. after
+// SessionState.Touch). Unlike SaveAccount there is no expectedVersion:
+// sessions carry no version column (docs/data-model.md's sessions row), so
+// the optimistic-lock contract this package documents on SaveAccount does
+// not apply here.
+func (r accountRepo) SaveSession(_ context.Context, session domain.SessionState) error {
+	if _, ok := r.s.sessions[session.ID()]; !ok {
+		return port.ErrNotFound
+	}
+	r.s.sessions[session.ID()] = session
+	// TokenHash never changes across a Touch, but keep the hash index
+	// consistent on the general principle that Save always reflects the
+	// object handed to it, not an assumption about which fields moved.
+	r.s.sessionsByHash[session.TokenHash().Hex()] = session.ID()
+	return nil
+}
+
+// SaveResetToken overwrites an existing reset token row (e.g. after
+// AdminResetToken.Consume/Invalidate). Like SaveSession, there is no
+// expectedVersion: AdminResetToken carries no version column either: its
+// one-shot guarantee comes from Consume/Invalidate re-checking
+// consumed_at/invalidated_at on a row read fresh inside the same write
+// transaction, not from an optimistic-lock counter.
+func (r accountRepo) SaveResetToken(_ context.Context, token domain.AdminResetToken) error {
+	if _, ok := r.s.resetTokens[token.ID()]; !ok {
+		return port.ErrNotFound
+	}
+	r.s.resetTokens[token.ID()] = token
+	r.s.resetTokensByHash[token.TokenHash().Hex()] = token.ID()
 	return nil
 }

@@ -39,6 +39,19 @@ type AccountRepository interface {
 	// own conflict error, not by pre-checking with this method.
 	GetAccountForUpdate(ctx context.Context, id domain.AccountID) (domain.Account, error)
 
+	// FindAccountByLoginName resolves a login attempt's normalized login
+	// name to an account, without locking -- the same "unlocked resolve,
+	// then lock by ID inside the write" split FindSessionByHash/
+	// GetSessionForUpdate already use below. Login only ever supplies a
+	// name, never an AccountID (docs/backend-implementation.md §8 "로그인"
+	// row starts the write by re-checking "계정/자격 증명 version", which
+	// presupposes the write already knows which account that is); without
+	// this lookup, IdentityService.Login could not get from the submitted
+	// name to an account through TxStores at all
+	// (docs/backend-implementation.md §13's named gap: "로그인 이름 조회").
+	// It returns ErrNotFound if no account has this normalized login name.
+	FindAccountByLoginName(ctx context.Context, normalizedLoginName string) (domain.Account, error)
+
 	// FindSessionByHash looks up a session by its token hash without
 	// locking, for the fast "is this cookie even known" path before the
 	// transaction that actually authenticates the request. It returns
@@ -105,7 +118,44 @@ type AccountRepository interface {
 	// consumed token) row by row rather than issuing a raw column overwrite.
 	InvalidateResetTokens(ctx context.Context, accountID domain.AccountID, now domain.Instant) error
 
+	// GetRateLimit reads back one rate-limit window keyed by exactly the
+	// same (Kind, SubjectHash, WindowStart) SaveRateLimit upserts. Without
+	// it, a failed-login write can only ever accumulate a failure_count no
+	// one can ever check, since SaveRateLimit alone makes the store
+	// write-only for this row (docs/backend-implementation.md §13's named
+	// gap: "rate-limit 읽기"). It returns ErrNotFound if no window has been
+	// saved for this key yet -- a fresh window, not an error condition the
+	// caller must special-case beyond treating a missing row as
+	// FailureCount 0.
+	GetRateLimit(ctx context.Context, kind string, subjectHash domain.Fingerprint, windowStart domain.Instant) (RateLimitRecord, error)
+
 	// SaveRateLimit upserts one rate-limit window keyed by
 	// (Kind, SubjectHash, WindowStart), matching the auth_rate_limits UQ.
 	SaveRateLimit(ctx context.Context, record RateLimitRecord) error
+
+	// SaveSession persists a session row that already exists (Insert
+	// creates it), such as the idle-expiry refresh SessionState.Touch
+	// produces on each authenticated request. Sessions carry no version
+	// column in docs/data-model.md, so unlike SaveAccount this takes no
+	// expectedVersion: the row is identified by its own SessionID, and the
+	// authenticating request already re-validated auth_epoch/expiry via
+	// GetSessionForUpdate/SessionState.ValidateAt before calling Touch, so
+	// there is no separate optimistic-lock check left to perform here.
+	// Without this method the idle window can never actually advance past
+	// what Insert wrote at login (docs/backend-implementation.md §13's
+	// named gap: "세션 만료 갱신"). It returns ErrNotFound if the session no
+	// longer exists (e.g. a concurrent logout/epoch bump deleted it).
+	SaveSession(ctx context.Context, session domain.SessionState) error
+
+	// SaveResetToken persists a reset token that already exists (Insert
+	// creates it) after a state-changing transition -- AdminResetToken has
+	// no version column either, so this too takes no expectedVersion; the
+	// one-shot guarantee comes from Consume/Invalidate re-checking
+	// consumed_at/invalidated_at on a row read fresh inside the same write
+	// transaction (GetResetToken's own doc comment), not from a version
+	// check here. Without this method, CompleteReset's consumed_at can
+	// never actually reach storage -- the token stays spendable forever
+	// (docs/backend-implementation.md §13's named gap: "reset token 소비
+	// 저장"). It returns ErrNotFound if the token no longer exists.
+	SaveResetToken(ctx context.Context, token domain.AdminResetToken) error
 }
