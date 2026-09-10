@@ -456,21 +456,36 @@ func (k PublicKey) Equal(other PublicKey) bool {
 	return k.algorithm == other.algorithm && k.Fingerprint().Equal(other.Fingerprint())
 }
 
-// KeyAlgorithm names a supported key type. Adapters map these to real curves
-// and moduli; the domain only carries the choice.
+// KeyAlgorithm names a supported key type. The permitted set is the one in
+// the OpenAPI key_algorithm enum and docs/certificate-lifecycle.md: ECDSA
+// P-256 and P-384 and RSA 2048, 3072 and 4096. Ed25519 and every other
+// algorithm are outside the MVP issuance scope and are rejected here so that
+// generation, import and request validation all apply the same list.
+// Adapters map these to real curves and moduli; the domain only carries the
+// choice.
 type KeyAlgorithm string
 
 const (
 	KeyAlgorithmECDSAP256 KeyAlgorithm = "ecdsa_p256"
 	KeyAlgorithmECDSAP384 KeyAlgorithm = "ecdsa_p384"
+	KeyAlgorithmRSA2048   KeyAlgorithm = "rsa_2048"
 	KeyAlgorithmRSA3072   KeyAlgorithm = "rsa_3072"
 	KeyAlgorithmRSA4096   KeyAlgorithm = "rsa_4096"
-	KeyAlgorithmEd25519   KeyAlgorithm = "ed25519"
+)
+
+// DefaultKeyAlgorithm is the product default for both CA and leaf keys.
+const DefaultKeyAlgorithm = KeyAlgorithmECDSAP256
+
+// DefaultCARSASize and DefaultLeafRSASize are the sizes applied when an
+// operator picks RSA without naming one.
+const (
+	DefaultCARSAAlgorithm   = KeyAlgorithmRSA3072
+	DefaultLeafRSAAlgorithm = KeyAlgorithmRSA2048
 )
 
 func (a KeyAlgorithm) Validate() error {
 	switch a {
-	case KeyAlgorithmECDSAP256, KeyAlgorithmECDSAP384, KeyAlgorithmRSA3072, KeyAlgorithmRSA4096, KeyAlgorithmEd25519:
+	case KeyAlgorithmECDSAP256, KeyAlgorithmECDSAP384, KeyAlgorithmRSA2048, KeyAlgorithmRSA3072, KeyAlgorithmRSA4096:
 		return nil
 	default:
 		return fmt.Errorf("%w: unsupported key algorithm %q", ErrInvalidValue, string(a))
