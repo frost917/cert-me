@@ -255,18 +255,30 @@ func (f TLSValidationFacts) firstFailure() string {
 // failing candidate stays prepared and unvalidated: it never changes the
 // active version, since Commit refuses an unvalidated candidate
 // (planning.md "HTTPS 교체 후보의 ... 검증 실패 시 기존 인증서를 유지한다").
+//
+// Unlike the other transitions in this file, a failing validation is not
+// reported through the error return: keeping the existing certificate while
+// recording why the candidate was rejected is the expected, successful
+// outcome of this call (planning.md, above), not an exceptional one. The
+// error return is reserved for genuine caller misuse (calling this on a
+// change that is not prepared), which — matching every other transition in
+// this file — yields a zero TLSChange. That split means a caller using the
+// common `next, err := change.ValidateCandidate(facts); if err != nil {
+// return err }` idiom always gets back the change to persist (errorCode
+// included) whenever err is nil, and never has a validated-or-failed result
+// silently discarded because it also carried a non-nil error.
 func (c TLSChange) ValidateCandidate(facts TLSValidationFacts) (TLSChange, error) {
 	if c.phase != TLSChangePhasePrepared {
 		return TLSChange{}, NewPolicyError(ErrInvalidTransition, "tls_change_not_prepared",
 			fmt.Sprintf("tls change is %s, not prepared", c.phase))
 	}
+	next := c
+	next.version = c.version.Next()
 	if !facts.allPass() {
-		next := c
 		next.validated = false
 		next.errorCode = facts.firstFailure()
-		return next, NewPolicyError(ErrPolicyViolation, facts.firstFailure(), "tls candidate failed validation")
+		return next, nil
 	}
-	next := c
 	next.validated = true
 	next.errorCode = ""
 	return next, nil
@@ -331,10 +343,25 @@ func (c TLSChange) RollbackApply(errorCode string, now Instant) (TLSChange, erro
 // must stop until Reconcile inspects stored state
 // (backend-implementation.md §9 "불명확한 변경은 일반 서비스 재개를 막고
 // Reconcile로 판단한다").
+//
+// Only a committed change may become recovery_required. §9 spells out the
+// exact sequence that can go ambiguous: "DB committed 기록/활성 포인터 변경
+// → Installer.Apply → DB applied 기록" — and the sentence that follows,
+// "applied 기록 실패를 포함한 불명확한 변경", names the ambiguity as
+// happening between those two writes: either Installer.Apply itself may
+// have partially run, or it succeeded but the DB write recording applied
+// failed. In both cases the change is still, in the DB, committed at the
+// moment the ambiguity is discovered — applied is never reached because
+// that write is exactly what may not have happened. A prepared candidate
+// has no activation in flight to be unclear about (Commit's !c.validated
+// gate is the only gate standing between prepared and committed, and this
+// transition must never be usable to skip it), and applied/rolled_back are
+// already terminal. So committed is the only phase this marker may start
+// from.
 func (c TLSChange) MarkRecoveryRequired(errorCode string, now Instant) (TLSChange, error) {
-	if c.phase.IsTerminal() {
-		return TLSChange{}, NewPolicyError(ErrInvalidTransition, "tls_change_terminal",
-			fmt.Sprintf("tls change is already terminal (%s)", c.phase))
+	if c.phase != TLSChangePhaseCommitted {
+		return TLSChange{}, NewPolicyError(ErrInvalidTransition, "tls_change_not_committed",
+			fmt.Sprintf("tls change is %s, not committed", c.phase))
 	}
 	if errorCode == "" {
 		return TLSChange{}, fmt.Errorf("%w: recovery marker requires an error code", ErrInvalidValue)

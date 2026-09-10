@@ -36,8 +36,8 @@ func TestTLSChange_FailedValidationBlocksCommit(t *testing.T) {
 	failing := passingFacts()
 	failing.KeyMatchesCertificate = false
 	afterValidate, err := c.ValidateCandidate(failing)
-	if err == nil {
-		t.Fatalf("expected validation failure error")
+	if err != nil {
+		t.Fatalf("expected failed validation to be a normal (non-error) result: %v", err)
 	}
 	if afterValidate.Validated() {
 		t.Fatalf("expected candidate to remain unvalidated after failure")
@@ -210,8 +210,8 @@ func TestTLSChange_ManagedCandidateStillRequiresServiceAddress(t *testing.T) {
 	managedFacts.ServiceAddressMatches = false
 
 	afterValidate, err := c.ValidateCandidate(managedFacts)
-	if err == nil {
-		t.Fatalf("expected managed candidate with a mismatched service address to fail validation")
+	if err != nil {
+		t.Fatalf("expected failed validation to be a normal (non-error) result: %v", err)
 	}
 	if afterValidate.Validated() {
 		t.Fatalf("expected managed candidate to remain unvalidated")
@@ -236,8 +236,15 @@ func TestTLSChange_ExternalCandidateStillRequiresServiceAddress(t *testing.T) {
 	externalFacts.CandidateSource = TLSSourceExternal
 	externalFacts.ServiceAddressMatches = false
 
-	if _, err := c.ValidateCandidate(externalFacts); err == nil {
-		t.Fatalf("expected external candidate with a mismatched service address to fail validation")
+	afterValidate, err := c.ValidateCandidate(externalFacts)
+	if err != nil {
+		t.Fatalf("expected failed validation to be a normal (non-error) result: %v", err)
+	}
+	if afterValidate.Validated() {
+		t.Fatalf("expected external candidate to remain unvalidated")
+	}
+	if afterValidate.ErrorCode() != "tls_candidate_address_mismatch" {
+		t.Fatalf("expected tls_candidate_address_mismatch, got %q", afterValidate.ErrorCode())
 	}
 }
 
@@ -411,5 +418,167 @@ func TestTLSChange_ReconcileRefusesPreparedCandidate(t *testing.T) {
 		CandidateFacts:     passingFacts(),
 	}, t0()); err == nil {
 		t.Fatalf("expected reconcile of a committed (not recovery_required) change to be refused")
+	}
+}
+
+// Reviewer finding (round 3, #1): a prepared candidate must never be able to
+// reach recovery_required and then get laundered into applied by Reconcile,
+// since that would bypass Commit's !c.validated gate entirely
+// (backend-implementation.md §9: "Reconcile는 prepared 후보는 활성화하지
+// 않고..."). This reproduces the reviewer's exact three-step path and
+// verifies it is refused at the first opportunity: MarkRecoveryRequired must
+// reject a merely prepared (never committed) candidate, so Reconcile never
+// even gets a chance to see it.
+func TestTLSChange_PreparedCandidateCannotLaunderThroughRecoveryRequired(t *testing.T) {
+	c, err := NewCandidateTLSChange(mkTLSVersionID(t, '1'), mkTLSVersionID(t, '2'))
+	if err != nil {
+		t.Fatalf("new candidate: %v", err)
+	}
+	if c.Phase() != TLSChangePhasePrepared || c.Validated() {
+		t.Fatalf("expected a fresh candidate to be prepared and unvalidated")
+	}
+
+	// Step 2 of the reviewer's repro: mark the still-prepared (never
+	// committed, never validated) candidate as recovery_required directly.
+	if _, err := c.MarkRecoveryRequired("boom", t0()); err == nil {
+		t.Fatalf("expected MarkRecoveryRequired on a prepared (not committed) change to be refused")
+	}
+
+	// Belt and suspenders: even if that guard were somehow bypassed, Reconcile
+	// itself must still refuse to activate a candidate that was never
+	// Commit-validated. We can't construct a recovery_required change that
+	// skipped Commit anymore (that's exactly what the guard above prevents),
+	// so this asserts the same rule holds for a legitimately-reached
+	// recovery_required change too: Reconcile only ever completes a change
+	// that passed through committed.
+	recovery := mkRecoveryRequiredChange(t, '3', '4')
+	if recovery.Phase() != TLSChangePhaseRecoveryRequired {
+		t.Fatalf("expected legitimate recovery path to still reach recovery_required")
+	}
+}
+
+// Reviewer finding (round 3, #1), continued: only a committed change may
+// become recovery_required. A prepared candidate is refused (covered above);
+// this also checks the other non-committed phases so the allowed-phase set
+// is exactly {committed}, not "everything except terminal" as it was before.
+func TestTLSChange_MarkRecoveryRequiredOnlyFromCommitted(t *testing.T) {
+	// prepared -> refused (see TestTLSChange_PreparedCandidateCannotLaunderThroughRecoveryRequired).
+
+	// recovery_required -> refused (already recovery_required, re-marking is
+	// not a committed->recovery_required transition).
+	recovery := mkRecoveryRequiredChange(t, '1', '2')
+	if _, err := recovery.MarkRecoveryRequired("again", t0()); err == nil {
+		t.Fatalf("expected MarkRecoveryRequired on an already recovery_required change to be refused")
+	}
+
+	// applied and rolled_back -> refused (terminal; also covered by
+	// TestTLSChange_UnclearOutcomeRequiresRecovery for applied).
+	c, err := NewCandidateTLSChange(mkTLSVersionID(t, '5'), mkTLSVersionID(t, '6'))
+	if err != nil {
+		t.Fatalf("new candidate: %v", err)
+	}
+	validated, err := c.ValidateCandidate(passingFacts())
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	committed, err := validated.Commit(t0())
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	rolledBack, err := committed.RollbackApply("installer_bind_failed", t0())
+	if err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	if _, err := rolledBack.MarkRecoveryRequired("late_signal", t0()); err == nil {
+		t.Fatalf("expected MarkRecoveryRequired on a rolled_back change to be refused")
+	}
+
+	// committed -> the only allowed starting phase.
+	if _, err := committed.MarkRecoveryRequired("apply_result_unknown", t0()); err != nil {
+		t.Fatalf("expected MarkRecoveryRequired from committed to succeed: %v", err)
+	}
+}
+
+// Reviewer finding (round 3, #2): ValidateCandidate must bump the optimistic
+// concurrency version like every other transition in this file, on both the
+// pass and fail path, so a SaveTLSChange(change, expectedVersion) call after
+// validation rejects a stale concurrent writer instead of silently
+// overwriting it.
+func TestTLSChange_ValidateCandidateAdvancesVersion(t *testing.T) {
+	c, err := NewTLSChange(TLSChangeFacts{
+		PreviousVersionID:  mkTLSVersionID(t, '1'),
+		CandidateVersionID: mkTLSVersionID(t, '2'),
+		Phase:              TLSChangePhasePrepared,
+		Version:            7,
+	})
+	if err != nil {
+		t.Fatalf("new tls change: %v", err)
+	}
+
+	passed, err := c.ValidateCandidate(passingFacts())
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if passed.Version() != 8 {
+		t.Fatalf("expected version to advance to 8 on successful validation, got %d", passed.Version())
+	}
+
+	failing := passingFacts()
+	failing.ChainVerified = false
+	failed, err := c.ValidateCandidate(failing)
+	if err != nil {
+		t.Fatalf("expected failed validation to be a normal (non-error) result: %v", err)
+	}
+	if failed.Version() != 8 {
+		t.Fatalf("expected version to advance to 8 on failed validation too, got %d", failed.Version())
+	}
+}
+
+// Reviewer finding (round 3, #3): a failing candidate validation is a normal
+// business result (planning.md: keep the existing certificate and record why),
+// not an error, so callers using the common `next, err := ...; if err != nil
+// { return err }` idiom must still receive the errorCode-bearing change
+// rather than discarding it. The error return stays reserved for genuine
+// caller misuse (wrong starting phase), which - like every other transition
+// in this file - yields a zero value.
+func TestTLSChange_ValidateCandidateFailureIsNotAnError(t *testing.T) {
+	c, err := NewCandidateTLSChange(mkTLSVersionID(t, '1'), mkTLSVersionID(t, '2'))
+	if err != nil {
+		t.Fatalf("new candidate: %v", err)
+	}
+
+	failing := passingFacts()
+	failing.WithinValidityPeriod = false
+
+	// Simulate the idiom a careless caller would use.
+	next, err := c.ValidateCandidate(failing)
+	if err != nil {
+		t.Fatalf("a failed validation must not be reported as an error: %v", err)
+	}
+	if next.Validated() {
+		t.Fatalf("expected candidate to remain unvalidated")
+	}
+	if next.ErrorCode() != "tls_candidate_out_of_validity" {
+		t.Fatalf("expected errorCode to survive the nil-error path, got %q", next.ErrorCode())
+	}
+
+	// Misuse (wrong phase) is still reported as an error, with a zero value,
+	// matching every other transition in this file.
+	committed, err := func() (TLSChange, error) {
+		validated, err := c.ValidateCandidate(passingFacts())
+		if err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+		return validated.Commit(t0())
+	}()
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	zero, err := committed.ValidateCandidate(passingFacts())
+	if err == nil {
+		t.Fatalf("expected ValidateCandidate on a non-prepared change to be refused")
+	}
+	if zero != (TLSChange{}) {
+		t.Fatalf("expected zero value on caller-misuse error, got %+v", zero)
 	}
 }
