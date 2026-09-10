@@ -31,6 +31,8 @@ type (
 	JobID               string
 	ResetTokenID        string
 	CRLDocumentID       string
+	ImportBatchID       string
+	TakeoverID          string
 )
 
 // uuidLength is the canonical 8-4-4-4-12 hyphenated form length.
@@ -146,6 +148,23 @@ func ParseResetTokenID(raw string) (ResetTokenID, error) {
 func ParseCRLDocumentID(raw string) (CRLDocumentID, error) {
 	v, err := parseUUID("crl document id", raw)
 	return CRLDocumentID(v), err
+}
+
+// ParseImportBatchID parses the identifier of one import_batches row. The id
+// list in backend-implementation.md §2 predates the import and takeover
+// tables in data-model.md; those rows carry their own UUID and are addressed
+// by it in the OpenAPI ImportResult/Takeover objects, so they get a distinct
+// named type here for the same reason every other stored entity does -- a
+// bare string lets an import id be passed where a takeover id is expected.
+func ParseImportBatchID(raw string) (ImportBatchID, error) {
+	v, err := parseUUID("import batch id", raw)
+	return ImportBatchID(v), err
+}
+
+// ParseTakeoverID parses the identifier of one ca_takeovers row.
+func ParseTakeoverID(raw string) (TakeoverID, error) {
+	v, err := parseUUID("takeover id", raw)
+	return TakeoverID(v), err
 }
 
 // Version is a non-negative optimistic locking counter.

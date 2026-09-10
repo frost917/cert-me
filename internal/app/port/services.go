@@ -220,8 +220,22 @@ type DeliveryFormat string
 
 const (
 	DeliveryFormatPEM    DeliveryFormat = "pem"
+	DeliveryFormatZIP    DeliveryFormat = "zip"
 	DeliveryFormatPKCS12 DeliveryFormat = "pkcs12"
 )
+
+// Validate rejects a format outside the set the download endpoint offers.
+// The three values are fixed by api/openapi.json's /download/{token} format
+// query parameter (pem/zip/pkcs12); an encoder must not silently fall back
+// to a different encoding when asked for one it does not recognise.
+func (f DeliveryFormat) Validate() error {
+	switch f {
+	case DeliveryFormatPEM, DeliveryFormatZIP, DeliveryFormatPKCS12:
+		return nil
+	default:
+		return fmt.Errorf("%w: unsupported delivery format %q", domain.ErrInvalidValue, string(f))
+	}
+}
 
 // DeliveryEncodeInput is what DeliveryEncoder needs to build one leaf
 // private-key bundle. LeafSecret must carry SecretPurposeLeafDelivery --
