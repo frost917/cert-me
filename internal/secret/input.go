@@ -53,7 +53,10 @@ func ReadAll(r io.Reader, limit int) (*Input, error) {
 	if limit <= 0 {
 		return nil, fmt.Errorf("secret: read limit must be positive")
 	}
-	buf := make([]byte, 0, min(limit, 4096))
+	// Allocate the full limit up front. Growing with append would reallocate
+	// and leave the discarded array holding plaintext that Close can no longer
+	// reach, since Close only zeroes the array buf currently points at.
+	buf := make([]byte, 0, limit)
 	chunk := make([]byte, 512)
 	for {
 		n, err := r.Read(chunk)
@@ -81,16 +84,25 @@ func ReadAll(r io.Reader, limit int) (*Input, error) {
 // Use grants synchronous access to the plaintext. The callback must not retain
 // the slice or hand it to another goroutine; that is the adapter contract.
 // A nil Input is treated as closed so callers do not need a nil check.
+//
+// The lock is released before the callback runs, so the callback may call any
+// method on the same Input -- including a deferred Close, which is the natural
+// thing to write. Holding a non-reentrant mutex across the callback would
+// deadlock on exactly that. The buffer is captured while the lock is held; a
+// concurrent Close zeroes that array, so a racing Close during the callback
+// blanks the plaintext rather than freeing it out from under the callback.
 func (i *Input) Use(fn func([]byte) error) error {
 	if i == nil {
 		return ErrClosed
 	}
 	i.mu.Lock()
-	defer i.mu.Unlock()
-	if i.closed || i.buf == nil {
+	buf := i.buf
+	closed := i.closed
+	i.mu.Unlock()
+	if closed || buf == nil {
 		return ErrClosed
 	}
-	return fn(i.buf)
+	return fn(buf)
 }
 
 // Len reports the plaintext length, which is not itself secret. A closed or

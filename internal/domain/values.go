@@ -317,8 +317,18 @@ type Instant struct {
 	micros int64
 }
 
-// NewInstant truncates to microseconds in UTC.
+// NewInstant truncates to microseconds in UTC. A zero time.Time maps to the
+// zero Instant rather than to year 1: every "must be set" check in this
+// package is IsZero, and an adapter reading a NULL or unset timestamp column
+// naturally reaches for this constructor. Without the mapping, such a value
+// passes validation and stores a year-1 record.
+//
+// The zero Instant is micros == 0, so the Unix epoch is also treated as unset.
+// A caller that genuinely means 1970-01-01T00:00:00Z uses InstantFromUnixMicro.
 func NewInstant(t time.Time) Instant {
+	if t.IsZero() {
+		return Instant{}
+	}
 	return Instant{micros: t.UTC().UnixMicro()}
 }
 

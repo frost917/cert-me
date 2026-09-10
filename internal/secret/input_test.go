@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestUseGivesPlaintextThenCloseZeroes(t *testing.T) {
@@ -167,5 +168,86 @@ func TestCloseAllSkipsNils(t *testing.T) {
 		if err := in.Use(func([]byte) error { return nil }); !errors.Is(err, ErrClosed) {
 			t.Fatalf("input %d not closed: %v", i, err)
 		}
+	}
+}
+
+// TestUseAllowsCallbackToTouchTheInput covers the deadlock the mutex used to
+// cause: sync.Mutex is not reentrant, so holding it across the callback made
+// the most natural spelling -- a deferred Close inside the callback -- block
+// forever. The test would hang rather than fail if that came back, so it runs
+// on its own goroutine with a deadline.
+func TestUseAllowsCallbackToTouchTheInput(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body func(in *Input, b []byte) error
+	}{
+		{"close inside callback", func(in *Input, _ []byte) error {
+			defer in.Close()
+			return nil
+		}},
+		{"len inside callback", func(in *Input, _ []byte) error {
+			if in.Len() == 0 {
+				return errors.New("unexpected empty input")
+			}
+			return nil
+		}},
+		{"nested use", func(in *Input, _ []byte) error {
+			return in.Use(func([]byte) error { return nil })
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := FromString("hunter2")
+			defer in.Close()
+
+			done := make(chan error, 1)
+			go func() {
+				done <- in.Use(func(b []byte) error { return tc.body(in, b) })
+			}()
+
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("Use: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Use deadlocked: the callback could not touch the Input")
+			}
+		})
+	}
+}
+
+// TestReadAllDoesNotLeaveAnUnzeroedCopy checks that a secret larger than the
+// old 4096-byte starting capacity is not copied into a discarded array that
+// Close can never reach.
+func TestReadAllDoesNotLeaveAnUnzeroedCopy(t *testing.T) {
+	const size = 9000
+	plaintext := bytes.Repeat([]byte("s"), size)
+
+	in, err := ReadAll(bytes.NewReader(plaintext), size)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if in.Len() != size {
+		t.Fatalf("Len = %d, want %d", in.Len(), size)
+	}
+
+	// One allocation at full capacity means no reallocation happened, so the
+	// only array holding the plaintext is the one Close zeroes.
+	var capacity int
+	if err := in.Use(func(b []byte) error {
+		capacity = cap(b)
+		return nil
+	}); err != nil {
+		t.Fatalf("Use: %v", err)
+	}
+	if capacity != size {
+		t.Errorf("buffer capacity = %d, want exactly the limit %d; a different capacity means append reallocated and left a copy behind", capacity, size)
+	}
+
+	if err := in.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := in.Use(func([]byte) error { return nil }); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Use after Close = %v, want ErrClosed", err)
 	}
 }
