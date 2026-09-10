@@ -78,6 +78,16 @@ type PKIRepository interface {
 	// issuance use. It returns ErrNotFound when the public key is unknown.
 	FindKeyBySPKI(ctx context.Context, spkiSHA256 domain.Fingerprint) (KeyMaterial, error)
 
+	// GetCertificate looks up a certificate by its own id. Renew/Reissue
+	// commands carry a source_certificate_id (docs/data-model.md "CA·인증서·
+	// 갱신 계보"; docs/backend-implementation.md §8 "Leaf 발급/갱신" row lists
+	// "기대 version·issuer/키/수령/폐기 검사" among the facts re-checked inside
+	// the single commit Write, and the certificate being renewed is exactly
+	// the fact FindCertificateByDER/FindKeyBySPKI cannot recover -- those are
+	// dedup lookups by content hash, not an id lookup for "the certificate
+	// this renewal names"). It returns ErrNotFound when id is unknown.
+	GetCertificate(ctx context.Context, id domain.CertificateID) (domain.Certificate, error)
+
 	// SerialExists reports whether serial is already used by a certificate
 	// or a revocation entry under issuer, the collision check serial
 	// generation runs before signing commits
@@ -91,6 +101,49 @@ type PKIRepository interface {
 
 	// InsertKeyGeneration creates a new CA key generation row.
 	InsertKeyGeneration(ctx context.Context, generation CAKeyGeneration) error
+
+	// InsertKeyMaterial creates a new key_materials row: the public-key
+	// identity a freshly generated or imported key pair gets before anything
+	// else (a CA key generation, a leaf key generation) can reference its
+	// KeyMaterialID (docs/data-model.md "key_materials ... 개인키가 삭제돼도
+	// 남는 공개키 식별자"; §4 table row lists InsertKeyMaterial explicitly).
+	// key_materials.spki_sha256 is unique, so a duplicate public key surfaces
+	// as a conflict error rather than a second row -- the same-public-key
+	// check FindKeyBySPKI performs before calling this is what makes that
+	// conflict unreachable in the normal path.
+	InsertKeyMaterial(ctx context.Context, material KeyMaterial) error
+
+	// InsertLeafKeyGeneration creates a new leaf_key_generations row: the
+	// first generation of a new series' key, or the new generation a key
+	// rotation (RenewalAction == RotateKey) or an emergency reissue creates
+	// (docs/data-model.md "leaf_key_generations ... (series_id,generation_no)
+	// UQ"; docs/backend-implementation.md §4 table row lists
+	// InsertLeafKeyGeneration explicitly; internal/domain/series.go
+	// RenewalPlan's doc comment: "possibly create a new leaf_key_generations
+	// row"). It does not itself update the series' current_key_generation_id
+	// -- that is SaveSeries' job, in the same Write.
+	InsertLeafKeyGeneration(ctx context.Context, generation domain.LeafKeyGeneration) error
+
+	// SaveLeafKeyGeneration persists generation's renewal_count when a
+	// renewal reuses the current key (RenewalAction == ReuseKey) rather than
+	// rotating to a new generation row (internal/domain/series.go
+	// RenewalPlan's doc comment: the caller must "update counts" after
+	// PlanRenewal decides to reuse a key). Unlike SaveSeries/SaveAuthority
+	// this takes no expectedVersion: domain.LeafKeyGeneration
+	// (internal/domain/series.go) has no version field of its own, and
+	// docs/data-model.md's leaf_key_generations row lists no version column
+	// either, only the caller-owned renewal_count/generation_no. The
+	// concurrency guard for this update instead comes from the enclosing
+	// transaction: SaveLeafKeyGeneration is only ever called next to
+	// SaveSeries(series, expectedVersion) inside the same renewal Write, both
+	// against the pair GetSeriesForUpdate locked together, so a losing
+	// concurrent renewal is already rejected by the series' own optimistic
+	// lock before this call is reached. GAP: the §4 table's terse
+	// "SaveLeafKeyGeneration/Series/Authority(expectedVersion)" reads as if
+	// expectedVersion applied to all three; it cannot for
+	// LeafKeyGeneration as the domain object stands today. Flagged for the
+	// lead/planning team rather than guessed at.
+	SaveLeafKeyGeneration(ctx context.Context, generation domain.LeafKeyGeneration) error
 
 	// InsertCertificate stores a freshly signed or imported certificate.
 	// certificates.der_sha256 is unique, so a duplicate DER surfaces as a

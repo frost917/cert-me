@@ -51,6 +51,17 @@ func (r pkiRepo) FindCertificateByDER(_ context.Context, derSHA256 domain.Finger
 	return r.s.certificates[id], nil
 }
 
+// GetCertificate looks up a certificate by its own id, the read
+// Renew/Reissue need to resolve a command's source_certificate_id (see
+// port.PKIRepository.GetCertificate's doc comment).
+func (r pkiRepo) GetCertificate(_ context.Context, id domain.CertificateID) (domain.Certificate, error) {
+	cert, ok := r.s.certificates[id]
+	if !ok {
+		return domain.Certificate{}, port.ErrNotFound
+	}
+	return cert, nil
+}
+
 func (r pkiRepo) FindKeyBySPKI(_ context.Context, spkiSHA256 domain.Fingerprint) (port.KeyMaterial, error) {
 	id, ok := r.s.keyMaterialsBySPKI[spkiSHA256.Hex()]
 	if !ok {
@@ -88,6 +99,41 @@ func (r pkiRepo) InsertKeyGeneration(_ context.Context, generation port.CAKeyGen
 		return ErrDuplicate
 	}
 	r.s.caKeyGenerations[generation.ID] = generation
+	return nil
+}
+
+// InsertKeyMaterial creates a new key_materials row, keyed by id and indexed
+// by SPKI fingerprint the same way FindKeyBySPKI reads it back.
+func (r pkiRepo) InsertKeyMaterial(_ context.Context, material port.KeyMaterial) error {
+	if _, ok := r.s.keyMaterials[material.ID]; ok {
+		return ErrDuplicate
+	}
+	spkiHex := material.PublicKey.Fingerprint().Hex()
+	if _, ok := r.s.keyMaterialsBySPKI[spkiHex]; ok {
+		return ErrDuplicate
+	}
+	r.s.keyMaterials[material.ID] = material
+	r.s.keyMaterialsBySPKI[spkiHex] = material.ID
+	return nil
+}
+
+// InsertLeafKeyGeneration creates a new leaf_key_generations row.
+func (r pkiRepo) InsertLeafKeyGeneration(_ context.Context, generation domain.LeafKeyGeneration) error {
+	if _, ok := r.s.leafKeyGenerations[generation.ID()]; ok {
+		return ErrDuplicate
+	}
+	r.s.leafKeyGenerations[generation.ID()] = generation
+	return nil
+}
+
+// SaveLeafKeyGeneration persists generation's renewal_count when a renewal
+// reuses the current key. See port.PKIRepository.SaveLeafKeyGeneration's doc
+// comment for why this takes no expectedVersion.
+func (r pkiRepo) SaveLeafKeyGeneration(_ context.Context, generation domain.LeafKeyGeneration) error {
+	if _, ok := r.s.leafKeyGenerations[generation.ID()]; !ok {
+		return port.ErrNotFound
+	}
+	r.s.leafKeyGenerations[generation.ID()] = generation
 	return nil
 }
 
