@@ -54,7 +54,7 @@ AuthorityID, CAKeyGenerationID, CertificateID, SeriesID, LeafKeyGenerationID, Ke
 | Delivery | CanConsume(now), Consume(now), Complete(now), Fail(code, now), Expire(now) | 전이마다 새 상태/오류 반환. 완료는 서버 전송 관측값 |
 | DownloadGrant | Validate(purpose, certificateID, deliveryID, now), Consume(now), Invalidate(now) | 토큰·권한·대상 결합. 원문 토큰 미보유 |
 | Account | CanLogin(), BeginReset(), CompleteReset(hash) | 상태·epoch 변경 반환. 세션 전체 삭제는 같은 트랜잭션의 서비스 책임 |
-| Revocation | Merge(incoming), Correct(reason,time,justification) | 동일 기록 무변경, 충돌 자동 덮어쓰기 금지, 해제 없음 |
+| Revocation | Merge(incoming), StampChangeGeneration(generation), Correct(reason,time,justification,now) | 동일 기록 무변경, 충돌 자동 덮어쓰기 금지, 해제 없음. stamp는 현재 값보다 큰 양수만 허용. 정정은 `revokedAt <= now + 5분`만 허용하고 now 미설정을 거부 |
 | CRLState | CanPublish(number,generation), MarkPublished(...) | 번호·반영 세대 후퇴 금지 |
 | Transition | SetTarget(...), ConfirmDeployment(...), Complete(ClosureFacts) | 긴급 영향과 개별 폐기 분리, 수동 확인 보존 |
 
@@ -183,11 +183,17 @@ Write callback 내부 순서는 인증/권한 확인 → 요청 결과 재확인
 
 app 내부 `applyRevocations(ctx, tx, changes, meta)`는 폐기 병합·generation 증가·CRL 작업·감사 추가를 함께 수행한다. Distribution의 실패/만료, Transition의 부모 CA 폐기, Import의 CRL 병합, RevocationService가 이 함수를 사용한다. 자체 트랜잭션을 열지 않는다. 여러 항목은 issuer별 generation을 한 번 증가시키고 같은 generation을 부여할 수 있다.
 
+generation은 issuer의 CRLState를 잠그고 batch당 한 번 계산하며 `Revocation.StampChangeGeneration(generation)`으로 각 레코드에 부여한다. 저장소에 별도 generation 인자를 두어 객체와 다른 값을 저장하지 않는다. 신규 레코드도 같은 batch generation을 받는다. `Merge`가 `changed=false`를 반환한 레코드는 stamp와 저장 대상에서 제외하며, batch 전체가 무변경이면 issuer generation과 CRL 작업 요구도 증가시키지 않는다.
+
+version은 DB 저장 횟수가 아니라 낙관적 잠금 토큰이다. 도메인 전이는 저장 필드를 바꿀 때마다 version을 올리므로 Merge/Correct 뒤 stamp하면 한 요청에서 두 번 증가할 수 있다. app은 DB에서 읽은 최초 version을 expectedVersion으로 보존하고 최종 객체를 한 번 Save한다. 저장소는 `WHERE version=expectedVersion`으로 검사하고 객체의 최종 version을 그대로 저장하며 `finalVersion=expectedVersion+1`을 강제하지 않는다. 레코드·CRLState·정정 이력·CRL 작업 요구·감사는 동일 트랜잭션에 커밋한다. 생성자에 Facts를 다시 조립하는 방식을 업무 전이의 대체 수단으로 사용하지 않는다.
+
 인증서 서명 공통 함수는 `prepareCertificate(plan, keyRef)`로 두고 Authority/Issuance/TLS가 사용한다. 내부 TLS 발급이 일반 Leaf 발급 서비스를 호출해 delivery를 만든 뒤 삭제하는 방식은 금지한다. 계획의 custody가 처음부터 internal이며 response에 download grant가 없다.
 
 ## 6. 비밀 입력·키·서명 계약
 
 secret.Input은 단기 []byte의 소유권을 갖는다. `Close()`는 소유 버퍼를 지우고 참조를 끊으며 여러 번 호출해도 안전하다. String/LogValue는 항상 redacted, MarshalJSON은 오류를 반환한다. 평문을 필요로 하는 어댑터에만 `Use(func([]byte) error)`로 동기 접근을 제공한다. callback이 참조를 보존하지 않는 것은 어댑터 계약이며 메모리 안전 삭제의 절대 보장을 주장하지 않는다.
+
+secret.Input은 실행 중인 Use callback 수를 추적한다. Close는 즉시 closed로 표시해 새 Use를 거부하되 callback이 남아 있으면 기다리지 않고 반환하고, 마지막 callback이 종료될 때 버퍼를 지운다. callback 종료 처리는 panic에도 defer로 수행한다. callback 내부 Close와 중첩 Use가 데드락을 만들지 않으며, 다른 goroutine의 Close가 사용 중인 버퍼를 동시에 덮어쓰지 않는다. callback이 없으면 Close가 즉시 버퍼를 지운다. callback은 바이트를 읽기 전용으로 사용하고 참조를 외부에 보존하지 않는다. Use/Close 경합은 race detector 테스트로 검증한다.
 
 HTTP/CLI는 비밀을 별도 command 필드의 secret.Input으로 변환하고 작업 반환 시 Close한다. command 전체를 로깅하지 않는다. encrypted secret에는 OwnerKeyID·Purpose·FormatVersion·EncryptionGenerationID·Nonce·Ciphertext가 있으며 AAD를 검증해 다른 레코드로 옮긴 암호문을 거부한다.
 
