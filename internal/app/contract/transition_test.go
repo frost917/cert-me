@@ -110,17 +110,11 @@ func TestDeploymentActionInput_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestDeploymentView_ActionFieldIsWireType is Q1: transition.go's file
-// header says "Views below expose the OpenAPI wire values directly
-// (TransitionStateView, DeploymentActionInput/View) with an explicit
-// mapping to the domain enum" -- but DeploymentView.Action was declared as
-// domain.DeploymentAction (domain values like "cert_key_replaced"), not the
-// wire enum (api/openapi.json Deployment.action: trust_added /
-// certificate_installed / trust_removed). An adapter trusting the header
-// comment and emitting DeploymentView.Action as-is would produce a value
-// the OpenAPI schema rejects. This test pins the field's static type to
-// DeploymentActionInput, the wire-view type already used for the input
-// side.
+// TestDeploymentView_ActionFieldIsWireType pins DeploymentView.Action's
+// static type to DeploymentActionInput. Now that B02 settled Decision 2 --
+// domain.DeploymentAction and the wire enum use identical values -- this is
+// no longer guarding a translation, just keeping the wire-shaped view types
+// consistent between the input and output sides.
 func TestDeploymentView_ActionFieldIsWireType(t *testing.T) {
 	field, ok := reflect.TypeOf(DeploymentView{}).FieldByName("Action")
 	if !ok {
@@ -128,25 +122,22 @@ func TestDeploymentView_ActionFieldIsWireType(t *testing.T) {
 	}
 	wantType := reflect.TypeOf(DeploymentActionInput(""))
 	if field.Type != wantType {
-		t.Fatalf("DeploymentView.Action must be %s (the OpenAPI wire enum view type), got %s -- "+
-			"the file header claims views expose wire values directly, so a domain-typed Action "+
-			"would let an adapter emit a value api/openapi.json's Deployment.action enum rejects",
-			wantType, field.Type)
+		t.Fatalf("DeploymentView.Action must be %s (the wire-view type), got %s", wantType, field.Type)
 	}
 }
 
-// TestDeploymentActionMapping_ExhaustiveRoundTrip is Q1/Q2: every
-// domain.DeploymentAction constant (internal/domain/transition.go lines
-// 287-289: DeploymentActionTrustAdded, DeploymentActionCertReplaced,
-// DeploymentActionTrustRemoved -- domain.DeploymentAction exports no
-// enumerator, so they are listed here by hand) must map to a distinct,
-// valid entry of api/openapi.json's Deployment.action enum, and mapping
-// back must reproduce the original domain value. This is the "total
-// mapping function, both directions" the finding calls for, verified
-// against the live OpenAPI document rather than a hardcoded wire list, so
-// a future domain action added without updating the mapping table fails
-// here.
-func TestDeploymentActionMapping_ExhaustiveRoundTrip(t *testing.T) {
+// TestDeploymentActionEnum_MatchesOpenAPIExhaustively is the B02-era
+// replacement for the old bijective-mapping guard: since domain and wire
+// values are now identical (Decision 2 ruling: DeploymentActionCertReplaced
+// / cert_key_replaced became DeploymentActionCertificateInstalled /
+// certificate_installed, matching OpenAPI exactly), what still needs
+// guarding is that domain.DeploymentAction's value set and
+// api/openapi.json's Deployment.action enum never drift apart. Verified
+// against the live OpenAPI document, listing domain.DeploymentAction's
+// constants by hand since the type exports no enumerator, so a future
+// domain action added without a matching OpenAPI entry (or vice versa)
+// fails here.
+func TestDeploymentActionEnum_MatchesOpenAPIExhaustively(t *testing.T) {
 	wireEnum := loadOpenAPIStringEnum(t, "Deployment", "action")
 	wireEnumSet := make(map[string]struct{}, len(wireEnum))
 	for _, w := range wireEnum {
@@ -155,31 +146,64 @@ func TestDeploymentActionMapping_ExhaustiveRoundTrip(t *testing.T) {
 
 	domainActions := []domain.DeploymentAction{
 		domain.DeploymentActionTrustAdded,
-		domain.DeploymentActionCertReplaced,
+		domain.DeploymentActionCertificateInstalled,
 		domain.DeploymentActionTrustRemoved,
 	}
 	if len(domainActions) != len(wireEnum) {
-		t.Fatalf("domain.DeploymentAction has %d values but api/openapi.json Deployment.action enum has %d -- mapping table is no longer total", len(domainActions), len(wireEnum))
+		t.Fatalf("domain.DeploymentAction has %d values but api/openapi.json Deployment.action enum has %d -- the two vocabularies are no longer in lockstep", len(domainActions), len(wireEnum))
 	}
 
 	seenWire := make(map[DeploymentActionInput]domain.DeploymentAction, len(domainActions))
 	for _, d := range domainActions {
 		wire := DeploymentActionInput(DeploymentActionView(d))
 		if _, ok := wireEnumSet[string(wire)]; !ok {
-			t.Fatalf("domain action %q maps to wire value %q, which is not in api/openapi.json's Deployment.action enum %v", d, wire, wireEnum)
+			t.Fatalf("domain action %q renders as %q, which is not in api/openapi.json's Deployment.action enum %v", d, wire, wireEnum)
 		}
 		if prev, dup := seenWire[wire]; dup {
-			t.Fatalf("domain actions %q and %q both map to the same wire value %q -- mapping is not bijective", prev, d, wire)
+			t.Fatalf("domain actions %q and %q both render as the same wire value %q -- values are no longer distinct", prev, d, wire)
 		}
 		seenWire[wire] = d
 
 		back, err := wire.Domain()
 		if err != nil {
-			t.Fatalf("wire value %q (from domain action %q) failed to map back: %v", wire, d, err)
+			t.Fatalf("wire value %q (from domain action %q) failed to parse back: %v", wire, d, err)
 		}
 		if back != d {
 			t.Fatalf("round-trip mismatch: domain %q -> wire %q -> domain %q", d, wire, back)
 		}
+	}
+}
+
+// TestTransitionStateEnum_MatchesOpenAPIExhaustively guards the other half
+// of B02 Decision 1: domain.TransitionState now uses the exact same
+// vocabulary as api/openapi.json's Transition.state enum, so this checks
+// the two stay in lockstep going forward.
+func TestTransitionStateEnum_MatchesOpenAPIExhaustively(t *testing.T) {
+	wireEnum := loadOpenAPIStringEnum(t, "Transition", "state")
+	wireEnumSet := make(map[string]struct{}, len(wireEnum))
+	for _, w := range wireEnum {
+		wireEnumSet[w] = struct{}{}
+	}
+
+	domainStates := []domain.TransitionState{
+		domain.TransitionStateInProgress,
+		domain.TransitionStateExternallyCompleted,
+		domain.TransitionStateClosed,
+	}
+	if len(domainStates) != len(wireEnum) {
+		t.Fatalf("domain.TransitionState has %d values but api/openapi.json Transition.state enum has %d -- the two vocabularies are no longer in lockstep", len(domainStates), len(wireEnum))
+	}
+
+	seen := make(map[TransitionStateView]domain.TransitionState, len(domainStates))
+	for _, s := range domainStates {
+		wire := TransitionStateViewOf(s)
+		if _, ok := wireEnumSet[string(wire)]; !ok {
+			t.Fatalf("domain state %q renders as %q, which is not in api/openapi.json's Transition.state enum %v", s, wire, wireEnum)
+		}
+		if prev, dup := seen[wire]; dup {
+			t.Fatalf("domain states %q and %q both render as the same wire value %q -- values are no longer distinct", prev, s, wire)
+		}
+		seen[wire] = s
 	}
 }
 

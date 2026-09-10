@@ -1,8 +1,6 @@
 package contract
 
 import (
-	"fmt"
-
 	"cert-me/internal/domain"
 )
 
@@ -10,18 +8,14 @@ import (
 // (docs/backend-implementation.md §3): Create, SetTarget, ConfirmDeployment,
 // Complete.
 //
-// NOTE on a documentation/OpenAPI disagreement, reported per the task
-// instructions rather than silently resolved: domain.TransitionState (see
-// internal/domain/transition.go) is reported/target_set/completed, while
-// api/openapi.json's Transition.state enum is
-// in_progress/externally_completed/closed, and domain.DeploymentAction is
-// trust_added/cert_key_replaced/trust_removed while OpenAPI's
-// Deployment/DeploymentInput.action enum is
-// trust_added/certificate_installed/trust_removed. Views below expose the
-// OpenAPI wire values directly (TransitionStateView, DeploymentActionInput/
-// View) with an explicit mapping to the domain enum, so the HTTP surface
-// matches api/openapi.json exactly; the mapping tables are the one place
-// that mismatch is bridged.
+// B02 planning ruling settled the two open questions this file used to
+// carry translation tables for: domain.TransitionState now uses the exact
+// same vocabulary as api/openapi.json's Transition.state enum
+// (in_progress/externally_completed/closed), and domain.DeploymentAction
+// now uses the exact same vocabulary as OpenAPI's
+// Deployment/DeploymentInput.action enum (including
+// certificate_installed). So the wire types below are aliases of the
+// domain types, not translated views -- there is nothing left to bridge.
 
 // TransitionModeInput mirrors domain.TransitionMode 1:1 on the wire (both
 // use normal/emergency), so no translation table is needed for mode.
@@ -84,9 +78,10 @@ func (c TransitionSetTargetCommand) Validate() error {
 	return nil
 }
 
-// DeploymentActionInput mirrors the OpenAPI DeploymentInput/Deployment
-// action enum, which spells the certificate-installed case differently from
-// domain.DeploymentAction (see the file-level NOTE above).
+// DeploymentActionInput mirrors domain.DeploymentAction 1:1 on the wire
+// (B02 ruling: both now spell the manual-install case
+// "certificate_installed"), so no translation table is needed, matching
+// TransitionModeInput's pattern above.
 type DeploymentActionInput string
 
 const (
@@ -95,31 +90,19 @@ const (
 	DeploymentActionInputTrustRemoved         DeploymentActionInput = "trust_removed"
 )
 
-var deploymentActionToDomain = map[DeploymentActionInput]domain.DeploymentAction{
-	DeploymentActionInputTrustAdded:           domain.DeploymentActionTrustAdded,
-	DeploymentActionInputCertificateInstalled: domain.DeploymentActionCertReplaced,
-	DeploymentActionInputTrustRemoved:         domain.DeploymentActionTrustRemoved,
-}
-
-var domainToDeploymentAction = func() map[domain.DeploymentAction]DeploymentActionInput {
-	out := make(map[domain.DeploymentAction]DeploymentActionInput, len(deploymentActionToDomain))
-	for wire, d := range deploymentActionToDomain {
-		out[d] = wire
-	}
-	return out
-}()
-
 func (a DeploymentActionInput) Domain() (domain.DeploymentAction, error) {
-	action, ok := deploymentActionToDomain[a]
-	if !ok {
-		return "", fmt.Errorf("%w: unsupported deployment action %q", domain.ErrInvalidValue, string(a))
+	action := domain.DeploymentAction(a)
+	if err := action.Validate(); err != nil {
+		return "", err
 	}
 	return action, nil
 }
 
-// DeploymentActionView renders a domain action back to its wire form.
+// DeploymentActionView renders a domain action back to its wire form. Since
+// the two vocabularies are identical (B02 ruling), this is a plain cast, not
+// a lookup.
 func DeploymentActionView(a domain.DeploymentAction) string {
-	return string(domainToDeploymentAction[a])
+	return string(a)
 }
 
 const maxTargetLabelLength = 255
@@ -164,7 +147,8 @@ func (c TransitionCompleteCommand) Validate() error {
 	return nil
 }
 
-// TransitionStateView mirrors OpenAPI's Transition.state enum.
+// TransitionStateView mirrors OpenAPI's Transition.state enum, which is now
+// identical to domain.TransitionState (B02 ruling on Decision 1).
 type TransitionStateView string
 
 const (
@@ -173,15 +157,17 @@ const (
 	TransitionStateViewClosed              TransitionStateView = "closed"
 )
 
+// TransitionStateViewOf renders a domain state to its wire form. Since the
+// two vocabularies are identical (B02 ruling), this is a plain cast.
+func TransitionStateViewOf(s domain.TransitionState) TransitionStateView {
+	return TransitionStateView(s)
+}
+
 // DeploymentView is the OpenAPI Deployment data object. Action is the wire
-// enum type (DeploymentActionInput), not domain.DeploymentAction: this file's
-// header NOTE says views expose the OpenAPI wire values directly, and
-// Deployment.action's wire spelling differs from the domain enum (e.g.
-// "certificate_installed" vs domain.DeploymentActionCertReplaced's
-// "cert_key_replaced"), so a domain-typed field here would let an adapter
-// emit a value api/openapi.json's enum rejects. Build it with
-// NewDeploymentActionView so the mapping stays the single deliberate
-// translation point.
+// enum type (DeploymentActionInput) rather than domain.DeploymentAction
+// purely to keep the wire-shaped views consistent with the input side; the
+// two vocabularies hold identical values (B02 ruling), so
+// NewDeploymentActionView is a plain cast, not a translation.
 type DeploymentView struct {
 	ID            string // deployment_confirmations has no dedicated typed ID in domain
 	TargetLabel   string
