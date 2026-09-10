@@ -26,22 +26,31 @@ func TestAuthorizationScope_EmptyIsNil(t *testing.T) {
 	}
 }
 
-func TestEncodedBundle_CloseZeroesData(t *testing.T) {
-	bundle := EncodedBundle{Data: []byte{1, 2, 3, 4}, ContentType: "application/x-pem-file"}
+// These four tests previously constructed EncodedBundle with a public Data
+// []byte field directly. S1 replaced that field with a private secret.Input
+// (see NewEncodedBundle/Use/Close in services.go); the tests below check the
+// exact same behaviors -- Close zeroes and drops the plaintext, Close is
+// idempotent, Close is safe on a zero value/nil receiver, and the original
+// backing array is actually overwritten -- through the new API instead of a
+// now-removed field. See secret_serialization_test.go for the additional
+// no-plaintext-leak coverage S1 requires.
+
+func TestEncodedBundle_CloseClosesThePayload(t *testing.T) {
+	bundle := NewEncodedBundle([]byte{1, 2, 3, 4}, "application/x-pem-file")
 	bundle.Close()
 
-	if bundle.Data != nil {
-		t.Fatalf("Close must drop the reference, got %v", bundle.Data)
+	if err := bundle.Use(func([]byte) error { return nil }); err == nil {
+		t.Fatalf("Use after Close must fail")
 	}
 }
 
 func TestEncodedBundle_CloseIsIdempotent(t *testing.T) {
-	bundle := EncodedBundle{Data: []byte{1, 2, 3, 4}}
+	bundle := NewEncodedBundle([]byte{1, 2, 3, 4}, "")
 	bundle.Close()
-	bundle.Close() // must not panic on an already-zeroed/nil Data
+	bundle.Close() // must not panic on an already-closed bundle
 
-	if bundle.Data != nil {
-		t.Fatalf("Data must stay nil after a second Close, got %v", bundle.Data)
+	if err := bundle.Use(func([]byte) error { return nil }); err == nil {
+		t.Fatalf("Use after a double Close must still fail")
 	}
 }
 
@@ -51,11 +60,15 @@ func TestEncodedBundle_CloseOnZeroValue(t *testing.T) {
 
 	var nilBundle *EncodedBundle
 	nilBundle.Close() // must not panic on a nil receiver
+
+	if err := bundle.Use(func([]byte) error { return nil }); err == nil {
+		t.Fatalf("Use on a zero-value bundle must fail, not run the callback")
+	}
 }
 
 func TestEncodedBundle_CloseActuallyOverwritesBytes(t *testing.T) {
 	data := []byte{0xAA, 0xBB, 0xCC, 0xDD}
-	bundle := EncodedBundle{Data: data}
+	bundle := NewEncodedBundle(data, "")
 	bundle.Close()
 
 	// The original backing array (still reachable via the pre-Close local
