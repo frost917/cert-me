@@ -590,35 +590,61 @@ type ChainValidator interface {
 	Validate(ctx context.Context, leafDER []byte, chainDER [][]byte, now domain.Instant) error
 }
 
-// S2 fix: PreparedTLSConfig used to be a marker interface with an unexported
-// method (sealedPreparedTLSConfig), which meant nothing outside this package
-// -- including the real B05 TLS installer in adapter/tls -- could ever
-// construct a value satisfying it. There was also no constructor inside
-// port itself, so no concrete "prepared" value existed anywhere. The type
-// was unimplementable by the very adapter docs/backend-implementation.md §9
-// requires to implement TLSInstaller.
+// S2 fix (round 1): PreparedTLSConfig used to be a marker interface with an
+// unexported method (sealedPreparedTLSConfig), which meant nothing outside
+// this package -- including the real B05 TLS installer in adapter/tls --
+// could ever construct a value satisfying it. There was also no constructor
+// inside port itself, so no concrete "prepared" value existed anywhere. The
+// type was unimplementable by the very adapter
+// docs/backend-implementation.md §9 requires to implement TLSInstaller.
 //
-// The guarantee that actually matters is not "no one outside package port
-// can name the type" (unimplementable achieves that only by accident,
-// alongside making it useless); it is "Apply only accepts a handle that was
-// really built by calling Prepare, not one app code fabricated by hand"
-// (docs/backend-implementation.md §9 "준비한 후보를 TLSInstaller.Prepare에
-// 넣어 실제 적용 가능한 메모리 설정을 먼저 만든다"). That is what this
-// replacement enforces, and it is enforced by Apply's own logic, not by
-// Go's type system: PreparedTLSConfig is now a concrete struct anyone can
-// construct via NewPreparedTLSConfig, but it carries the TLSPrepareToken it
-// was stamped with, and a real Apply implementation calls
-// token.Verify(prepared) before trusting it -- so a hand-built or
-// foreign-installer handle is rejected at that check, not by a compile-time
-// wall. See TestPreparedTLSConfig_ApplyRejectsAForeignHandle and
-// TestPreparedTLSConfig_ApplyRejectsAZeroValueHandle in the external
-// port_test package for the enforced behavior; a TLSInstaller
-// implementation that skips the Verify call does not get this guarantee for
-// free.
+// Round 1 replaced the marker interface with a concrete struct carrying an
+// installer-minted TLSPrepareToken plus a public `Payload any` field, and
+// Apply called token.Verify(prepared) before trusting a handle. That closed
+// constructibility and rejected foreign/hand-built handles, but left a
+// second hole open (P2 on this PR): Verify only checks *which installer*
+// minted the handle, never *what configuration* it carries. Payload being a
+// public field meant any caller holding a legitimately Prepared handle
+// could overwrite it with an unvalidated value between Prepare and Apply,
+// and token.Verify(prepared) still reported true -- so Apply would install a
+// configuration that was never run through Prepare's validation, defeating
+// the property docs/backend-implementation.md §9 depends on ("준비한 후보를
+// TLSInstaller.Prepare에 넣어 실제 적용 가능한 메모리 설정을 먼저 만든다").
+// A getter exposing a mutable concrete config (e.g. *tls.Config) would have
+// reopened the identical hole one level down, since the caller could mutate
+// whatever the getter's pointer points at.
+//
+// Round 2 (this fix) removes the payload from PreparedTLSConfig entirely.
+// The handle now carries only the installer's token (who minted it) and an
+// opaque per-Prepare-call identity (which specific Prepare call minted it).
+// The actual configuration never leaves the TLSInstaller implementation
+// that built it: a real Prepare stores the config in a private registry
+// keyed by the handle's identity (see ID below) and a real Apply looks the
+// config up from that same private registry after Verify succeeds. Because
+// port itself never stores or exposes the payload, there is no field or
+// getter anywhere in this package for an outside caller to overwrite or
+// mutate -- the substitution the reviewer reproduced is a compile error
+// now, not a runtime check. See TestPreparedTLSConfig_ApplyRejectsAForeignHandle,
+// TestPreparedTLSConfig_ApplyRejectsAZeroValueHandle and
+// TestPreparedTLSConfig_PayloadCannotBeSubstitutedExternally in the
+// external port_test package. A TLSInstaller implementation that skips the
+// Verify call, or that hands its config out through some other exported
+// getter of its own, does not get this guarantee for free -- port can only
+// enforce what travels through PreparedTLSConfig itself.
 type PreparedTLSConfig struct {
-	token   TLSPrepareToken
-	Payload any
+	token  TLSPrepareToken
+	handle *byte
 }
+
+// ID returns an opaque, comparable identity for this specific Prepare call,
+// suitable as a map key in the installer's own handle -> config registry
+// (see PreparedTLSConfig's doc comment for why the registry lives in the
+// installer, not here). Two handles from different Prepare calls -- even by
+// the same installer, even for the same candidate -- never compare equal,
+// because each wraps its own freshly allocated byte. The zero value's ID is
+// nil, matching no registry entry an installer would ever create with
+// NewPreparedTLSConfig.
+func (p PreparedTLSConfig) ID() any { return p.handle }
 
 // TLSPrepareToken is an opaque, comparable identity a TLSInstaller
 // implementation mints once -- typically in its own constructor -- and
@@ -638,18 +664,22 @@ type TLSPrepareToken struct{ id *byte }
 // compare equal and defeat Verify entirely.
 func NewTLSPrepareToken() TLSPrepareToken { return TLSPrepareToken{id: new(byte)} }
 
-// NewPreparedTLSConfig builds a handle stamped with token and carrying
-// payload -- the installer's own real in-memory config. Call it only from
-// inside the Prepare that just finished validating and building payload;
-// TLSInstaller.Prepare's doc comment says as much.
-func NewPreparedTLSConfig(token TLSPrepareToken, payload any) PreparedTLSConfig {
-	return PreparedTLSConfig{token: token, Payload: payload}
+// NewPreparedTLSConfig mints a handle stamped with token, identifying one
+// specific Prepare call. Call it only from inside the Prepare that just
+// finished validating candidate/key and building the real in-memory config;
+// TLSInstaller.Prepare's doc comment says as much. The caller must record
+// its own config against the returned handle's ID() in a private registry
+// before returning the handle, since the handle itself carries no payload
+// (see PreparedTLSConfig's doc comment for why).
+func NewPreparedTLSConfig(token TLSPrepareToken) PreparedTLSConfig {
+	return PreparedTLSConfig{token: token, handle: new(byte)}
 }
 
 // Verify reports whether prepared was stamped with this exact token. A
 // TLSInstaller's Apply must call this on its own token before trusting
-// prepared; a zero-value PreparedTLSConfig (never passed through
-// NewPreparedTLSConfig) always fails Verify, since its token has a nil id.
+// prepared -- i.e. before looking prepared.ID() up in its own registry; a
+// zero-value PreparedTLSConfig (never passed through NewPreparedTLSConfig)
+// always fails Verify, since its token has a nil id.
 func (t TLSPrepareToken) Verify(prepared PreparedTLSConfig) bool {
 	return t.id != nil && prepared.token.id == t.id
 }
@@ -665,16 +695,24 @@ type TLSInstaller interface {
 	// any plaintext it touched. It does not change the live listener. The
 	// returned PreparedTLSConfig must be built with NewPreparedTLSConfig
 	// using a TLSPrepareToken this same implementation holds, so its own
-	// Apply can Verify it later.
+	// Apply can Verify it later. Because PreparedTLSConfig carries no
+	// payload (see its doc comment), the implementation must record the
+	// config it just built in its own private registry, keyed by the
+	// returned handle's ID(), before returning -- otherwise its own Apply
+	// has nothing to look up.
 	Prepare(ctx context.Context, candidate domain.TLSVersion, key domain.EncryptedSecret) (PreparedTLSConfig, error)
 
 	// Apply swaps the live listener onto a previously prepared
 	// configuration. It must call its TLSPrepareToken.Verify(prepared)
 	// before trusting prepared, rejecting a handle that was never built by
 	// this installer's own Prepare -- app code must never be able to
-	// fabricate one and have it accepted. A failure here must leave the
-	// previously active configuration serving traffic unchanged
-	// (docs/backend-implementation.md §9 "Apply 실패는 DB/메모리 모두
-	// 원복한다").
+	// fabricate one and have it accepted. Once Verify succeeds, it must
+	// look the real configuration up from its own private registry by
+	// prepared.ID(); nothing reachable from prepared itself can have been
+	// substituted after Prepare returned it, so the config that gets
+	// applied is always the one this installer's own Prepare built and
+	// validated. A failure here must leave the previously active
+	// configuration serving traffic unchanged (docs/backend-implementation.md
+	// §9 "Apply 실패는 DB/메모리 모두 원복한다").
 	Apply(ctx context.Context, prepared PreparedTLSConfig) error
 }
