@@ -197,6 +197,11 @@ func (a Account) BeginReset() (AccountResetOutcome, error) {
 	next := a
 	next.state = AccountStateResetPending
 	next.authEpoch = a.authEpoch.Next()
+	// The account row changes, so the optimistic lock must move with it.
+	// auth_epoch invalidating credentials and version detecting a concurrent
+	// write are separate concerns, and SaveAccount(account, expectedVersion)
+	// needs the latter to reject a stale writer.
+	next.version = a.version.Next()
 	return AccountResetOutcome{Account: next, SessionsInvalidated: true}, nil
 }
 
@@ -219,6 +224,7 @@ func (a Account) CompleteReset(hash PasswordHash) (AccountResetOutcome, error) {
 	next.state = AccountStateActive
 	next.passwordHash = hash
 	next.authEpoch = a.authEpoch.Next()
+	next.version = a.version.Next()
 	return AccountResetOutcome{Account: next, SessionsInvalidated: true}, nil
 }
 

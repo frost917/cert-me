@@ -23,13 +23,18 @@ const (
 	RevocationReasonSuperseded           RevocationReason = "superseded"
 	RevocationReasonCessationOfOperation RevocationReason = "cessation_of_operation"
 	RevocationReasonPrivilegeWithdrawn   RevocationReason = "privilege_withdrawn"
+	// RevocationReasonAACompromise is RFC 5280 aACompromise. It is in the
+	// OpenAPI reason enum and the initial SQL reason CHECK, so a revoke
+	// request or an imported CRL entry using it must be representable here.
+	RevocationReasonAACompromise RevocationReason = "aa_compromise"
 )
 
 func (r RevocationReason) Validate() error {
 	switch r {
 	case RevocationReasonUnspecified, RevocationReasonKeyCompromise, RevocationReasonCACompromise,
 		RevocationReasonAffiliationChanged, RevocationReasonSuperseded,
-		RevocationReasonCessationOfOperation, RevocationReasonPrivilegeWithdrawn:
+		RevocationReasonCessationOfOperation, RevocationReasonPrivilegeWithdrawn,
+		RevocationReasonAACompromise:
 		return nil
 	default:
 		return fmt.Errorf("%w: unsupported revocation reason %q", ErrInvalidValue, string(r))

@@ -594,3 +594,45 @@ func requirePolicyError(t *testing.T, err error, base error, code string) {
 		t.Fatalf("policy error code = %q, want %q", pe.Code, code)
 	}
 }
+
+// TestIdentityResetTransitionsBumpVersion checks that both reset transitions
+// move the optimistic lock. SaveAccount(account, expectedVersion) relies on it,
+// so leaving version unchanged would let a stale writer's expected version stay
+// valid after the account row changed. Bumping auth_epoch is a separate
+// concern: it invalidates credentials, it does not detect a concurrent write.
+func TestIdentityResetTransitionsBumpVersion(t *testing.T) {
+	account := newTestAccount(t, AccountStateActive, AuthEpoch(3))
+	start := account.Version()
+
+	begun, err := account.BeginReset()
+	if err != nil {
+		t.Fatalf("BeginReset: %v", err)
+	}
+	if got, want := begun.Account.Version(), start.Next(); got != want {
+		t.Errorf("BeginReset version = %d, want %d", got.Int64(), want.Int64())
+	}
+	if account.Version() != start {
+		t.Errorf("BeginReset mutated the receiver's version to %d", account.Version().Int64())
+	}
+
+	completed, err := begun.Account.CompleteReset(mustPasswordHash(t, "$argon2id$v=19$m=65536,t=3,p=4$bmV3c2FsdA$bmV3aGFzaA"))
+	if err != nil {
+		t.Fatalf("CompleteReset: %v", err)
+	}
+	if got, want := completed.Account.Version(), begun.Account.Version().Next(); got != want {
+		t.Errorf("CompleteReset version = %d, want %d", got.Int64(), want.Int64())
+	}
+	// Across both transitions the version must advance twice, not stay put.
+	if completed.Account.Version() == start {
+		t.Errorf("version unchanged across both resets: %d", start.Int64())
+	}
+
+	// Reissuing a link from reset_pending is also a change to the row.
+	reissued, err := begun.Account.BeginReset()
+	if err != nil {
+		t.Fatalf("BeginReset from reset_pending: %v", err)
+	}
+	if got, want := reissued.Account.Version(), begun.Account.Version().Next(); got != want {
+		t.Errorf("reissue version = %d, want %d", got.Int64(), want.Int64())
+	}
+}

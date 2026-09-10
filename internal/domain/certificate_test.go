@@ -395,3 +395,30 @@ func TestIssuanceIntent_UnknownIsRejected(t *testing.T) {
 		t.Fatalf("CanIssue with an unknown intent = %v, want ErrInvalidValue", err)
 	}
 }
+
+// TestNewSAN_RejectsIPv6ZoneIdentifier keeps a scoped address out of an IP
+// SAN. netip.ParseAddr accepts fe80::1%eth0, but a zone is a local interface
+// identifier that an iPAddress SAN cannot represent.
+func TestNewSAN_RejectsIPv6ZoneIdentifier(t *testing.T) {
+	for _, value := range []string{"fe80::1%eth0", "fe80::1%1", "ff02::1%en0"} {
+		if san, err := NewSAN(SANTypeIP, value); !errors.Is(err, ErrInvalidValue) {
+			t.Errorf("NewSAN(ip, %q) = (%q, %v), want ErrInvalidValue", value, san.Value(), err)
+		}
+	}
+
+	// Unscoped addresses stay valid and are normalised.
+	for _, tc := range []struct{ in, want string }{
+		{"192.0.2.10", "192.0.2.10"},
+		{"fe80::1", "fe80::1"},
+		{"2001:0db8:0000:0000:0000:0000:0000:0001", "2001:db8::1"},
+	} {
+		san, err := NewSAN(SANTypeIP, tc.in)
+		if err != nil {
+			t.Errorf("NewSAN(ip, %q) = %v, want nil", tc.in, err)
+			continue
+		}
+		if san.Value() != tc.want {
+			t.Errorf("NewSAN(ip, %q) normalised to %q, want %q", tc.in, san.Value(), tc.want)
+		}
+	}
+}

@@ -197,6 +197,13 @@ func normalizeIPSANValue(v string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("%w: ip san must be a valid ipv4 or ipv6 address", ErrInvalidValue)
 	}
+	// ParseAddr also accepts a scoped address such as fe80::1%eth0, but a
+	// zone is a local interface identifier with no representation in the
+	// address bytes of an iPAddress SAN. Rejecting it here keeps the zone from
+	// failing a later conversion or being dropped silently.
+	if addr.Zone() != "" {
+		return "", fmt.Errorf("%w: ip san must not carry an ipv6 zone identifier", ErrInvalidValue)
+	}
 	return addr.String(), nil
 }
 

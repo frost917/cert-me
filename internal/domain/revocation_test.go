@@ -285,3 +285,60 @@ func TestCRLState_BumpRevocationGeneration(t *testing.T) {
 		t.Fatalf("expected generation to increase by 1")
 	}
 }
+
+// TestRevocationReason_CoversContractValues pins the domain reason set to the
+// OpenAPI reason enum and the SQL reason CHECK. The wire form is camelCase and
+// the domain form is snake_case; the mapping must be total in both directions
+// so that no contract reason is unrepresentable.
+func TestRevocationReason_CoversContractValues(t *testing.T) {
+	// Left: the value used by OpenAPI and the stored SQL CHECK.
+	wireToDomain := map[string]RevocationReason{
+		"unspecified":          RevocationReasonUnspecified,
+		"keyCompromise":        RevocationReasonKeyCompromise,
+		"caCompromise":         RevocationReasonCACompromise,
+		"affiliationChanged":   RevocationReasonAffiliationChanged,
+		"superseded":           RevocationReasonSuperseded,
+		"cessationOfOperation": RevocationReasonCessationOfOperation,
+		"privilegeWithdrawn":   RevocationReasonPrivilegeWithdrawn,
+		"aACompromise":         RevocationReasonAACompromise,
+	}
+
+	seen := make(map[RevocationReason]string, len(wireToDomain))
+	for wire, reason := range wireToDomain {
+		if err := reason.Validate(); err != nil {
+			t.Errorf("contract reason %q maps to %q, which Validate rejects: %v", wire, reason, err)
+		}
+		if prior, dup := seen[reason]; dup {
+			t.Errorf("reasons %q and %q both map to %q", prior, wire, reason)
+		}
+		seen[reason] = wire
+	}
+
+	// Every domain constant must correspond to a contract value, so a reason
+	// cannot be added here without a wire representation.
+	allDomain := []RevocationReason{
+		RevocationReasonUnspecified,
+		RevocationReasonKeyCompromise,
+		RevocationReasonCACompromise,
+		RevocationReasonAffiliationChanged,
+		RevocationReasonSuperseded,
+		RevocationReasonCessationOfOperation,
+		RevocationReasonPrivilegeWithdrawn,
+		RevocationReasonAACompromise,
+	}
+	for _, reason := range allDomain {
+		if _, ok := seen[reason]; !ok {
+			t.Errorf("domain reason %q has no contract value", reason)
+		}
+	}
+	if len(allDomain) != len(wireToDomain) {
+		t.Errorf("domain has %d reasons, contract has %d", len(allDomain), len(wireToDomain))
+	}
+
+	// A reason outside the contract is still rejected.
+	for _, bogus := range []RevocationReason{"removeFromCRL", "remove_from_crl", "aACompromise", ""} {
+		if err := RevocationReason(bogus).Validate(); err == nil {
+			t.Errorf("Validate(%q) = nil, want an error", bogus)
+		}
+	}
+}
