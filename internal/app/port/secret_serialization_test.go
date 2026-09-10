@@ -12,12 +12,12 @@ import (
 )
 
 // S1 (docs/backend-implementation.md B02 acceptance: "비밀 JSON/로그 차단"):
-// EncodedBundle.Data and ImportBundleInput.PrivateKeyDER are plaintext
-// private-key material sitting behind public []byte fields, so
-// json.Marshal, fmt and slog could all leak the raw key. These tests are
-// written against the fixed, non-leaking shape both types must have; they
-// fail against the current public-[]byte shape and must pass once each type
-// carries its plaintext the way secret.Input already does.
+// EncodedBundle.Data was once a plaintext private-key bundle sitting behind
+// a public []byte field, so json.Marshal, fmt and slog could all leak the
+// raw key. CAKeyInput.Passphrase carries the same discipline: the
+// passphrase, unlike the key ciphertext bytes it decrypts, is a secret the
+// struct must never leak through Marshal/fmt/slog even while the
+// surrounding CAKeyInput value is otherwise ordinary and printable.
 
 const plaintextMarker = "TOTALLY-SECRET-PRIVATE-KEY-BYTES"
 
@@ -76,17 +76,17 @@ func TestEncodedBundle_UseGrantsAccessThenCloseZeroes(t *testing.T) {
 	}
 }
 
-func TestImportBundleInput_PrivateKeyIsASecretInput(t *testing.T) {
-	key := secret.New([]byte(plaintextMarker))
-	defer key.Close()
+func TestCAKeyInput_PassphraseIsASecretInput(t *testing.T) {
+	passphrase := secret.New([]byte(plaintextMarker))
+	defer passphrase.Close()
 
-	input := ImportBundleInput{PrivateKey: key}
+	input := CAKeyInput{Data: []byte("not-the-secret"), Passphrase: passphrase}
 
 	if _, err := json.Marshal(input); err == nil {
-		t.Fatalf("json.Marshal(ImportBundleInput) must fail while PrivateKey is set")
+		t.Fatalf("json.Marshal(CAKeyInput) must fail while Passphrase is set")
 	}
-	s := fmt.Sprintf("%v %s %#v", input, input, input)
+	s := fmt.Sprintf("%v %#v", input, input)
 	if strings.Contains(s, plaintextMarker) {
-		t.Fatalf("formatted ImportBundleInput leaked plaintext: %q", s)
+		t.Fatalf("formatted CAKeyInput leaked plaintext: %q", s)
 	}
 }
