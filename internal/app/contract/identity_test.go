@@ -69,6 +69,21 @@ func TestIdentityLoginCommand_SecretBlockedFromJSONAndLog(t *testing.T) {
 // TestIdentityBeginResetCommand_Validate_RejectsMalformedID is the B02
 // "잘못된 ID... 거부" criterion for the one command in this file that carries
 // a target id.
+// TestIdentityLoginCommand_Validate_CountsCharactersNotBytes is F3, applied
+// to the login path: a 5-character Korean password is 15 bytes, which must
+// still fail the 12-character minLength.
+func TestIdentityLoginCommand_Validate_CountsCharactersNotBytes(t *testing.T) {
+	pw := secret.FromString("안녕하세요")
+	defer pw.Close()
+	if pw.Len() < 12 {
+		t.Fatalf("test fixture assumption broken: byte length must be >= 12, got %d", pw.Len())
+	}
+	cmd := IdentityLoginCommand{LoginName: "admin", Password: pw}
+	if err := cmd.Validate(); err == nil {
+		t.Fatal("expected a 5-character password to be rejected even though it is 15 bytes")
+	}
+}
+
 func TestIdentityBeginResetCommand_Validate_RejectsMalformedID(t *testing.T) {
 	cases := []string{"", "not-a-uuid", "00000000-0000-0000-0000-00000000000", "00000000-0000-0000-0000-0000000000zz"}
 	for _, raw := range cases {
@@ -110,6 +125,22 @@ func TestIdentityCompleteResetCommand_Validate_RejectsMissingRequired(t *testing
 				t.Fatal("expected validation error")
 			}
 		})
+	}
+}
+
+// TestIdentityCompleteResetCommand_Validate_CountsCharactersNotBytes is F3
+// applied to the reset path's new_password field.
+func TestIdentityCompleteResetCommand_Validate_CountsCharactersNotBytes(t *testing.T) {
+	validToken := secret.FromString("a-valid-reset-token-of-sufficient-length")
+	defer validToken.Close()
+	pw := secret.FromString("안녕하세요")
+	defer pw.Close()
+	if pw.Len() < 12 {
+		t.Fatalf("test fixture assumption broken: byte length must be >= 12, got %d", pw.Len())
+	}
+	cmd := IdentityCompleteResetCommand{ResetToken: validToken, NewPassword: pw}
+	if err := cmd.Validate(); err == nil {
+		t.Fatal("expected a 5-character new_password to be rejected even though it is 15 bytes")
 	}
 }
 

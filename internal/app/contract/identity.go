@@ -74,17 +74,23 @@ type IdentityLoginCommand struct {
 // type per the naming convention (one command type per service method).
 func (c IdentityLoginCommand) Validate() error {
 	if len(c.LoginName) < loginNameMinLength || len(c.LoginName) > loginNameMaxLength {
-		return NewAppError(ErrorKindValidation, "invalid_login_name", "login_name must be 3..64 characters")
+		return NewAppError(ErrorKindValidation, "invalid_login_name", "login_name must be 3..64 characters").WithField("login_name", c.LoginName)
 	}
 	for i := 0; i < len(c.LoginName); i++ {
 		if !isLoginNameChar(c.LoginName[i]) {
-			return NewAppError(ErrorKindValidation, "invalid_login_name", "login_name must match [A-Za-z0-9._-]")
+			return NewAppError(ErrorKindValidation, "invalid_login_name", "login_name must match [A-Za-z0-9._-]").WithField("login_name", c.LoginName)
 		}
 	}
 	if c.Password == nil {
 		return NewAppError(ErrorKindValidation, "invalid_password", "password is required")
 	}
-	if n := c.Password.Len(); n < 12 || n > 128 {
+	// Character count, not byte count: see secretCharacterLen's doc comment
+	// in setup.go (F3 -- OpenAPI minLength/maxLength counts characters).
+	n, err := secretCharacterLen(c.Password)
+	if err != nil {
+		return WrapAppError(ErrorKindValidation, "invalid_password", "password could not be read", err)
+	}
+	if n < passwordMinLength || n > passwordMaxLength {
 		return NewAppError(ErrorKindValidation, "invalid_password", "password must be 12..128 characters")
 	}
 	return nil
@@ -110,6 +116,11 @@ func (c IdentityAuthenticateCommand) Validate() error {
 	if c.SessionToken == nil {
 		return NewAppError(ErrorKindAuth, "session_token_required", "a session token is required")
 	}
+	// SessionToken is a bearer cookie value, not a JSON string property on
+	// any OpenAPI schema (it never crosses the wire as a body field), so its
+	// length bound is intentionally left as a byte count rather than
+	// switched to secretCharacterLen along with the three JSON-schema
+	// secrets F3 covers.
 	if n := c.SessionToken.Len(); n < tokenMinLength || n > tokenMaxLength {
 		return NewAppError(ErrorKindAuth, "invalid_session_token", "session token has an invalid length")
 	}
@@ -128,7 +139,7 @@ type IdentityBeginResetCommand struct {
 // even from a trusted local path.
 func (c IdentityBeginResetCommand) Validate() error {
 	if _, err := domain.ParseAccountID(string(c.AccountID)); err != nil {
-		return NewAppError(ErrorKindValidation, "invalid_account_id", "account_id must be a uuid")
+		return WrapAppError(ErrorKindValidation, "invalid_account_id", "account_id must be a uuid", err)
 	}
 	return nil
 }
@@ -149,13 +160,23 @@ func (c IdentityCompleteResetCommand) Validate() error {
 	if c.ResetToken == nil {
 		return NewAppError(ErrorKindValidation, "reset_token_required", "reset_token is required")
 	}
-	if n := c.ResetToken.Len(); n < tokenMinLength || n > tokenMaxLength {
+	// reset_token is a PasswordReset schema string property, so its
+	// minLength/maxLength counts characters too (F3).
+	tokenLen, err := secretCharacterLen(c.ResetToken)
+	if err != nil {
+		return WrapAppError(ErrorKindValidation, "invalid_reset_token", "reset_token could not be read", err)
+	}
+	if tokenLen < tokenMinLength || tokenLen > tokenMaxLength {
 		return NewAppError(ErrorKindValidation, "invalid_reset_token", "reset_token has an invalid length")
 	}
 	if c.NewPassword == nil {
 		return NewAppError(ErrorKindValidation, "new_password_required", "new_password is required")
 	}
-	if n := c.NewPassword.Len(); n < 12 || n > 128 {
+	passwordLen, err := secretCharacterLen(c.NewPassword)
+	if err != nil {
+		return WrapAppError(ErrorKindValidation, "invalid_new_password", "new_password could not be read", err)
+	}
+	if passwordLen < passwordMinLength || passwordLen > passwordMaxLength {
 		return NewAppError(ErrorKindValidation, "invalid_new_password", "new_password must be 12..128 characters")
 	}
 	return nil

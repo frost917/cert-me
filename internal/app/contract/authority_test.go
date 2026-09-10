@@ -112,11 +112,15 @@ func TestAuthoritySetIssuanceStateCommand_Validate(t *testing.T) {
 	}
 }
 
+// F2: KeyDestruction lists "justification" as required in the OpenAPI
+// document, so an empty justification must be rejected, not merely one that
+// is too long.
 func TestAuthorityDestroyKeyCommand_Validate_RejectsMissingRequired(t *testing.T) {
 	cases := map[string]AuthorityDestroyKeyCommand{
 		"missing key_generation_id":   {AuthorityID: domain.AuthorityID(fixtureUUID), Justification: "reason"},
 		"malformed authority id":      {AuthorityID: "bad", KeyGenerationID: domain.CAKeyGenerationID(fixtureUUID), Justification: "reason"},
 		"malformed key generation id": {AuthorityID: domain.AuthorityID(fixtureUUID), KeyGenerationID: "bad", Justification: "reason"},
+		"missing justification":       {AuthorityID: domain.AuthorityID(fixtureUUID), KeyGenerationID: domain.CAKeyGenerationID(fixtureUUID), Justification: ""},
 	}
 	for name, cmd := range cases {
 		t.Run(name, func(t *testing.T) {

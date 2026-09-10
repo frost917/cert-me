@@ -83,12 +83,19 @@ func (c SettingsUpdateCommand) Validate() error {
 			return NewAppError(ErrorKindValidation, "invalid_service_url", "service_url must be an https:// uri")
 		}
 	}
-	for _, v := range []*ValidityInput{c.LeafValidity, c.RootValidity, c.IntermediateValidity} {
-		if v == nil {
+	for _, f := range []struct {
+		name string
+		v    *ValidityInput
+	}{
+		{"leaf_validity", c.LeafValidity},
+		{"root_validity", c.RootValidity},
+		{"intermediate_validity", c.IntermediateValidity},
+	} {
+		if f.v == nil {
 			continue
 		}
-		if _, err := v.Domain(); err != nil {
-			return NewAppError(ErrorKindValidation, "invalid_validity", "validity must have a positive value and a supported unit")
+		if _, err := f.v.Domain(); err != nil {
+			return WrapAppError(ErrorKindValidation, "invalid_validity", "validity must have a positive value and a supported unit", err).WithField("field", f.name)
 		}
 	}
 	if c.RotateEvery != nil && (*c.RotateEvery < minRotateEverySetting || *c.RotateEvery > maxRotateEverySetting) {

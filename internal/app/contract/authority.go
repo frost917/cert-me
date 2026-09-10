@@ -46,13 +46,13 @@ type AuthorityCreateCommand struct {
 func (c AuthorityCreateCommand) DomainKind() (domain.AuthorityKind, error) {
 	kind := domain.AuthorityKind(c.Kind)
 	if err := kind.Validate(); err != nil {
-		return "", err
+		return "", WrapAppError(ErrorKindValidation, "invalid_kind", "kind is unsupported", err).WithField("kind", c.Kind)
 	}
 	// AuthorityCreate's own enum is root/intermediate only; bootstrap is a
 	// separate, internal-only authority kind that this public command must
 	// never be able to select.
 	if kind == domain.AuthorityKindBootstrap {
-		return "", NewAppError(ErrorKindValidation, "invalid_kind", "kind must be root or intermediate")
+		return "", NewAppError(ErrorKindValidation, "invalid_kind", "kind must be root or intermediate").WithField("kind", c.Kind)
 	}
 	return kind, nil
 }
@@ -65,7 +65,7 @@ func (c AuthorityCreateCommand) DomainKeyAlgorithm() (domain.KeyAlgorithm, error
 	}
 	alg := domain.KeyAlgorithm(c.KeyAlgorithm)
 	if err := alg.Validate(); err != nil {
-		return "", err
+		return "", WrapAppError(ErrorKindValidation, "invalid_key_algorithm", "key_algorithm is unsupported", err).WithField("key_algorithm", c.KeyAlgorithm)
 	}
 	return alg, nil
 }
@@ -83,30 +83,33 @@ const maxCreateAuthorityNameLength = 255
 func (c AuthorityCreateCommand) Validate() error {
 	kind, err := c.DomainKind()
 	if err != nil {
+		// DomainKind already returns a fully-formed AppError (cause and
+		// field attached); passing it through keeps both instead of
+		// discarding them behind a second, causeless NewAppError.
 		return err
 	}
 	if c.Name == "" || len(c.Name) > maxCreateAuthorityNameLength {
-		return NewAppError(ErrorKindValidation, "invalid_name", "name must be 1..255 characters")
+		return NewAppError(ErrorKindValidation, "invalid_name", "name must be 1..255 characters").WithField("name", c.Name)
 	}
 	switch kind {
 	case domain.AuthorityKindIntermediate:
 		if _, err := domain.ParseAuthorityID(string(c.ParentAuthorityID)); err != nil {
-			return NewAppError(ErrorKindValidation, "invalid_parent_authority_id", "intermediate authority requires a valid parent_authority_id")
+			return WrapAppError(ErrorKindValidation, "invalid_parent_authority_id", "intermediate authority requires a valid parent_authority_id", err).WithField("parent_authority_id", string(c.ParentAuthorityID))
 		}
 	case domain.AuthorityKindRoot:
 		if c.ParentAuthorityID != "" {
-			return NewAppError(ErrorKindValidation, "unexpected_parent_authority_id", "root authority must not have a parent_authority_id")
+			return NewAppError(ErrorKindValidation, "unexpected_parent_authority_id", "root authority must not have a parent_authority_id").WithField("parent_authority_id", string(c.ParentAuthorityID))
 		}
 	}
 	if _, err := c.DomainSubject(); err != nil {
-		return NewAppError(ErrorKindValidation, "invalid_subject", "subject is invalid")
+		return WrapAppError(ErrorKindValidation, "invalid_subject", "subject is invalid", err)
 	}
 	if _, err := c.DomainKeyAlgorithm(); err != nil {
-		return NewAppError(ErrorKindValidation, "invalid_key_algorithm", "key_algorithm is unsupported")
+		return err
 	}
 	if c.Validity != nil {
 		if _, err := c.Validity.Domain(); err != nil {
-			return NewAppError(ErrorKindValidation, "invalid_validity", "validity must have a positive value and a supported unit")
+			return WrapAppError(ErrorKindValidation, "invalid_validity", "validity must have a positive value and a supported unit", err)
 		}
 	}
 	return nil
@@ -124,10 +127,10 @@ type AuthorityRenameCommand struct {
 
 func (c AuthorityRenameCommand) Validate() error {
 	if _, err := domain.ParseAuthorityID(string(c.AuthorityID)); err != nil {
-		return NewAppError(ErrorKindValidation, "invalid_authority_id", "authority id must be a uuid")
+		return WrapAppError(ErrorKindValidation, "invalid_authority_id", "authority id must be a uuid", err)
 	}
 	if c.Name == "" || len(c.Name) > maxCreateAuthorityNameLength {
-		return NewAppError(ErrorKindValidation, "invalid_name", "name must be 1..255 characters")
+		return NewAppError(ErrorKindValidation, "invalid_name", "name must be 1..255 characters").WithField("name", c.Name)
 	}
 	return nil
 }
@@ -148,13 +151,13 @@ func (c AuthoritySetIssuanceStateCommand) DomainState() (domain.IssuanceState, e
 	case domain.IssuanceStateEnabled, domain.IssuanceStateStopped:
 		return state, nil
 	default:
-		return "", NewAppError(ErrorKindValidation, "invalid_state", "state must be enabled or stopped")
+		return "", NewAppError(ErrorKindValidation, "invalid_state", "state must be enabled or stopped").WithField("state", c.State)
 	}
 }
 
 func (c AuthoritySetIssuanceStateCommand) Validate() error {
 	if _, err := domain.ParseAuthorityID(string(c.AuthorityID)); err != nil {
-		return NewAppError(ErrorKindValidation, "invalid_authority_id", "authority id must be a uuid")
+		return WrapAppError(ErrorKindValidation, "invalid_authority_id", "authority id must be a uuid", err)
 	}
 	if _, err := c.DomainState(); err != nil {
 		return err
@@ -174,13 +177,15 @@ type AuthorityDestroyKeyCommand struct {
 
 func (c AuthorityDestroyKeyCommand) Validate() error {
 	if _, err := domain.ParseAuthorityID(string(c.AuthorityID)); err != nil {
-		return NewAppError(ErrorKindValidation, "invalid_authority_id", "authority id must be a uuid")
+		return WrapAppError(ErrorKindValidation, "invalid_authority_id", "authority id must be a uuid", err)
 	}
 	if _, err := domain.ParseCAKeyGenerationID(string(c.KeyGenerationID)); err != nil {
-		return NewAppError(ErrorKindValidation, "invalid_key_generation_id", "key_generation_id must be a uuid")
+		return WrapAppError(ErrorKindValidation, "invalid_key_generation_id", "key_generation_id must be a uuid", err).WithField("key_generation_id", string(c.KeyGenerationID))
 	}
-	if len(c.Justification) > maxJustificationLength {
-		return NewAppError(ErrorKindValidation, "invalid_justification", "justification must be at most 4096 characters")
+	// KeyDestruction lists justification as required, so an empty string
+	// (not just one over the max length) must be rejected.
+	if c.Justification == "" || len(c.Justification) > maxJustificationLength {
+		return NewAppError(ErrorKindValidation, "invalid_justification", "justification is required and must be at most 4096 characters").WithField("justification", c.Justification)
 	}
 	return nil
 }
@@ -194,7 +199,7 @@ type AuthorityArchiveCommand struct {
 
 func (c AuthorityArchiveCommand) Validate() error {
 	if _, err := domain.ParseAuthorityID(string(c.AuthorityID)); err != nil {
-		return NewAppError(ErrorKindValidation, "invalid_authority_id", "authority id must be a uuid")
+		return WrapAppError(ErrorKindValidation, "invalid_authority_id", "authority id must be a uuid", err)
 	}
 	return nil
 }

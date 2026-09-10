@@ -3,6 +3,7 @@ package contract
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"cert-me/internal/domain"
@@ -157,6 +158,52 @@ func TestIssuanceUpdateSeriesCommand_JSONCannotSetSeriesID(t *testing.T) {
 	if err := dec.Decode(&cmd); err == nil {
 		t.Fatal("expected decode to reject an attempt to set the path-derived series id")
 	}
+}
+
+// TestIssuanceIssueCommand_DomainRotateEvery_DoesNotDefault is F1: rotate_every
+// is an installation Setting (docs/architecture.md:152, admin-configurable,
+// factory default 3), not a per-request constant the contract layer may
+// supply. An omitted field must be reported as absent so IssuanceService can
+// resolve it from current Settings at issuance time
+// (docs/api-contract.md:105), instead of the contract layer silently baking in
+// 3 regardless of what an admin configured.
+func TestIssuanceIssueCommand_DomainRotateEvery_DoesNotDefault(t *testing.T) {
+	cmd := validIssueCommand()
+	cmd.RotateEvery = nil
+	value, present := cmd.DomainRotateEvery()
+	if present {
+		t.Fatalf("expected rotate_every to be reported absent when omitted, got present with value %d", value)
+	}
+
+	ten := 10
+	cmd.RotateEvery = &ten
+	value, present = cmd.DomainRotateEvery()
+	if !present || value != 10 {
+		t.Fatalf("expected the explicit rotate_every=10 to be reported present, got present=%v value=%d", present, value)
+	}
+}
+
+// TestIssuanceIssueCommand_Validate_ErrorHasCause is F4: Validate must not
+// discard the underlying domain error. errors.Is has to keep reaching the
+// domain sentinel through the AppError chain, while AppError.Error() must
+// still never render the cause text.
+func TestIssuanceIssueCommand_Validate_ErrorHasCause(t *testing.T) {
+	cmd := validIssueCommand()
+	cmd.AuthorityID = "not-a-uuid"
+	err := cmd.Validate()
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	if !errors.Is(err, domain.ErrInvalidValue) {
+		t.Fatalf("expected errors.Is to reach domain.ErrInvalidValue through the AppError chain, got: %v", err)
+	}
+	if want := "36 character uuid"; bytesContainsString(err.Error(), want) {
+		t.Fatalf("AppError.Error() must never render the internal cause text, got: %s", err.Error())
+	}
+}
+
+func bytesContainsString(s, substr string) bool {
+	return bytes.Contains([]byte(s), []byte(substr))
 }
 
 func TestIssuanceArchiveSeriesCommand_Validate(t *testing.T) {

@@ -39,6 +39,22 @@ func TestSetupCreateAdminCommand_Validate_RejectsShortPassword(t *testing.T) {
 	}
 }
 
+// TestSetupCreateAdminCommand_Validate_CountsCharactersNotBytes is F3:
+// OpenAPI minLength/maxLength on a JSON string counts characters, not bytes.
+// "안녕하세요" is 5 Korean characters but 15 UTF-8 bytes, so a byte-counting
+// check wrongly accepts it as satisfying a 12-character minimum.
+func TestSetupCreateAdminCommand_Validate_CountsCharactersNotBytes(t *testing.T) {
+	pw := secret.FromString("안녕하세요") // 5 runes, 15 bytes
+	defer pw.Close()
+	if pw.Len() < 12 {
+		t.Fatalf("test fixture assumption broken: byte length must be >= 12, got %d", pw.Len())
+	}
+	cmd := SetupCreateAdminCommand{LoginName: "admin", Password: pw}
+	if err := cmd.Validate(); err == nil {
+		t.Fatal("expected a 5-character password to be rejected even though it is 15 bytes")
+	}
+}
+
 func TestSetupCreateAdminCommand_Validate_Accepts(t *testing.T) {
 	pw := secret.FromString("a-valid-password-12")
 	defer pw.Close()

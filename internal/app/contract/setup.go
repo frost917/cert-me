@@ -2,6 +2,7 @@ package contract
 
 import (
 	"fmt"
+	"unicode/utf8"
 
 	"cert-me/internal/domain"
 	"cert-me/internal/secret"
@@ -45,7 +46,43 @@ type AccountView struct {
 const (
 	loginNameMinLength = 3
 	loginNameMaxLength = 64
+
+	// passwordMinLength and passwordMaxLength are the Credentials/
+	// PasswordReset schemas' password minLength/maxLength. OpenAPI
+	// minLength/maxLength on a JSON string schema counts characters, so
+	// these bounds are checked with secretCharacterLen, never
+	// secret.Input.Len (bytes).
+	passwordMinLength = 12
+	passwordMaxLength = 128
 )
+
+// secretCharacterLen counts the UTF-8 characters (runes) held in a secret,
+// not its byte length. OpenAPI minLength/maxLength on a "type: string"
+// schema is defined over characters, not bytes: a 5-character Korean
+// password is 15 UTF-8 bytes, so counting bytes would let it satisfy a
+// 12-character minimum it does not actually meet. It rejects input that is
+// not valid UTF-8 rather than silently miscounting it.
+//
+// The count is produced entirely inside the Use callback and never copied
+// out or retained past it, per internal/secret/input.go's contract that the
+// callback must not retain the slice or hand it to another goroutine.
+func secretCharacterLen(in *secret.Input) (int, error) {
+	if in == nil {
+		return 0, secret.ErrClosed
+	}
+	var n int
+	err := in.Use(func(b []byte) error {
+		if !utf8.Valid(b) {
+			return fmt.Errorf("%w: secret is not valid utf-8", domain.ErrInvalidValue)
+		}
+		n = utf8.RuneCount(b)
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
 
 // SetupCreateAdminCommand is the JSON decode target for the OpenAPI
 // Credentials schema, used once while installation has no admin yet. The
@@ -70,21 +107,25 @@ func isLoginNameChar(c byte) bool {
 }
 
 // Validate enforces the Credentials schema's login_name pattern
-// (^[A-Za-z0-9._-]{3,64}$) and password length (12..128), matching the
-// OpenAPI required set exactly.
+// (^[A-Za-z0-9._-]{3,64}$) and password length (12..128 characters), matching
+// the OpenAPI required set exactly.
 func (c SetupCreateAdminCommand) Validate() error {
 	if len(c.LoginName) < loginNameMinLength || len(c.LoginName) > loginNameMaxLength {
-		return NewAppError(ErrorKindValidation, "invalid_login_name", "login_name must be 3..64 characters")
+		return NewAppError(ErrorKindValidation, "invalid_login_name", "login_name must be 3..64 characters").WithField("login_name", c.LoginName)
 	}
 	for i := 0; i < len(c.LoginName); i++ {
 		if !isLoginNameChar(c.LoginName[i]) {
-			return NewAppError(ErrorKindValidation, "invalid_login_name", "login_name must match [A-Za-z0-9._-]")
+			return NewAppError(ErrorKindValidation, "invalid_login_name", "login_name must match [A-Za-z0-9._-]").WithField("login_name", c.LoginName)
 		}
 	}
 	if c.Password == nil {
 		return NewAppError(ErrorKindValidation, "invalid_password", "password is required")
 	}
-	if n := c.Password.Len(); n < 12 || n > 128 {
+	n, err := secretCharacterLen(c.Password)
+	if err != nil {
+		return WrapAppError(ErrorKindValidation, "invalid_password", "password could not be read", err)
+	}
+	if n < passwordMinLength || n > passwordMaxLength {
 		return NewAppError(ErrorKindValidation, "invalid_password", "password must be 12..128 characters")
 	}
 	return nil
