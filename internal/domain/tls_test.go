@@ -148,6 +148,99 @@ func TestNewTLSVersion_ManagedRequiresCertificate(t *testing.T) {
 	}
 }
 
+// architecture.md: "부트스트랩은 임시 HTTPS 용도이며 실제 접속 DNS/IP를 수집하거나
+// 인증서에 반영하는 것을 초기 구동의 조건으로 요구하지 않는다." A bootstrap snapshot
+// must be constructible before any service URL has been configured.
+func TestNewTLSVersion_BootstrapAllowsEmptyServiceURL(t *testing.T) {
+	if _, err := NewTLSVersion(TLSVersionFacts{
+		ID: mkTLSVersionID(t, '1'), Source: TLSSourceBootstrap,
+		KeyMaterialID: mkKeyMaterialID(t), LeafDER: []byte{1, 2, 3},
+		ValidatedServiceURL: "", NotAfter: plus(t0(), 24*time.Hour),
+	}); err != nil {
+		t.Fatalf("expected bootstrap tls version without a service url to be accepted: %v", err)
+	}
+}
+
+// architecture.md: a bootstrap candidate has no real service address to
+// check, so validation must not be blocked on ServiceAddressMatches, and the
+// full prepare -> validate -> commit -> apply path must succeed for it.
+func TestTLSChange_BootstrapCandidateValidatesWithoutServiceAddress(t *testing.T) {
+	c, err := NewCandidateTLSChange("", mkTLSVersionID(t, '1'))
+	if err != nil {
+		t.Fatalf("new candidate: %v", err)
+	}
+
+	bootstrapFacts := passingFacts()
+	bootstrapFacts.CandidateSource = TLSSourceBootstrap
+	bootstrapFacts.ServiceAddressMatches = false
+
+	validated, err := c.ValidateCandidate(bootstrapFacts)
+	if err != nil {
+		t.Fatalf("expected bootstrap candidate without a service address to validate: %v", err)
+	}
+	if !validated.Validated() {
+		t.Fatalf("expected bootstrap candidate to be validated")
+	}
+
+	committed, err := validated.Commit(t0())
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	applied, err := committed.Apply(t0())
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !applied.IsActive() {
+		t.Fatalf("expected applied bootstrap change to be active")
+	}
+}
+
+// architecture.md: "운영 인증서 교체 후보에는 실제 서비스 주소 검증을 적용한다."
+// The bootstrap exception must not become a loophole for managed/external
+// candidates: planning.md requires rejecting HTTPS replacement candidates on
+// address mismatch and keeping the existing certificate.
+func TestTLSChange_ManagedCandidateStillRequiresServiceAddress(t *testing.T) {
+	c, err := NewCandidateTLSChange(mkTLSVersionID(t, '1'), mkTLSVersionID(t, '2'))
+	if err != nil {
+		t.Fatalf("new candidate: %v", err)
+	}
+
+	managedFacts := passingFacts()
+	managedFacts.CandidateSource = TLSSourceManaged
+	managedFacts.ServiceAddressMatches = false
+
+	afterValidate, err := c.ValidateCandidate(managedFacts)
+	if err == nil {
+		t.Fatalf("expected managed candidate with a mismatched service address to fail validation")
+	}
+	if afterValidate.Validated() {
+		t.Fatalf("expected managed candidate to remain unvalidated")
+	}
+	if afterValidate.ErrorCode() != "tls_candidate_address_mismatch" {
+		t.Fatalf("expected tls_candidate_address_mismatch, got %q", afterValidate.ErrorCode())
+	}
+	if _, err := afterValidate.Commit(t0()); err == nil {
+		t.Fatalf("expected commit of an unvalidated managed candidate to be refused")
+	}
+}
+
+// Same as above for an external candidate, whose default (zero-value)
+// CandidateSource must not be mistaken for a bootstrap exemption either.
+func TestTLSChange_ExternalCandidateStillRequiresServiceAddress(t *testing.T) {
+	c, err := NewCandidateTLSChange(mkTLSVersionID(t, '1'), mkTLSVersionID(t, '2'))
+	if err != nil {
+		t.Fatalf("new candidate: %v", err)
+	}
+
+	externalFacts := passingFacts()
+	externalFacts.CandidateSource = TLSSourceExternal
+	externalFacts.ServiceAddressMatches = false
+
+	if _, err := c.ValidateCandidate(externalFacts); err == nil {
+		t.Fatalf("expected external candidate with a mismatched service address to fail validation")
+	}
+}
+
 func mkKeyMaterialID(t *testing.T) KeyMaterialID {
 	t.Helper()
 	id, err := ParseKeyMaterialID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")

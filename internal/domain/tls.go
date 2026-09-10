@@ -73,7 +73,12 @@ func NewTLSVersion(facts TLSVersionFacts) (TLSVersion, error) {
 	if len(facts.LeafDER) == 0 {
 		return TLSVersion{}, fmt.Errorf("%w: tls version leaf der must not be empty", ErrInvalidValue)
 	}
-	if facts.ValidatedServiceURL == "" {
+	// Bootstrap snapshots are the pre-configuration temporary HTTPS the
+	// dashboard serves before any real address is known
+	// (architecture.md "부트스트랩은 임시 HTTPS 용도이며 실제 접속 DNS/IP를
+	// 수집하거나 인증서에 반영하는 것을 초기 구동의 조건으로 요구하지 않는다.").
+	// managed/external replacement candidates still need a validated address.
+	if facts.Source != TLSSourceBootstrap && facts.ValidatedServiceURL == "" {
 		return TLSVersion{}, fmt.Errorf("%w: tls version needs a validated service url", ErrInvalidValue)
 	}
 	if facts.NotAfter.IsZero() {
@@ -203,7 +208,17 @@ func (c TLSChange) Version() Version                 { return c.version }
 // TLSValidationFacts are the cryptographic/network facts the adapter (not
 // the domain) already checked for the candidate. The domain only decides
 // what those facts permit.
+//
+// CandidateSource identifies the candidate's TLSVersion.Source. It must
+// mirror NewTLSVersion's own bootstrap exception: a bootstrap candidate has
+// no real service address to check by design (architecture.md "부트스트랩은
+// ... 실제 접속 DNS/IP를 ... 초기 구동의 조건으로 요구하지 않는다."), so
+// ServiceAddressMatches is only enforced for managed/external candidates
+// (architecture.md "운영 인증서 교체 후보에는 실제 서비스 주소 검증을
+// 적용한다."). Without this, a bootstrap TLSVersion could be constructed
+// without a service URL but then get stuck failing candidate validation.
 type TLSValidationFacts struct {
+	CandidateSource          TLSSource
 	KeyMatchesCertificate    bool
 	WithinValidityPeriod     bool
 	PurposeMatchesServerAuth bool
@@ -211,9 +226,13 @@ type TLSValidationFacts struct {
 	ChainVerified            bool
 }
 
+func (f TLSValidationFacts) requiresServiceAddress() bool {
+	return f.CandidateSource != TLSSourceBootstrap
+}
+
 func (f TLSValidationFacts) allPass() bool {
 	return f.KeyMatchesCertificate && f.WithinValidityPeriod && f.PurposeMatchesServerAuth &&
-		f.ServiceAddressMatches && f.ChainVerified
+		(f.ServiceAddressMatches || !f.requiresServiceAddress()) && f.ChainVerified
 }
 
 // firstFailure names which check failed, for a stable error code.
@@ -225,7 +244,7 @@ func (f TLSValidationFacts) firstFailure() string {
 		return "tls_candidate_out_of_validity"
 	case !f.PurposeMatchesServerAuth:
 		return "tls_candidate_wrong_purpose"
-	case !f.ServiceAddressMatches:
+	case !f.ServiceAddressMatches && f.requiresServiceAddress():
 		return "tls_candidate_address_mismatch"
 	default:
 		return "tls_candidate_chain_invalid"
