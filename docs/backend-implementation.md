@@ -379,3 +379,10 @@ PR #3의 질문 번호에 대응한다. 기존 HTTP·수명 정책에서 이미 
 - 운영 Leaf의 CRLDistributionPoints는 검증된 Settings.service_url의 끝 슬래시를 제거한 값에 `/pki/ca-certificates/{issuer_certificate_id}/crl.der`를 붙인 단일 절대 URL이다. 이는 api-contract의 기존 공개 경로이며 `/api/v1`을 삽입하지 않는다. issuer_certificate_id는 이번 서명에 선택한 CA 인증서 ID이며 Leaf 자신의 ID나 Authority ID가 아니다. service_url에 설치 경로가 있으면 보존하고 사용자 정보·query·fragment·빈 host를 허용하지 않는다. 이 URL의 서버 조회는 해당 CA 인증서의 키 세대에 속한 최신 published CRL을 반환한다. 과거 인증서의 URL과 issuer 링크는 CA 인증서 선택 변경 이후에도 유지한다.
 - 최초 발급·갱신·serial 충돌 재서명 모두 같은 준비 snapshot의 CRLDistributionPoints를 signer에 전달한다. 운영 Leaf에서 빈 목록으로 서명하지 않는다. 설정 변경 시 기존 재준비 규칙을 적용하고, B03에서는 recording signer로 URL 및 재시도 시 보존을 검사한다. 실제 X.509 확장 인코딩은 B05에서 검증한다. 자체 서명 Root/bootstrap의 별도 정책에 이 Leaf 규칙을 무조건 적용하지 않는다.
 - 서비스 설정 행이 아직 없는 발급 요청은 conflict(`issuance_settings_not_configured`)로 거부한다. 저장된 설정의 손상·지원하지 않는 schema는 unavailable로 구분하며 기본값으로 복구하지 않는다.
+
+
+### 14.2. 전송 소비와 종료 시각
+
+소비 트랜잭션에서 잠금 획득 후 읽은 시각은 grant/delivery 기한 검사, consumed_at 및 시작 감사에 사용한다. Send가 반환하거나 panic을 회수한 뒤 payload를 정리하고 app Clock.Now()를 다시 읽어 종료 관측 시각을 정한다. 시스템 시계 역행 시 종료 시각은 consumed_at보다 이르지 않도록 둘 중 늦은 값으로 보정한다. 이 값을 Complete/Fail의 finished_at, 결과 감사, 해당 전송 실패로 새로 생성하는 폐기 변경의 revoked_at 및 반환 TransferSummary.FinishedAt에 일관되게 사용한다. 기존 폐기 기록의 시각·사유 병합 규칙은 유지한다.
+
+TransferOutcome.FinishedAt은 sink가 관측한 시각이며 app의 영속 종료 시각을 대체하지 않는다. 오류·panic으로 outcome이 비어 있어도 동일한 app 종료 시각 경로를 사용한다. 후처리 트랜잭션 재시도에는 최초 종료 관측 시각을 보존하며 재시도마다 새 종료 시각을 만들지 않는다. 성공 전송이 소비 후 수령 기한을 넘겼다는 이유만으로 소급 실패 처리하지 않는다. 기한은 소비 가능 여부를 결정하고 전송은 별도 timeout으로 제한한다. 느린 sink와 전진 clock, 실패/panic, 시계 역행을 통해 소비·종료 시각 구분과 결과 일관성을 검증한다.
