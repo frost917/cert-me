@@ -714,5 +714,41 @@ type TLSInstaller interface {
 	// validated. A failure here must leave the previously active
 	// configuration serving traffic unchanged (docs/backend-implementation.md
 	// §9 "Apply 실패는 DB/메모리 모두 원복한다").
+	//
+	// Apply consumes the handle exactly once. On success it removes the
+	// registry entry and hands that configuration's ownership to the live
+	// listener; on failure it removes the entry but keeps the previous
+	// listener. Re-applying a handle that was already consumed or discarded
+	// is rejected (docs/backend-implementation.md §13 "Apply는 handle을 한 번만
+	// 소비한다 ... 이미 소비·폐기된 handle의 재Apply는 거부한다").
 	Apply(ctx context.Context, prepared PreparedTLSConfig) error
+
+	// Discard releases a prepared entry that will never be applied.
+	//
+	// The registry the handle-ID design requires means a successful Prepare
+	// leaves state behind, and Apply is not always reached: the surrounding
+	// DB write can roll back, come back commit_unknown, or the request can be
+	// cancelled or panic. A service therefore defers Discard immediately
+	// after a successful Prepare, so none of those paths leak an entry
+	// (docs/backend-implementation.md §13 "서비스는 Prepare 성공 직후 Discard를
+	// defer해 DB rollback·commit_unknown·취소·panic에서도 미적용 registry
+	// 항목을 정리한다").
+	//
+	// Required behaviour:
+	//   - Idempotent. Calling it twice, or after Apply already consumed the
+	//     handle, is not an error -- which is what makes the deferred call
+	//     safe on the success path.
+	//   - A deferred Discard after a SUCCESSFUL Apply must not tear down the
+	//     now-active configuration: Apply transferred ownership to the live
+	//     listener, so there is no longer a prepared entry to release.
+	//   - It releases only entries this installer itself prepared, the same
+	//     ownership check Apply performs through Verify.
+	//   - It must not depend on a request context. It runs precisely on the
+	//     paths where that context is already cancelled, so it takes none.
+	//   - It never changes the live listener.
+	//
+	// It returns no error: a caller in a defer has nothing useful to do with
+	// one, and a failure to release an unapplied entry must not mask the
+	// error that caused the cleanup in the first place.
+	Discard(prepared PreparedTLSConfig)
 }

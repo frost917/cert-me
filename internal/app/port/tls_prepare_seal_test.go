@@ -33,19 +33,31 @@ import (
 // require of a real implementation now that PreparedTLSConfig carries no
 // payload of its own.
 type fakeInstaller struct {
-	token    port.TLSPrepareToken
-	configs  map[any]string // handle ID -> the config Prepare built for it
-	applied  int
-	rejected int
+	token     port.TLSPrepareToken
+	configs   map[any]string // handle ID -> the config Prepare built for it
+	applied   int
+	rejected  int
+	discarded int
 	// lastApplied is the config fakeInstaller's own Apply most recently
 	// installed, read back out of its private registry -- never anything a
 	// caller could have supplied directly.
 	lastApplied string
 }
 
+// The assertion is the point of this double: it makes the whole TLSInstaller
+// contract a compile-time check from OUTSIDE the port package, so a method
+// added to the interface cannot silently drift away from what an adapter in
+// another package can actually implement. Without it, this file compiled
+// happily while missing Discard entirely.
+var _ port.TLSInstaller = (*fakeInstaller)(nil)
+
 func newFakeInstaller() *fakeInstaller {
 	return &fakeInstaller{token: port.NewTLSPrepareToken(), configs: map[any]string{}}
 }
+
+// discarded counts released-but-never-applied entries, so a test can tell a
+// cleanup that ran from one that silently did nothing.
+func (f *fakeInstaller) prepared() int { return len(f.configs) }
 
 func (f *fakeInstaller) Prepare(ctx context.Context, candidate domain.TLSVersion, key domain.EncryptedSecret) (port.PreparedTLSConfig, error) {
 	// A real installer would validate the candidate/key here and build an
@@ -73,9 +85,31 @@ func (f *fakeInstaller) Apply(ctx context.Context, prepared port.PreparedTLSConf
 		f.rejected++
 		return errors.New("tls: prepared config has no registered configuration")
 	}
+	// Apply consumes the handle exactly once: the entry leaves the registry
+	// on both outcomes, so a replay of the same handle finds nothing and is
+	// rejected, and a deferred Discard on the success path has nothing left
+	// to release (docs/backend-implementation.md §13).
+	delete(f.configs, prepared.ID())
 	f.applied++
 	f.lastApplied = cfg
 	return nil
+}
+
+// Discard releases a prepared entry that will never be applied. It is
+// idempotent, takes no context because it runs precisely where the request
+// context is already cancelled, and never touches the live listener -- here,
+// lastApplied.
+func (f *fakeInstaller) Discard(prepared port.PreparedTLSConfig) {
+	if !f.token.Verify(prepared) {
+		// Releasing only our own entries is the same ownership check Apply
+		// makes; another installer's handle is not ours to clean up.
+		return
+	}
+	if _, ok := f.configs[prepared.ID()]; ok {
+		f.configs[prepared.ID()] = ""
+		delete(f.configs, prepared.ID())
+		f.discarded++
+	}
 }
 
 func TestPreparedTLSConfig_PrepareThenApplyRoundTrips(t *testing.T) {
@@ -162,5 +196,172 @@ func TestPreparedTLSConfig_PayloadCannotBeSubstitutedExternally(t *testing.T) {
 	}
 	if got := inst.lastApplied; got != "real-config" {
 		t.Fatalf("Apply installed %q, want the installer's own registered config %q", got, "real-config")
+	}
+}
+
+// A Prepare that never reaches Apply must not leak its registry entry. This is
+// the path the handle-ID design created: the DB write around Prepare can roll
+// back, come back commit_unknown, or the request can be cancelled or panic.
+func TestTLSInstaller_DiscardReleasesAnUnappliedEntry(t *testing.T) {
+	inst := newFakeInstaller()
+	prepared, err := inst.Prepare(context.Background(), domain.TLSVersion{}, domain.EncryptedSecret{})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if inst.prepared() != 1 {
+		t.Fatalf("Prepare left %d registry entries, want 1", inst.prepared())
+	}
+
+	inst.Discard(prepared)
+
+	if inst.prepared() != 0 {
+		t.Fatalf("Discard left %d registry entries, want 0", inst.prepared())
+	}
+	if inst.discarded != 1 {
+		t.Fatalf("discarded=%d, want 1", inst.discarded)
+	}
+	if inst.lastApplied != "" {
+		t.Fatalf("Discard changed the live configuration to %q", inst.lastApplied)
+	}
+	// A released handle must not be applicable afterwards.
+	if err := inst.Apply(context.Background(), prepared); err == nil {
+		t.Fatal("Apply accepted a handle that had already been discarded")
+	}
+}
+
+// The service defers Discard right after Prepare, so it runs on the success
+// path too. It must not tear down the configuration Apply just installed:
+// Apply transferred ownership to the live listener.
+func TestTLSInstaller_DeferredDiscardAfterSuccessfulApplyKeepsTheActiveConfig(t *testing.T) {
+	inst := newFakeInstaller()
+
+	applyErr := func() error {
+		prepared, err := inst.Prepare(context.Background(), domain.TLSVersion{}, domain.EncryptedSecret{})
+		if err != nil {
+			return err
+		}
+		defer inst.Discard(prepared) // exactly what a service does
+		return inst.Apply(context.Background(), prepared)
+	}()
+	if applyErr != nil {
+		t.Fatalf("Apply: %v", applyErr)
+	}
+
+	if inst.lastApplied != "real-config" {
+		t.Fatalf("the deferred Discard tore down the active configuration: lastApplied=%q", inst.lastApplied)
+	}
+	if inst.applied != 1 {
+		t.Fatalf("applied=%d, want 1", inst.applied)
+	}
+	if inst.prepared() != 0 {
+		t.Fatalf("%d registry entries survived a successful Apply, want 0", inst.prepared())
+	}
+}
+
+// Discard is idempotent: that is what makes the deferred call safe regardless
+// of which path the service took.
+func TestTLSInstaller_DiscardIsIdempotent(t *testing.T) {
+	inst := newFakeInstaller()
+	prepared, err := inst.Prepare(context.Background(), domain.TLSVersion{}, domain.EncryptedSecret{})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		inst.Discard(prepared)
+	}
+	if inst.discarded != 1 {
+		t.Fatalf("discarded=%d after three calls, want 1 release and no error", inst.discarded)
+	}
+	// Also safe on a handle that was already consumed by Apply, and on a
+	// zero handle.
+	other, err := inst.Prepare(context.Background(), domain.TLSVersion{}, domain.EncryptedSecret{})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if err := inst.Apply(context.Background(), other); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	inst.Discard(other)
+	inst.Discard(port.PreparedTLSConfig{})
+	if inst.lastApplied != "real-config" {
+		t.Fatalf("a post-Apply Discard disturbed the active configuration: %q", inst.lastApplied)
+	}
+}
+
+// A failed Apply must release the entry but leave the previous listener
+// serving, and the handle must not be replayable afterwards.
+func TestTLSInstaller_FailedApplyReleasesTheEntryAndKeepsTheOldListener(t *testing.T) {
+	inst := newFakeInstaller()
+	first, err := inst.Prepare(context.Background(), domain.TLSVersion{}, domain.EncryptedSecret{})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if err := inst.Apply(context.Background(), first); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// A second candidate whose Apply fails: drop its registry entry behind
+	// its back to simulate the installer's own apply-time failure path.
+	second, err := inst.Prepare(context.Background(), domain.TLSVersion{}, domain.EncryptedSecret{})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	delete(inst.configs, second.ID())
+	if err := inst.Apply(context.Background(), second); err == nil {
+		t.Fatal("Apply succeeded with no registered configuration")
+	}
+	if inst.lastApplied != "real-config" {
+		t.Fatalf("a failed Apply disturbed the active configuration: %q", inst.lastApplied)
+	}
+	inst.Discard(second) // the service's deferred cleanup still runs
+	if inst.prepared() != 0 {
+		t.Fatalf("%d entries survived, want 0", inst.prepared())
+	}
+}
+
+// A consumed handle must not be applicable a second time: replaying one would
+// re-install a configuration whose ownership already moved to the listener.
+func TestTLSInstaller_ApplyRejectsAConsumedHandle(t *testing.T) {
+	inst := newFakeInstaller()
+	prepared, err := inst.Prepare(context.Background(), domain.TLSVersion{}, domain.EncryptedSecret{})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if err := inst.Apply(context.Background(), prepared); err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+	if err := inst.Apply(context.Background(), prepared); err == nil {
+		t.Fatal("Apply accepted the same handle twice")
+	}
+	if inst.applied != 1 {
+		t.Fatalf("applied=%d, want 1", inst.applied)
+	}
+}
+
+// Discard must only release entries the installer itself prepared, the same
+// ownership check Apply makes through Verify.
+func TestTLSInstaller_DiscardIgnoresAForeignHandle(t *testing.T) {
+	genuine := newFakeInstaller()
+	impostor := newFakeInstaller()
+
+	mine, err := genuine.Prepare(context.Background(), domain.TLSVersion{}, domain.EncryptedSecret{})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	theirs, err := impostor.Prepare(context.Background(), domain.TLSVersion{}, domain.EncryptedSecret{})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	genuine.Discard(theirs)
+	if impostor.prepared() != 1 {
+		t.Fatalf("another installer released our entry: impostor has %d", impostor.prepared())
+	}
+	if genuine.prepared() != 1 {
+		t.Fatalf("discarding a foreign handle disturbed our own registry: %d entries", genuine.prepared())
+	}
+	// Our own handle still works.
+	if err := genuine.Apply(context.Background(), mine); err != nil {
+		t.Fatalf("Apply on our own handle: %v", err)
 	}
 }

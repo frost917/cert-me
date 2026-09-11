@@ -36,11 +36,27 @@ type Job struct {
 // making a re-run of the same job safe.
 type JobRepository interface {
 	// UpsertDemand records that kind's work is needed for dedupKey, merging
-	// into any existing pending row for the same key rather than creating a
-	// duplicate (docs/backend-implementation.md §5 "CRL은 CA 키별
-	// dedup_key로 요구 generation을 병합한다"). A caller passing a payload
-	// for an already-pending row is expected to have already decided the
-	// merged payload; this method does not itself compare generations.
+	// into the EXISTING row for that key whatever its state rather than
+	// creating a duplicate (docs/backend-implementation.md §5 "CRL은 CA 키별
+	// dedup_key로 요구 generation을 병합한다"; docs/data-model.md declares
+	// jobs.dedup_key unique across the whole table, not only among pending
+	// rows). A caller passing a payload is expected to have already decided
+	// the merged payload; this method does not itself compare generations.
+	//
+	// What the merge does to the row's state depends on where that row is:
+	//   - A finished row (succeeded or failed) goes back to pending, and the
+	//     finished run's lease, retry backoff, attempt count and error code
+	//     are cleared with it. The demand is new work, not a continuation, so
+	//     the previous run's backoff must not delay it. Without this, CRL
+	//     publication would never run again after its first success, because
+	//     ClaimDue only considers pending and running rows
+	//     (docs/data-model.md "작업 완료 시 같은 dedup_key에 새 작업 요구가
+	//     들어왔는지 generation/version을 검사하고 그 요구까지 삭제하지 않는다").
+	//   - A running row is left alone: its lease belongs to a live worker,
+	//     which re-reads the row on completion and leaves it pending if a
+	//     newer demand arrived while it was working.
+	// Either way the row's version advances, so a Save carrying a version
+	// read before the merge loses rather than erasing the new demand.
 	UpsertDemand(ctx context.Context, dedupKey, kind string, payloadVersion int, payload []byte) error
 
 	// ClaimDue selects up to limit jobs available at or before now, sets
@@ -65,5 +81,14 @@ type JobRepository interface {
 	// resuming normal admission -- leftover leases from a process that
 	// exited without releasing them, and any recovery-kind work
 	// maintenance_crl_requirements left outstanding.
+	//
+	// It deliberately does NOT apply ClaimDue's expiry test. This runs on the
+	// single-instance restart's exclusive recovery path, where every running
+	// row was left by the previous process, so a lease whose time is still in
+	// the future is a recovery target too -- that future time is precisely the
+	// evidence the old process died mid-lease
+	// (docs/backend-implementation.md §13). ClaimDue's `now >= lease_until`
+	// test is the ordinary worker's rule and stays separate. This must not be
+	// used as a path that steals work from another live process.
 	ListRecoveryRequired(ctx context.Context) ([]Job, error)
 }
