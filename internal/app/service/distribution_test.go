@@ -453,7 +453,7 @@ func distRootCACert(t *testing.T, n int, caKeyGenID domain.CAKeyGenerationID) do
 }
 
 // seedChainAndScope stores everything buildChainDER (§14.2) and
-// distributionManagementAuthority (§14.6) need for one leaf certificate: a
+// leafManagementAuthority (§14.6) need for one leaf certificate: a
 // one-level stored issuer chain terminating at a self-signed Root, and a
 // leaf series recording the management authority. n selects distinct
 // deterministic ids so private/public fixtures do not collide.
@@ -1795,7 +1795,7 @@ func TestDeliver_OperationalEvent_CarriesNoSecrets(t *testing.T) {
 // certificate's cryptographic issuer (which §14.2's buildChainDER resolves
 // to a different id entirely in this fixture). Confirmed failing before the
 // fix: appendDistributionAudit used to hard-code scope nil (there was no
-// distributionManagementAuthority function to call at all).
+// leafManagementAuthority function to call at all).
 func TestDeliver_DownloadAuditScope_IsManagementAuthority_NotEmpty(t *testing.T) {
 	t.Run("private start and completed", func(t *testing.T) {
 		fx := seedPrivateFixture(t, distTestNow().Add(domain.NewDuration(time.Hour)), domain.DeliveryStatePending)

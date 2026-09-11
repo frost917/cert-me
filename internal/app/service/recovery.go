@@ -114,7 +114,7 @@ func (s *DistributionService) failInterruptedTransfer(ctx context.Context, deliv
 		if err != nil {
 			return storeError(err, "recovery_certificate_read_failed", "could not read the interrupted delivery's certificate")
 		}
-		scope, err := distributionManagementAuthority(ctx, tx, certificate.ID())
+		scope, err := leafManagementAuthority(ctx, tx, certificate.ID())
 		if err != nil {
 			return err
 		}

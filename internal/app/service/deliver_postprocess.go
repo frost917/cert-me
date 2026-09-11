@@ -225,7 +225,7 @@ func (s *DistributionService) recordPrivateOutcome(ctx context.Context, meta con
 		if err != nil {
 			return storeError(err, "delivery_read_failed", "could not read the delivery record")
 		}
-		scope, err := distributionManagementAuthority(ctx, tx, prep.certificate.ID())
+		scope, err := leafManagementAuthority(ctx, tx, prep.certificate.ID())
 		if err != nil {
 			return err
 		}
@@ -304,7 +304,7 @@ func (s *DistributionService) recordPrivateOutcome(ctx context.Context, meta con
 // it into the §14.5 OperationalLogger call) instead of being swallowed.
 func (s *DistributionService) recordPublicFailureAudit(ctx context.Context, meta contract.RequestMeta, prep preparedDelivery, consumed consumedTransfer, finishedAt domain.Instant) error {
 	return s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
-		scope, err := distributionManagementAuthority(ctx, tx, prep.certificate.ID())
+		scope, err := leafManagementAuthority(ctx, tx, prep.certificate.ID())
 		if err != nil {
 			return err
 		}
@@ -322,7 +322,7 @@ func (s *DistributionService) recordPublicFailureAudit(ctx context.Context, meta
 // event instead.
 func (s *DistributionService) recordPublicSuccessAudit(ctx context.Context, meta contract.RequestMeta, prep preparedDelivery, consumed consumedTransfer, finishedAt domain.Instant) error {
 	return s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
-		scope, err := distributionManagementAuthority(ctx, tx, prep.certificate.ID())
+		scope, err := leafManagementAuthority(ctx, tx, prep.certificate.ID())
 		if err != nil {
 			return err
 		}
