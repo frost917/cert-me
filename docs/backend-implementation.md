@@ -349,6 +349,10 @@ B02 재검토에서 version 없는 행의 잠금 방식을 확정한다. SaveLea
 
 작업의 새 요구가 succeeded/failed 행에 도착하면 같은 행을 pending으로 재개하고 이전 lease와 재시도 지연을 정리한다. running의 새 요구는 실행 lease를 유지한다. ImportBatch/Takeover의 모든 가변 필드는 대역 입출력에서 깊은 복사를 적용해 callback rollback과 읽기 snapshot을 보장한다. TLS prepared handle은 호출자가 검증된 payload를 교체하거나 가변 설정 참조를 획득할 수 없어야 한다. 구현은 installer 내부 registry 등으로 결정하되 성공·실패·미적용 취소 시 준비 자원의 해제 경로도 명시한다.
 
+TLSInstaller는 `Discard(prepared PreparedTLSConfig)`를 제공한다. 서비스는 Prepare 성공 직후 Discard를 defer해 DB rollback·commit_unknown·취소·panic에서도 미적용 registry 항목을 정리한다. Discard는 해당 installer가 소유한 항목만 제거하며 멱등이고, 취소된 request context에 의존하지 않으며 활성 listener를 변경하지 않는다. Apply는 handle을 한 번만 소비한다. 성공 시 registry에서 제거한 설정의 소유권을 활성 listener로 넘기고, 실패 시 registry 항목을 제거하되 기존 listener를 유지한다. 이미 소비·폐기된 handle의 재Apply는 거부한다. 성공 후 defer된 Discard는 활성 설정을 지우지 않는다. B02는 외부 패키지 대역으로 Prepare→Discard, Apply 성공/실패, 반복 Discard 및 재Apply 거부 계약을 검증하고 실제 TLS 자원 처리는 B05가 구현한다.
+
+ListRecoveryRequired는 단일 인스턴스 재시작의 배타적 복구 경로에서 이전 프로세스가 남긴 running 작업을 모두 조회한다. 이전 lease의 시각이 아직 미래여도 복구 관찰 대상이며, 일반 worker의 ClaimDue 만료 판정과 구분한다. 살아 있는 다른 프로세스의 작업을 빼앗는 호출 경로로 사용하지 않는다. Takeover의 CAKeyGenerationID는 생성 후 업무적으로 불변이다. 정상 ConfirmTakeover는 이 식별자를 바꾸지 않으며 저장소의 변경 거부는 방어적 불변 조건 보강으로 다룬다.
+
 저장소 대역도 실제 port 계약을 따른다. TLS.SetActive는 installation.version을 검사하고 활성 TLS ID와 version을 원자적으로 갱신한다. jobs는 실행 중에도 dedup_key당 한 행을 유지하고 새 요구 병합 시 version을 올리며, 만료된 running lease를 재획득한다. 경합 오류는 SQL과 대역이 공유하는 port 계약으로 식별 가능해야 한다. TLS prepared 값은 다른 패키지의 어댑터와 테스트 대역이 만들 수 있는 opaque handle로 표현하고 Apply에서 소유 installer·유효성을 검사한다. private 입력과 복호화된 다운로드 payload에도 비밀 JSON 거부·로그 redaction·명시적 수명 계약을 적용한다.
 
 계약 완결성 검토에는 로그인 이름 조회·rate-limit 읽기·세션 만료 갱신·reset token 소비 저장, import batch/takeover 저장·조회, PKI의 키 유출 표시·ID 기반 조회도 포함한다. 범용 raw SQL 우회 대신 소비 서비스가 필요한 typed port를 추가한다. 서비스 본체 구현을 B02에 앞당긴다는 뜻은 아니다.
