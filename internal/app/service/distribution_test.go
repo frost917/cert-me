@@ -590,6 +590,34 @@ func seedPublicFixture(t *testing.T, expiresAt domain.Instant) distFixture {
 	}
 }
 
+// advancingClock is a Clock double whose Now() can be moved forward by a
+// test between calls -- used to model real wall-clock delay (e.g. slow
+// encoding) between Deliver's prepare step and its consuming commit.
+type advancingClock struct {
+	mu  sync.Mutex
+	now domain.Instant
+}
+
+func (c *advancingClock) Now() domain.Instant {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *advancingClock) advanceTo(t domain.Instant) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = t
+}
+
+// withClock overrides just the Clock dependency distDeps otherwise defaults
+// to a fixedClock, the same pattern withPublicEncoder/withOperationalLogger
+// use below.
+func withClock(deps DistributionDeps, clock port.Clock) DistributionDeps {
+	deps.Clock = clock
+	return deps
+}
+
 func distDeps(t *testing.T, uow port.UnitOfWork, readStore port.ReadStore, encoder port.DeliveryEncoder, gate port.RuntimeGate) DistributionDeps {
 	t.Helper()
 	return DistributionDeps{
@@ -1836,5 +1864,162 @@ func assertAllScopesAreManagementAuthority(t *testing.T, capture *auditScopeCapt
 				t.Fatalf("audit event %d scope leaked the cryptographic issuer id instead of the management authority", i)
 			}
 		}
+	}
+}
+
+// ---- PR #3 final-review findings -----------------------------------------
+
+// TestDeliver_GrantExpiresDuringEncoding_RejectedAtConsumeTime is finding #1:
+// commitConsumption used to reuse Deliver's single, prepare-time now for its
+// own Validate/CanConsume/Consume calls. A grant/delivery valid when prepare
+// read it but expired by the time the consuming Write actually acquires its
+// row lock (e.g. because encoding took real wall-clock time) must still be
+// rejected -- not waved through on a stale now. This encoder advances a
+// shared clock past the grant/delivery deadline before returning, modeling
+// exactly the delayed-encoder-plus-advancing-clock reproduction the reviewer
+// used.
+func TestDeliver_GrantExpiresDuringEncoding_RejectedAtConsumeTime(t *testing.T) {
+	prepTime := distTestNow()
+	expiresAt := prepTime.Add(domain.NewDuration(time.Millisecond))
+	consumeTime := expiresAt.Add(domain.NewDuration(time.Hour))
+
+	fx := seedPrivateFixture(t, expiresAt, domain.DeliveryStatePending)
+	clock := &advancingClock{now: prepTime}
+	encoder := &fakeDeliveryEncoder{fn: func(port.DeliveryEncodeInput) (port.EncodedBundle, error) {
+		// Simulate encoding taking long enough that the grant/delivery
+		// deadline passes before the consuming commit runs.
+		clock.advanceTo(consumeTime)
+		return port.NewEncodedBundle([]byte("payload"), "application/x-pem-file"), nil
+	}}
+	gate := &fakeRuntimeGate{}
+	sink := &fakeSink{outcome: port.TransferOutcome{Completed: true, BytesWritten: 1, FinishedAt: consumeTime}}
+	deps := withClock(distDeps(t, fx.store, fx.store, encoder, gate), clock)
+	svc := newDistributionService(t, deps)
+
+	_, err := svc.Deliver(context.Background(), distMeta(), distCmd(t, fx.rawToken), sink)
+	if err == nil {
+		t.Fatal("expected the request to be rejected as expired at consume time")
+	}
+	if sink.callCount() != 0 {
+		t.Fatalf("expected 0 Send calls, got %d", sink.callCount())
+	}
+	if got := deliveryState(t, fx.store, fx.deliverID); got != domain.DeliveryStatePending {
+		t.Fatalf("expected delivery to remain pending (0 consumptions), got %s", got)
+	}
+}
+
+// TestDeliver_EncoderReturnsBundleWithError_BundleIsClosed is finding #2's
+// private-side reproduction: an encoder that hands back both a bundle and an
+// error used to leave that bundle open, because prepare's own encErr return
+// happens before Deliver installs its `defer prep.bundle.Close()`. This
+// keeps a reference to the bundle the misbehaving encoder produced and
+// checks it is unusable once Deliver has returned its error.
+func TestDeliver_EncoderReturnsBundleWithError_BundleIsClosed(t *testing.T) {
+	fx := seedPrivateFixture(t, distTestNow().Add(domain.NewDuration(time.Hour)), domain.DeliveryStatePending)
+	var leaked port.EncodedBundle
+	encoder := &fakeDeliveryEncoder{fn: func(port.DeliveryEncodeInput) (port.EncodedBundle, error) {
+		leaked = port.NewEncodedBundle([]byte("leaked-private-plaintext"), "application/x-pem-file")
+		return leaked, errors.New("encode failed but returned a bundle anyway")
+	}}
+	gate := &fakeRuntimeGate{}
+	sink := &fakeSink{}
+	svc := newDistributionService(t, distDeps(t, fx.store, fx.store, encoder, gate))
+
+	_, err := svc.Deliver(context.Background(), distMeta(), distCmd(t, fx.rawToken), sink)
+	if err == nil {
+		t.Fatal("expected the encoding error to surface")
+	}
+	if useErr := leaked.Use(func([]byte) error { return nil }); useErr == nil {
+		t.Fatal("expected the bundle returned alongside an encoder error to be closed, but Use still succeeded")
+	}
+}
+
+// TestDeliver_PublicEncoderReturnsBundleWithError_BundleIsClosed is finding
+// #2's public-side counterpart: PublicCertificateEncoder must get the same
+// treatment as the private DeliveryEncoder.
+func TestDeliver_PublicEncoderReturnsBundleWithError_BundleIsClosed(t *testing.T) {
+	fx := seedPublicFixture(t, distTestNow().Add(domain.NewDuration(time.Hour)))
+	var leaked port.EncodedBundle
+	publicEncoder := &fakePublicCertificateEncoder{fn: func(port.PublicEncodeInput) (port.EncodedBundle, error) {
+		leaked = port.NewEncodedBundle([]byte("leaked-public-plaintext"), "application/x-pem-file")
+		return leaked, errors.New("public encode failed but returned a bundle anyway")
+	}}
+	gate := &fakeRuntimeGate{}
+	sink := &fakeSink{}
+	deps := withPublicEncoder(distDeps(t, fx.store, fx.store, okEncoder("unused"), gate), publicEncoder)
+	svc := newDistributionService(t, deps)
+
+	_, err := svc.Deliver(context.Background(), distMeta(), distCmd(t, fx.rawToken), sink)
+	if err == nil {
+		t.Fatal("expected the public encoding error to surface")
+	}
+	if useErr := leaked.Use(func([]byte) error { return nil }); useErr == nil {
+		t.Fatal("expected the public bundle returned alongside an encoder error to be closed, but Use still succeeded")
+	}
+}
+
+// TestDeliver_PublicSuccess_ResultAuditRecorded is finding #3: a public
+// transfer that completes cleanly used to leave only a "start" audit row.
+// This checks a second, result audit row now appears, scoped to the
+// management authority (§14.6), with no FailClosed and no revocation.
+func TestDeliver_PublicSuccess_ResultAuditRecorded(t *testing.T) {
+	fx := seedPublicFixture(t, distTestNow().Add(domain.NewDuration(time.Hour)))
+	capture := &auditScopeCapture{}
+	wrapped := &scopeCapturingStore{inner: fx.store, capture: capture}
+	gate := &fakeRuntimeGate{}
+	sink := &fakeSink{outcome: port.TransferOutcome{Completed: true, BytesWritten: 5, FinishedAt: distTestNow()}}
+	svc := newDistributionService(t, distDeps(t, wrapped, wrapped, okEncoder("unused"), gate))
+
+	if _, err := svc.Deliver(context.Background(), distMeta(), distCmd(t, fx.rawToken), sink); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	scopes := capture.all()
+	if len(scopes) < 2 {
+		t.Fatalf("expected at least 2 audit rows (start + result) for a successful public transfer, got %d", len(scopes))
+	}
+	assertAllScopesAreManagementAuthority(t, capture, fx.managementAuthorityID, fx.issuerID)
+	if gate.callCount() != 0 {
+		t.Fatalf("a public success audit must never FailClosed, got %d", gate.callCount())
+	}
+	if n := countRevocations(t, fx.store, fx.issuerID, distSerial(t, "a2")); n != 0 {
+		t.Fatalf("a public success must never revoke, got %d", n)
+	}
+}
+
+// TestDeliver_PublicSuccess_ResultAuditFails_LogsOnly checks the failure mode
+// of the new result audit: if the post-process transaction that writes it
+// cannot commit, Deliver still reports the transfer as completed, never
+// FailCloses, never revokes, and records exactly one OperationalLogger event
+// -- the same non-escalating treatment the existing public-failure audit
+// path gets.
+func TestDeliver_PublicSuccess_ResultAuditFails_LogsOnly(t *testing.T) {
+	fx := seedPublicFixture(t, distTestNow().Add(domain.NewDuration(time.Hour)))
+	staged := newStagedUoW(fx.store)
+	// Stage 1 is the consuming commit; stage 2 is the new success-audit
+	// post-process write this fix adds.
+	staged.forceUnknownAt[2] = true
+	logger := &fakeOperationalLogger{}
+	gate := &fakeRuntimeGate{}
+	sink := &fakeSink{outcome: port.TransferOutcome{Completed: true, BytesWritten: 5, FinishedAt: distTestNow()}}
+	deps := withOperationalLogger(distDeps(t, staged, fx.store, okEncoder("unused"), gate), logger)
+	svc := newDistributionService(t, deps)
+
+	summary, err := svc.Deliver(context.Background(), distMeta(), distCmd(t, fx.rawToken), sink)
+	if err != nil {
+		t.Fatalf("a public post-process audit failure must not fail Deliver itself, got %v", err)
+	}
+	if !summary.Completed {
+		t.Fatal("expected the transfer to still report completed")
+	}
+	if gate.callCount() != 0 {
+		t.Fatalf("a public success audit failure must never FailClosed, got %d", gate.callCount())
+	}
+	if n := countRevocations(t, fx.store, fx.issuerID, distSerial(t, "a2")); n != 0 {
+		t.Fatalf("a public success audit failure must never revoke, got %d", n)
+	}
+	events := logger.recorded()
+	if len(events) != 1 {
+		t.Fatalf("OperationalLogger.Record calls = %d, want 1", len(events))
 	}
 }

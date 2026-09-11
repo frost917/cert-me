@@ -287,6 +287,15 @@ func (s *DistributionService) prepare(ctx context.Context, cmd contract.Download
 		})
 	}
 	if encErr != nil {
+		// An encoder that returns a bundle alongside its error is still
+		// handing back live plaintext (port.EncodedBundle.Use works on it
+		// until Close is called). This path returns before Deliver's own
+		// `defer prep.bundle.Close()` is installed, so nothing else will
+		// ever close it if this function does not -- close it here so a
+		// buggy or malicious encoder cannot leave decrypted key/certificate
+		// material reachable through a bundle nobody else holds a reference
+		// to releasing.
+		bundle.Close()
 		return preparedDelivery{}, encErr
 	}
 
@@ -380,8 +389,9 @@ func appendDistributionAudit(ctx context.Context, tx port.TxStores, ids port.IDG
 // never touches sink: those already ran (prepare) or run only after this
 // commit succeeds (sendAndRecord), matching the "encoding failure consumes
 // nothing" / "commit loser never reaches Send" rules.
-func (s *DistributionService) commitConsumption(ctx context.Context, meta contract.RequestMeta, prep preparedDelivery, now domain.Instant) (consumedTransfer, error) {
+func (s *DistributionService) commitConsumption(ctx context.Context, meta contract.RequestMeta, prep preparedDelivery) (consumedTransfer, domain.Instant, error) {
 	var result consumedTransfer
+	var consumeNow domain.Instant
 	err := s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
 		grant, err := tx.Delivery().GetGrantForUpdate(ctx, prep.tokenHash)
 		if err != nil {
@@ -390,6 +400,16 @@ func (s *DistributionService) commitConsumption(ctx context.Context, meta contra
 			}
 			return storeError(err, "download_grant_read_failed", "could not read the download link")
 		}
+		// Re-read the clock now that GetGrantForUpdate has taken the row
+		// lock, instead of reusing prepare()'s now. Encoding (§7 step 2) can
+		// take real wall-clock time, and prepare's now was only ever a
+		// snapshot for preparation-time checks; reusing it here would let a
+		// grant/delivery whose deadline passed during encoding still be
+		// validated and Consumed against a now that predates that deadline.
+		// The reviewer reproduced exactly this with a delayed encoder and an
+		// advancing clock (PR #3 finding).
+		now := s.deps.Clock.Now()
+		consumeNow = now
 		if err := grant.Validate(grant.Purpose(), grant.CertificateID(), grant.DeliveryID(), now); err != nil {
 			return contract.FromDomainError(err)
 		}
@@ -463,7 +483,7 @@ func (s *DistributionService) commitConsumption(ctx context.Context, meta contra
 		result = consumedTransfer{grant: consumedGrant, delivery: consumedDelivery}
 		return nil
 	})
-	return result, err
+	return result, consumeNow, err
 }
 
 // Deliver is the fixed signature docs/backend-implementation.md §7 assigns
@@ -482,9 +502,9 @@ func (s *DistributionService) Deliver(ctx context.Context, meta contract.Request
 	if err != nil {
 		return contract.TransferSummary{}, err
 	}
-	now := s.deps.Clock.Now()
+	prepareNow := s.deps.Clock.Now()
 
-	prep, err := s.prepare(ctx, cmd, format, now)
+	prep, err := s.prepare(ctx, cmd, format, prepareNow)
 	if err != nil {
 		// Step 2's rule: an encoding/preparation failure never reaches a
 		// Write, so nothing was ever consumed.
@@ -495,7 +515,11 @@ func (s *DistributionService) Deliver(ctx context.Context, meta contract.Request
 	// before that; Close is idempotent, so a redundant call here is free.
 	defer prep.bundle.Close()
 
-	consumed, err := s.commitConsumption(ctx, meta, prep, now)
+	// commitConsumption re-reads the clock itself once it holds the grant's
+	// row lock (see its comment) -- prepareNow above is preparation-only and
+	// must not be reused past this point (PR #3 finding: reusing it let an
+	// expiry that landed during encoding go unnoticed).
+	consumed, now, err := s.commitConsumption(ctx, meta, prep)
 	if err != nil {
 		if errors.Is(err, port.ErrCommitUnknown) {
 			// §12: "private 소비 commit 미확정 ... 은 FailClosed 대상이다."

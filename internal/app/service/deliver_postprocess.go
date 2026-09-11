@@ -152,6 +152,29 @@ func (s *DistributionService) sendAndRecord(ctx context.Context, meta contract.R
 			GrantID:       consumed.grant.ID(),
 			CertificateID: prep.certificate.ID(),
 		})
+	} else {
+		// PR #3 finding: a public transfer that completes cleanly used to
+		// leave only its "start" audit row (appendDistributionAudit in
+		// commitConsumption) with no record of the actual result, unlike the
+		// private path (recordPrivateOutcome's "completed" row). §14.1's
+		// follow-up settles that a public download's outcome is audited the
+		// same way a private one's is -- same scope rule (§14.6, one
+		// management authority, never the ancestor chain) -- but a public
+		// success audit failure gets the same non-escalating treatment as a
+		// public failure audit above: OperationalLogger only, never
+		// FailClosed, never a revocation. This is not the "운영 로그가 감사
+		// DB의 대체가 아니다" case §14.5 warns about, because the business
+		// audit call above (recordPublicSuccessAudit) is still attempted
+		// first; the log only records that attempt's own failure.
+		if auditErr := s.recordPublicSuccessAudit(postCtx, meta, prep, consumed, now); auditErr != nil {
+			s.deps.OperationalLogger.Record(port.OperationalEvent{
+				Code:          "distribution_public_postprocess_audit_failed",
+				RequestID:     meta.RequestID,
+				Stage:         port.OperationalStagePublicPostProcess,
+				GrantID:       consumed.grant.ID(),
+				CertificateID: prep.certificate.ID(),
+			})
+		}
 	}
 
 	if result.panicked {
@@ -271,5 +294,23 @@ func (s *DistributionService) recordPublicFailureAudit(ctx context.Context, meta
 			return err
 		}
 		return appendDistributionAudit(ctx, tx, s.deps.IDs, now, meta, "distribution.deliver.public.failed", consumed.grant.ID(), contract.AuditResultFailure, scope)
+	})
+}
+
+// recordPublicSuccessAudit is recordPublicFailureAudit's success-case
+// counterpart (PR #3 finding): a public transfer that completed cleanly
+// still gets a result audit row, in its own post-process transaction, scoped
+// the same way as every other Deliver audit row (§14.6 -- one management
+// authority, never the ancestor chain). Unlike the private path, this row's
+// own write failure is never a private-grade incident: no FailClosed, no
+// revocation. sendAndRecord folds a failure here into an OperationalLogger
+// event instead.
+func (s *DistributionService) recordPublicSuccessAudit(ctx context.Context, meta contract.RequestMeta, prep preparedDelivery, consumed consumedTransfer, now domain.Instant) error {
+	return s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
+		scope, err := distributionManagementAuthority(ctx, tx, prep.certificate.ID())
+		if err != nil {
+			return err
+		}
+		return appendDistributionAudit(ctx, tx, s.deps.IDs, now, meta, "distribution.deliver.public.completed", consumed.grant.ID(), contract.AuditResultSuccess, scope)
 	})
 }
