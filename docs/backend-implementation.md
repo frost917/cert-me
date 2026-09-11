@@ -145,7 +145,7 @@ ReadStore는 별도 읽기 스냅샷용 인터페이스로 둔다. 사전 준비
 | --- | --- |
 | AccountRepository | GetAccountForUpdate(id) → Account; FindSessionByHash(hash) → SessionState; GetSessionForUpdate(sessionID) → SessionState; InsertAccount; SaveAccount(account,expectedVersion); Insert/DeleteSession; DeleteAllSessions(accountID); Get/Insert/InvalidateResetTokens; SaveRateLimit |
 | InstallationRepository | GetForUpdate → Installation; Save(expectedVersion); Get/SaveSettings(expectedVersion) |
-| PKIRepository | GetIssuerForUpdate(authorityID) → IssuerContext; GetSeriesForUpdate(seriesID) → SeriesSnapshot; FindCertificateByDER; FindKeyBySPKI; SerialExists(issuer,serial); InsertAuthority/KeyGeneration/Certificate/Series; SaveSeries(expectedVersion); SaveAuthority(expectedVersion); ListCertificatesUsingKey; ListAffectedDescendants |
+| PKIRepository | GetIssuerForUpdate(authorityID) → Authority; GetSeriesForUpdate(seriesID) → SeriesSnapshot; GetCertificate(id); FindCertificateByDER; FindKeyBySPKI; SerialExists(issuer,serial); InsertKeyMaterial/Authority/CAKeyGeneration/LeafKeyGeneration/Certificate/Series; SaveLeafKeyGeneration(generation); SaveSeries/Authority(expectedVersion); ListCertificatesUsingKey; ListAffectedDescendants |
 | DeliveryRepository | GetDeliveryForUpdate; GetGrantForUpdate(tokenHash); InsertDelivery/Grant; SaveDelivery(expectedVersion); SaveGrant; InvalidatePrivateGrants(deliveryID); InvalidatePublicGrants(certificateID); ListExpired/Transferring |
 | RevocationRepository | FindForUpdate(issuer,serial); Insert; Save(expectedVersion); AppendRevision; ListByIssuer |
 | CRLRepository | GetStateForUpdate(caKeyID); SaveState(expectedVersion); InsertDocument; GetDocument |
@@ -326,4 +326,33 @@ B01~B04는 백엔드 규칙과 협력 관계를 구현하는 단계다. 마이�
 - private 소비 commit 미확정 또는 소비 후 Send panic에서 후처리를 끝내지 못한 경우도 FailClosed 대상이다. 확정 rollback으로 소비가 없었던 경우는 payload만 지우고 반환한다. 후처리가 확정 성공하면 추가 폐기하지 않는다. 재시작 복구 commit이 실패하면 다운로드/발급 요청을 열지 않는다. 이전 프로세스가 잠금을 완전히 반납하기 전 다른 프로세스가 시작하지 않는 기존 규칙을 유지한다.
 - 인코딩/전송/비밀번호 KDF와 import의 자원 상한은 [HTTP 계약](./api-contract.md), [운영 정책](./architecture.md), [import](./pki-import.md)를 따른다. 해시·복호화 admission은 비싼 계산 전에 검사하고 임의 중첩 작업이 semaphore를 두 번 획득하지 않게 한다. PasswordHasher는 지원 프로필 외 DB 파라미터를 실행하지 않는다.
 - ImportService는 typed ImportMetadata 입력과 별도의 PublicImportManifest/TakeoverEvidence 저장 타입을 사용한다. manifest는 파서가 만든 공개 Facts에서 생성하고 repository에 input command를 전달하지 않는다. OpenAPI ImportManifest/TakeoverEvidence의 필드만 매핑한다.
+
 - B03 필수 테스트에 Send 성공/실패 × 후처리 rollback/commit_unknown, FailClosed admission 차단, 재시작 시 저장된 completed 유지/잔류 transferring 폐기를 추가한다. timeout 후 background 계산을 방치하지 않는 자원 해제도 확인한다. B05는 KDF 상한 사전 거부와 실제 상한 입력 비용, B06은 프록시 로그·IP 체인·CSRF origin·CSP/HTMX·재설정 URL 제거를 검증한다.
+
+## 13. B02 계약 검토 확정 사항
+
+설계 변경은 기획 담당자가 문서를 직접 수정하고 해당 개발 브랜치에 커밋·푸시한 뒤 PR에 커밋과 적용 범위를 알린다. 개발팀은 같은 문서를 별도로 재작성하지 않고 확정된 계약의 코드·테스트를 구현한다. 판단 요청은 한 번에 모아 제시하고, 확정 전에는 해당 부분의 임시 구현·매핑 테스트를 확대하지 않으며 독립적인 작업을 진행한다. 기획 리뷰는 재현 조건과 기대 동작을 전달하고 제품 코드 수정은 개발팀이 맡는다. 명칭·파일 분할 같은 제품 동작을 바꾸지 않는 구현 선택은 개발팀이 결정한다. 새 결정이 기존 요청을 대체하면 PR에서 대체 관계를 명시한다.
+
+PR #2의 설계 질문에 대한 결정이다. §4의 축약 목록은 메서드의 상한이 아니다. 서비스가 TxStores만으로 필요한 사실을 읽고 결과를 저장할 수 있어야 하며, 대역 내부 map에 직접 fixture를 넣어야만 가능한 정상 업무 흐름은 계약 완성으로 인정하지 않는다.
+
+1. 전환 상태는 OpenAPI·SQL의 `in_progress → externally_completed → closed`를 도메인에도 사용한다. 후속 CA 선택 여부는 nullable TargetAuthorityID로 표현한다. SetTarget은 in_progress 안에서 수행한다. Complete는 기존 영향 처리·수동 외부 배포 확인 조건을 검사해 externally_completed로 옮긴다. closed는 원본 CA의 게시 종료 조건까지 충족한 상태이며 Complete만으로 추정하지 않는다. CRL 종료와 연결하는 별도 도메인 전이가 필요하다. 기존 reported/target_set/completed의 단순 전단사 매핑은 사용하지 않는다. 서비스 연결은 B04에서 구현하되 B02 계약에서 상태 의미를 통일한다.
+2. 배포 확인은 `certificate_installed`로 통일한다. 지정한 인증서와 대응하는 키를 대상에 설치했다는 관리자의 수동 확인이다. 같은 키를 재사용한 정상 갱신에도 기록할 수 있으며 항상 새 키를 만들었다는 뜻은 아니다. 긴급 전환의 새 키 필수 조건은 발급 정책에서 별도로 검사한다. 도메인의 cert_key_replaced 명칭도 이 의미에 맞춘다.
+3. GetIssuerForUpdate는 저장된 Authority를 반환한다. app이 요청 기간·intent·인수 확인으로 IssuerContext를 구성하고 트랜잭션 안에서 CanIssue를 다시 검사한다.
+4. PKIParser는 인증서 PEM/DER 묶음, CRL PEM/DER, CA 개인키, 내부 TLS 개인키를 구분하는 typed 입력/출력 메서드를 제공한다. 인증서/CRL 출력은 공개 facts이며 CRL의 issuer·서명 검증에 필요한 정보·번호·기간·폐기 항목을 포함한다. 파서가 DB ID나 issuer 관계를 임의 생성하지 않고 app이 검증 후 연결한다. 키 입력은 secret.Input이고 CA/internal_tls 목적과 인증서 공개키 일치를 검증한다. 검증된 키 입력은 호출자가 KeyEngine.Import 후 Close하며, 중간 실패 시 파서가 이미 만든 비밀을 닫는다. 일반 leaf 개인키 import는 허용하지 않는다. 포맷·암호화·자원 상한은 §6과 pki-import를 따른다.
+5. Query.ListAuthority/GetAuthority, ListSeries/GetSeries, ListCertificate/GetCertificate, ListRevocation/GetRevocation, ListTransition/GetTransition, ListImport/GetImport, ListJob/GetJob, ListAudit/ExportAudit, GetCRLStatus/ReadPublicCA를 각각 별도 Action으로 선언한다. 실제 API에 없는 단일 Audit 조회는 신설하지 않는다. TLS.Bootstrap과 TLS.Reconcile도 별도 Action이며 대응 내부 operation만 허용한다. 미정의 Action은 거부한다.
+6. idempotency input hash v1은 작업별 전용 typed 정규화 DTO의 Go encoding/json 바이트를 SHA-256으로 계산한다. envelope에 schema_version=1, operation, path 대상 ID와 모든 검증된 업무 입력을 포함한다. UUID/지문은 소문자, 시간은 UTC 마이크로초로 정규화한다. SAN은 domain 정규화 후 type/value 순 정렬·중복 제거하며 나머지 문자열은 업무 정책 외 임의 trim/case folding을 하지 않는다. 선택값 생략은 명시값과 구별해 보존한다. 설치 기본값 적용 전에 해시를 계산하고 첫 실행의 해석값은 결과에 저장해 설정 변경 이후에도 같은 요청을 재생한다. actor와 idempotency key는 조회 키이며 trace RequestID/IP/세션 토큰/If-Match는 해시에서 제외한다. import는 파일 ID 순 정렬한 공개 manifest의 종류·원본 파일 SHA-256·issuer 연결 및 CA 지문 순 정렬한 takeover 입력을 포함하며 passphrase·개인키 원문은 제외한다. command 전체를 무차별 직렬화하지 않는다. 입력이 다르면 conflict, 같으면 기대 version 검사 전에 성공 결과를 재생한다. B03은 작업별 필드 변경·생략·설정 변경 후 재생 테스트를 갖춘다.
+7. ImportBatchID·TakeoverID 추가를 승인한다. 다른 저장 엔티티 ID와 동일한 UUID 검증을 적용한다.
+
+B02 재검토에서 version 없는 행의 잠금 방식을 확정한다. SaveLeafKeyGeneration(generation)은 별도 expectedVersion 없이 유지하며 version 컬럼을 추가하지 않는다. app은 같은 Write에서 GetSeriesForUpdate로 부모 Series와 현재 키 세대를 잠그고 소속·현재 세대를 재검사한 뒤 SaveLeafKeyGeneration과 SaveSeries(expectedVersion)를 함께 커밋한다. 두 저장의 호출 순서와 무관하게 Series 충돌 시 전체를 rollback한다. 트랜잭션 밖에서 읽은 generation을 그대로 저장하지 않는다. SaveSession/SaveResetToken 역시 같은 Write에서 최신 행을 잠그고 도메인 전이 후 저장하며, Account 잠금·epoch·상태 검사를 함께 수행한다. SQL 어댑터는 이 행 잠금 계약을 구현해야 한다.
+
+로그인 이름은 Credentials의 ASCII 문자·길이 검증을 먼저 적용하고 NormalizeLoginName의 ASCII 소문자화를 생성·조회에 공통 적용한다. 공백이 포함된 외부 입력을 정규화로 구제하지 않는다. 키 유출 반복 보고는 이른 compromised_at을 보존하는 구현을 승인한다. 시각은 0이 아니어야 하고 유출 표시가 설정되면 시각과 무관하게 즉시 발급/재사용을 차단한다. 과거 인증서의 신뢰 구간을 서버가 자동 판정한다는 의미는 아니다. Import Preview는 batch를 영속화하지 않으며 Commit의 결과 batch는 write-once로 유지한다. previewed 스키마 값 때문에 별도 저장 흐름을 추가하지 않는다. 실패 기록은 rollback된 업무 변경을 재커밋하지 않는 별도 오류/감사 처리 규칙을 따른다.
+
+작업의 새 요구가 succeeded/failed 행에 도착하면 같은 행을 pending으로 재개하고 이전 lease와 재시도 지연을 정리한다. running의 새 요구는 실행 lease를 유지한다. ImportBatch/Takeover의 모든 가변 필드는 대역 입출력에서 깊은 복사를 적용해 callback rollback과 읽기 snapshot을 보장한다. TLS prepared handle은 호출자가 검증된 payload를 교체하거나 가변 설정 참조를 획득할 수 없어야 한다. 구현은 installer 내부 registry 등으로 결정하되 성공·실패·미적용 취소 시 준비 자원의 해제 경로도 명시한다.
+
+TLSInstaller는 `Discard(prepared PreparedTLSConfig)`를 제공한다. 서비스는 Prepare 성공 직후 Discard를 defer해 DB rollback·commit_unknown·취소·panic에서도 미적용 registry 항목을 정리한다. Discard는 해당 installer가 소유한 항목만 제거하며 멱등이고, 취소된 request context에 의존하지 않으며 활성 listener를 변경하지 않는다. Apply는 handle을 한 번만 소비한다. 성공 시 registry에서 제거한 설정의 소유권을 활성 listener로 넘기고, 실패 시 registry 항목을 제거하되 기존 listener를 유지한다. 이미 소비·폐기된 handle의 재Apply는 거부한다. 성공 후 defer된 Discard는 활성 설정을 지우지 않는다. B02는 외부 패키지 대역으로 Prepare→Discard, Apply 성공/실패, 반복 Discard 및 재Apply 거부 계약을 검증하고 실제 TLS 자원 처리는 B05가 구현한다.
+
+ListRecoveryRequired는 단일 인스턴스 재시작의 배타적 복구 경로에서 이전 프로세스가 남긴 running 작업을 모두 조회한다. 이전 lease의 시각이 아직 미래여도 복구 관찰 대상이며, 일반 worker의 ClaimDue 만료 판정과 구분한다. 살아 있는 다른 프로세스의 작업을 빼앗는 호출 경로로 사용하지 않는다. Takeover의 CAKeyGenerationID는 생성 후 업무적으로 불변이다. 정상 ConfirmTakeover는 이 식별자를 바꾸지 않으며 저장소의 변경 거부는 방어적 불변 조건 보강으로 다룬다.
+
+저장소 대역도 실제 port 계약을 따른다. TLS.SetActive는 installation.version을 검사하고 활성 TLS ID와 version을 원자적으로 갱신한다. jobs는 실행 중에도 dedup_key당 한 행을 유지하고 새 요구 병합 시 version을 올리며, 만료된 running lease를 재획득한다. 경합 오류는 SQL과 대역이 공유하는 port 계약으로 식별 가능해야 한다. TLS prepared 값은 다른 패키지의 어댑터와 테스트 대역이 만들 수 있는 opaque handle로 표현하고 Apply에서 소유 installer·유효성을 검사한다. private 입력과 복호화된 다운로드 payload에도 비밀 JSON 거부·로그 redaction·명시적 수명 계약을 적용한다.
+
+계약 완결성 검토에는 로그인 이름 조회·rate-limit 읽기·세션 만료 갱신·reset token 소비 저장, import batch/takeover 저장·조회, PKI의 키 유출 표시·ID 기반 조회도 포함한다. 범용 raw SQL 우회 대신 소비 서비스가 필요한 typed port를 추가한다. 서비스 본체 구현을 B02에 앞당긴다는 뜻은 아니다.

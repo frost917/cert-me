@@ -33,12 +33,15 @@ func mkAccountID(t *testing.T) AccountID {
 }
 
 // data-model.md: emergency reports can register with no successor CA yet.
+// B02 ruling: whether a successor has been chosen is expressed by
+// TargetAuthorityID, not by a separate state -- SetTarget stays legal while
+// in_progress regardless of whether a target was already set.
 func TestTransition_EmergencyCanBeCreatedWithoutTarget(t *testing.T) {
 	tr, err := NewTransition(TransitionFacts{
 		ID:                mkTransitionID(t),
 		SourceAuthorityID: mkAuthorityID(t, '1'),
 		Mode:              TransitionModeEmergency,
-		State:             TransitionStateReported,
+		State:             TransitionStateInProgress,
 		ReportedBy:        mkAccountID(t),
 		ReportedAt:        t0(),
 		Reason:            "key compromise reported",
@@ -61,16 +64,36 @@ func TestTransition_EmergencyCanBeCreatedWithoutTarget(t *testing.T) {
 	if withTarget.TargetAuthorityID() != mkAuthorityID(t, '2') {
 		t.Fatalf("expected target authority to be recorded")
 	}
-	if withTarget.State() != TransitionStateTargetSet {
-		t.Fatalf("expected state to advance to target_set")
+	// B02 ruling: setting a target does not advance the state machine --
+	// it stays in_progress, since target presence is tracked by
+	// TargetAuthorityID alone, not by a "target_set" state.
+	if withTarget.State() != TransitionStateInProgress {
+		t.Fatalf("expected state to remain in_progress after SetTarget, got %q", withTarget.State())
+	}
+
+	// B02 ruling: SetTarget is legal in_progress even when a target is
+	// already recorded (replacing the successor), and rejected once the
+	// transition has moved past in_progress.
+	replaced, err := withTarget.SetTarget(mkAuthorityID(t, '3'), t0())
+	if err != nil {
+		t.Fatalf("expected replacing an already-set target to be legal in_progress: %v", err)
+	}
+	if replaced.TargetAuthorityID() != mkAuthorityID(t, '3') {
+		t.Fatalf("expected target authority to be replaced")
 	}
 }
 
+// Rewritten for B02: the old test asserted Complete moved the transition
+// straight to a single terminal "completed" state. The ruling replaces that
+// with externally_completed (Complete) and closed (a separate transition,
+// Close) -- Complete alone must never reach closed, and re-running Complete
+// once externally_completed must fail exactly like the old "already
+// completed" case did.
 func TestTransition_CompleteRequiresBothImpactsAndDeployment(t *testing.T) {
 	tr, err := NewTransition(TransitionFacts{
 		ID: mkTransitionID(t), SourceAuthorityID: mkAuthorityID(t, '1'),
 		TargetAuthorityID: mkAuthorityID(t, '2'), Mode: TransitionModeNormal,
-		State: TransitionStateTargetSet, ReportedBy: mkAccountID(t), ReportedAt: t0(),
+		State: TransitionStateInProgress, ReportedBy: mkAccountID(t), ReportedAt: t0(),
 	})
 	if err != nil {
 		t.Fatalf("new transition: %v", err)
@@ -86,11 +109,56 @@ func TestTransition_CompleteRequiresBothImpactsAndDeployment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("complete: %v", err)
 	}
-	if !done.IsCompleted() {
-		t.Fatalf("expected transition to complete")
+	if !done.IsExternallyCompleted() {
+		t.Fatalf("expected transition to reach externally_completed")
+	}
+	if done.IsClosed() {
+		t.Fatalf("expected Complete alone to never reach closed (B02 ruling)")
 	}
 	if _, err := done.Complete(TransitionClosureFacts{AllImpactsAddressed: true, ManualDeploymentConfirmed: true}, t0()); err == nil {
-		t.Fatalf("expected completing an already-completed transition to fail")
+		t.Fatalf("expected completing an already-externally_completed transition to fail")
+	}
+}
+
+// New for B02: closed must be reached only via the separate Close
+// transition, and Close itself must check the source CA's
+// publication-termination fact rather than assume it.
+func TestTransition_CloseRequiresExternallyCompletedAndPublicationEnded(t *testing.T) {
+	tr, err := NewTransition(TransitionFacts{
+		ID: mkTransitionID(t), SourceAuthorityID: mkAuthorityID(t, '1'),
+		TargetAuthorityID: mkAuthorityID(t, '2'), Mode: TransitionModeNormal,
+		State: TransitionStateInProgress, ReportedBy: mkAccountID(t), ReportedAt: t0(),
+	})
+	if err != nil {
+		t.Fatalf("new transition: %v", err)
+	}
+
+	// Close must be refused while still in_progress -- closed requires
+	// externally_completed first.
+	if _, err := tr.Close(TransitionTerminationFacts{SourceCAPublicationEnded: true}, t0()); err == nil {
+		t.Fatalf("expected Close to be refused while in_progress")
+	}
+
+	done, err := tr.Complete(TransitionClosureFacts{AllImpactsAddressed: true, ManualDeploymentConfirmed: true}, t0())
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	// Close must be refused when the CRL-termination fact says the source
+	// CA's publication has not ended, even though externally_completed.
+	if _, err := done.Close(TransitionTerminationFacts{SourceCAPublicationEnded: false}, t0()); err == nil {
+		t.Fatalf("expected Close to be refused when publication has not ended")
+	}
+
+	closed, err := done.Close(TransitionTerminationFacts{SourceCAPublicationEnded: true}, t0())
+	if err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if !closed.IsClosed() {
+		t.Fatalf("expected transition to be closed")
+	}
+	if _, err := closed.Close(TransitionTerminationFacts{SourceCAPublicationEnded: true}, t0()); err == nil {
+		t.Fatalf("expected closing an already-closed transition to fail")
 	}
 }
 
@@ -154,11 +222,28 @@ func TestDeploymentConfirmation_ConstructionValidatesFields(t *testing.T) {
 	}
 }
 
+// B02 ruling on Decision 2: certificate_installed is recordable for an
+// ordinary same-key renewal too, so construction must not require a new key
+// to have been generated -- it only needs the usual required fields.
+func TestDeploymentConfirmation_CertificateInstalledDoesNotRequireNewKey(t *testing.T) {
+	_, err := NewDeploymentConfirmation(DeploymentConfirmationFacts{
+		TransitionID:  mkTransitionID(t),
+		TargetLabel:   "edge-lb-01",
+		CertificateID: mkCertID(t),
+		Action:        DeploymentActionCertificateInstalled,
+		ConfirmedBy:   mkAccountID(t),
+		ConfirmedAt:   t0(),
+	})
+	if err != nil {
+		t.Fatalf("expected certificate_installed confirmation for a same-key renewal to construct: %v", err)
+	}
+}
+
 func TestTransition_ConfirmDeploymentRefusedAfterCompletion(t *testing.T) {
 	tr, err := NewTransition(TransitionFacts{
 		ID: mkTransitionID(t), SourceAuthorityID: mkAuthorityID(t, '1'),
 		TargetAuthorityID: mkAuthorityID(t, '2'), Mode: TransitionModeNormal,
-		State: TransitionStateTargetSet, ReportedBy: mkAccountID(t), ReportedAt: t0(),
+		State: TransitionStateInProgress, ReportedBy: mkAccountID(t), ReportedAt: t0(),
 	})
 	if err != nil {
 		t.Fatalf("new transition: %v", err)
@@ -169,5 +254,25 @@ func TestTransition_ConfirmDeploymentRefusedAfterCompletion(t *testing.T) {
 	}
 	if err := done.ConfirmDeployment(t0()); err == nil {
 		t.Fatalf("expected confirmation to be refused after completion")
+	}
+}
+
+// New for B02: SetTarget must be rejected once the transition has moved
+// past in_progress, not just once fully closed.
+func TestTransition_SetTargetRejectedAfterComplete(t *testing.T) {
+	tr, err := NewTransition(TransitionFacts{
+		ID: mkTransitionID(t), SourceAuthorityID: mkAuthorityID(t, '1'),
+		TargetAuthorityID: mkAuthorityID(t, '2'), Mode: TransitionModeNormal,
+		State: TransitionStateInProgress, ReportedBy: mkAccountID(t), ReportedAt: t0(),
+	})
+	if err != nil {
+		t.Fatalf("new transition: %v", err)
+	}
+	done, err := tr.Complete(TransitionClosureFacts{AllImpactsAddressed: true, ManualDeploymentConfirmed: true}, t0())
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	if _, err := done.SetTarget(mkAuthorityID(t, '3'), t0()); err == nil {
+		t.Fatalf("expected SetTarget to be refused once externally_completed")
 	}
 }
