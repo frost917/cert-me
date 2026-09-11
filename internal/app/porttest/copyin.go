@@ -210,3 +210,10 @@ func sortSecretKeys(keys []secretKey) {
 		return keys[i].purpose < keys[j].purpose
 	})
 }
+
+// cloneLeafCertificateRecord copies PolicySnapshotJSON, the one exported
+// byte slice on this port-level projection type.
+func cloneLeafCertificateRecord(r port.LeafCertificateRecord) port.LeafCertificateRecord {
+	r.PolicySnapshotJSON = cloneBytes(r.PolicySnapshotJSON)
+	return r
+}

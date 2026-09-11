@@ -172,8 +172,8 @@ Write callback 내부 순서는 인증/권한 확인 → 요청 결과 재확인
 | --- | --- |
 | Setup/Identity | PasswordHasher, TokenCodec |
 | Settings | URLValidator, 현재 TLS 공개 스냅샷 조회 |
-| Authority/Issuance | KeyEngine, CertificateSigner, ProfileValidator |
-| Distribution | TokenCodec, DeliveryEncoder, RuntimeGate |
+| Authority/Issuance | KeyEngine, CertificateSigner, SerialGenerator, ProfileValidator |
+| Distribution | TokenCodec, DeliveryEncoder, PublicCertificateEncoder, OperationalLogger, RuntimeGate |
 | Revocation/Transition | 추가 외부 I/O 없음; app 내부 revocationChanges 공통 함수 |
 | Import | PKIParser, ChainValidator, KeyEngine |
 | CRL | CRLSigner |
@@ -206,7 +206,7 @@ type KeyEngine interface {
     Reencrypt(context.Context, domain.EncryptedSecret, RotationKeys) (domain.EncryptedSecret, error)
 }
 type CertificateSigner interface {
-    Sign(context.Context, domain.IssuancePlan, domain.EncryptedSecret) (domain.Certificate, error)
+    Sign(context.Context, CertificateSigningRequest, domain.EncryptedSecret) (domain.Certificate, error)
 }
 type CRLSigner interface {
     SignCRL(context.Context, CRLSnapshot, domain.EncryptedSecret) (SignedCRL, error)
@@ -356,3 +356,33 @@ ListRecoveryRequired는 단일 인스턴스 재시작의 배타적 복구 경로
 저장소 대역도 실제 port 계약을 따른다. TLS.SetActive는 installation.version을 검사하고 활성 TLS ID와 version을 원자적으로 갱신한다. jobs는 실행 중에도 dedup_key당 한 행을 유지하고 새 요구 병합 시 version을 올리며, 만료된 running lease를 재획득한다. 경합 오류는 SQL과 대역이 공유하는 port 계약으로 식별 가능해야 한다. TLS prepared 값은 다른 패키지의 어댑터와 테스트 대역이 만들 수 있는 opaque handle로 표현하고 Apply에서 소유 installer·유효성을 검사한다. private 입력과 복호화된 다운로드 payload에도 비밀 JSON 거부·로그 redaction·명시적 수명 계약을 적용한다.
 
 계약 완결성 검토에는 로그인 이름 조회·rate-limit 읽기·세션 만료 갱신·reset token 소비 저장, import batch/takeover 저장·조회, PKI의 키 유출 표시·ID 기반 조회도 포함한다. 범용 raw SQL 우회 대신 소비 서비스가 필요한 typed port를 추가한다. 서비스 본체 구현을 B02에 앞당긴다는 뜻은 아니다.
+
+## 14. B03 서비스 계약 확정 사항
+
+PR #3의 질문 번호에 대응한다. 기존 HTTP·수명 정책에서 이미 정한 동작은 그대로 구현하고, 아래 port 보완은 B03 서비스와 대역까지 함께 반영한다. 실제 암호화·SQL·HTTP 어댑터의 구현 단계는 앞당기지 않는다.
+
+1. **수령 실패 폐기:** 전송 실패·수령 만료·잔류 transferring 복구의 기본 reason은 unspecified, source는 cascade로 확정한다. cascade는 시스템 정책에 따른 파생 폐기를 포함한다. 실제 키 유출 신고만 key_compromise를 사용하며, 더 강한 기존 폐기 사유를 낮추지 않는다. 감사 action/failure_code로 transfer_failed·delivery_expired·interrupted_transfer 원인을 구별한다. 새로운 CRL reason이나 DB enum은 추가하지 않는다.
+2. **고정 체인과 저장 관계:** PKIRepository에 GetCAKeyGeneration(id), GetLeafCertificateRecord(certificateID), GetCACertificateRecord(certificateID) 및 해당 subtype 저장 계약을 추가한다. leaf_certificates/ca_certificates의 issuer_ca_certificate_id를 따라 대상 인증서부터 self-signed Root까지 연결하고, 그 당시 경로를 유지한다. 현재 Authority.IssuanceCertificateID나 management_parent로 과거 체인을 대체하지 않는다. subtype은 data-model의 series/key generation/previous certificate/operation/policy snapshot 등 기존 필드를 보존하며 인증서·subtype·계보 변경을 같은 Write에 저장한다. app의 공통 조회 함수가 이 typed port로 chain을 구성한다. 누락·순환·issuer 키 불일치는 인코딩 전에 오류이며 빈 chain으로 성공하지 않는다. 내부 ChainDER는 대상 인증서를 제외한 issuer→Root 순서다. 공개 PEM part=chain은 대상→Root, ZIP의 certificate.pem은 대상, chain.pem은 issuer→Root다.
+3. **공개 인코딩:** PublicCertificateEncoder.Encode(ctx, input) → EncodedBundle을 Distribution에 주입한다. 입력은 대상 Certificate, ChainDER, Format, PEMPart의 공개 자료만 갖고 비밀/복호화 의존성이 없다. PEM은 실제 CERTIFICATE PEM, ZIP은 certificate.pem과 chain.pem으로 인코딩한다. DER를 그대로 보내고 PEM/ZIP이라고 표시하는 구현은 허용하지 않는다. private DeliveryEncoder의 leaf_delivery 목적 제한은 유지한다. 포맷 선택·실패 시 무소비는 서비스 대역으로 검증하고 실제 형식 호환성은 B05에서 검증한다.
+4. **공개 PKCS#12:** api-contract의 기존 규칙대로 거부한다. public은 PEM certificate/chain 또는 공개 ZIP만 허용한다. private는 private_key PEM·키/인증서/체인 ZIP·PKCS#12를 허용한다. 금지 조합은 소비 전에 거부한다. 새 공개 PKCS#12 형식을 설계하지 않는다.
+5. **공개 후처리 오류:** OperationalLogger.Record(event)를 Distribution에 필수 주입한다. typed event에는 정해진 code, request ID, grant/delivery/certificate ID, 처리 단계만 넣고 원문 error·URL·token·개인키·입력 command를 넣지 않는다. Record는 context 취소에 의존하지 않는 best-effort 비차단·비panic 계약이며 업무 성공/실패를 뒤집는 오류를 반환하지 않는다. 공개 후처리 실패를 여기 기록하고 추가 JSON 응답·개인키 폐기는 하지 않는다. 운영 로그는 감사 DB의 대체 성공 기록이 아니다.
+6. **다운로드 감사 scope:** 일반 Leaf 다운로드 이벤트의 scope는 leaf subtype→Series.ManagementAuthorityID 한 개로 저장한다. 상위 관리 Authority를 동일 이벤트의 추가 scope로 복제하지 않는다. 장기 ACL에서 Root 관리자의 하위 감사 접근은 저장된 management_parent 관계에 따른 권한 상속으로 판정한다. 복수 scope는 모든 관련 범위의 권한을 요구하므로 조상을 추가하면 Intermediate 관리자의 자기 범위 조회까지 막게 된다. 현재 MVP도 scope를 비워 저장하지 않는다. 인증서의 역사적 발급 체인은 2번 경로로 별도로 구하고 관리 관계와 혼용하지 않는다. 전환으로 여러 CA가 관련된 작업은 기존 복수 scope 감사 규칙을 적용한다. 성공/실패/복구 감사에서 동일한 관계 기반 scope를 사용하며 caller가 넘긴 AuthorityID를 신뢰하지 않는다.
+7. **시간과 저장 결과:** domain.Instant에 이 문제를 우회하기 위한 범용 JSON marshaller를 추가하지 않는다. HTTP 시간은 전용 mapper의 UTC 문자열, 저장 replay DTO는 명시적인 UTC UnixMicro 필드를 사용한다. nullable 시각은 포인터/null로 보존한다. 저장 DTO는 schema_version=1을 포함하고 알 수 없는 version·손상된 값은 오류로 처리한다. domain 객체의 비공개 필드를 json.Marshal로 저장하지 않는다. 재생 시 인증서 식별자·발급 당시 정책은 유지하되 수령 상태는 현재 저장값으로 조회한다.
+8. **Settings JSON v1:** service_settings.schema_version=1의 settings_json은 OpenAPI Settings에서 version을 제외한 필드명/구조를 사용한다. leaf_validity/root_validity/intermediate_validity는 각각 {value,unit}, 나머지는 service_url, rotate_every, private_delivery_seconds, public_link_seconds, crl_interval_seconds, crl_validity_seconds, audit_retention_days다. 공통 typed codec을 만들어 B03 읽기와 B04 쓰기가 공유한다. 저장 시 기본값을 모두 해석해 완전한 snapshot을 저장한다. 평탄화된 leaf_validity_value/unit은 사용하지 않는다. 알 수 없는 schema version·깨진 JSON·누락/범위 오류를 공장 기본값으로 덮지 않는다. 초기 미설정은 Setup의 명시적 초기화 경로로만 처리하며 운영 발급은 검증된 snapshot을 요구한다. 설정 version이 준비 후 바뀌면 commit 전에 다시 준비하되 이미 성공한 요청 재생에는 현재 기본값을 덮지 않는다.
+9. **서명 CA 키 조회:** Authority.CAKeyGenerationID→GetCAKeyGeneration→KeyMaterialID→ca_signing secret 경로로 명시한다. 선택한 issuance CA 인증서의 CA key generation/key material 일치, 키 파기·유출·인수·issuer 상위 차단 상태를 준비와 commit에서 확인한다. CA 인증서는 issuer DN/확장/유효기간 검증용이며 세대 행 조회를 대신하지 않는다. bootstrap은 별도 허용 intent에서 bootstrap_ca 목적을 사용한다.
+10. **서명 입력:** CertificateSigningRequest는 Plan, CertificateID, KeyMaterialID, SubjectPublicKey, Serial, Kind, CreatedByAccountID, IssuerCertificate, CRLDistributionPoints를 명시한다. IssuerCertificate는 일반 발급에서 선택한 CA 공개 인증서이고 Root 자체 서명에서만 생략 가능하다. SubjectPublicKey는 신규 생성 결과 또는 GetKeyMaterial로 읽은 기존 공개키이며 재사용 갱신에 leaf 개인키를 요구하지 않는다. SerialGenerator.NewSerial(ctx) → domain.SerialNumber를 주입해 서명 전에 serial을 정하고, 기존 정책에 맞는 암호학적 난수 serial을 만든다. signer는 지정된 ID·serial·키·정책에 맞는 domain.Certificate를 반환하며 DER와 해석 필드의 일치를 보장한다. app은 반환 ID/serial/issuer/window/subject/SAN/kind/profile/algorithm이 요청과 일치하는지 검사하고 불일치는 오류로 처리한다. 반환 DER에 관계없는 metadata를 다시 조립해 성공으로 만들지 않는다. B03은 recording signer 대역으로 public key·ID·serial 전달과 불일치 거부를 검사하고 B05는 실제 DER 공개키·서명·확장을 대조한다. serial 충돌만의 재시도는 같은 요청과 키에 새 serial을 사용해 다시 서명한다. TLS 내부 발급에도 같은 입력 계약과 SerialGenerator를 사용한다.
+
+
+### 14.1. B03 후속 질문 확정
+
+- 일반 갱신의 leaf_certificates.operation은 동일 키 재사용이면 renew, 키 교체이면 rekey다. 명시적인 CA 전환 및 긴급 전환 서비스에서는 각각 migrate/emergency를 사용하며, 키 교체 여부만으로 전환 작업의 의미를 덮지 않는다.
+- 운영 Leaf의 CRLDistributionPoints는 검증된 Settings.service_url의 끝 슬래시를 제거한 값에 `/pki/ca-certificates/{issuer_certificate_id}/crl.der`를 붙인 단일 절대 URL이다. 이는 api-contract의 기존 공개 경로이며 `/api/v1`을 삽입하지 않는다. issuer_certificate_id는 이번 서명에 선택한 CA 인증서 ID이며 Leaf 자신의 ID나 Authority ID가 아니다. service_url에 설치 경로가 있으면 보존하고 사용자 정보·query·fragment·빈 host를 허용하지 않는다. 이 URL의 서버 조회는 해당 CA 인증서의 키 세대에 속한 최신 published CRL을 반환한다. 과거 인증서의 URL과 issuer 링크는 CA 인증서 선택 변경 이후에도 유지한다.
+- 최초 발급·갱신·serial 충돌 재서명 모두 같은 준비 snapshot의 CRLDistributionPoints를 signer에 전달한다. 운영 Leaf에서 빈 목록으로 서명하지 않는다. 설정 변경 시 기존 재준비 규칙을 적용하고, B03에서는 recording signer로 URL 및 재시도 시 보존을 검사한다. 실제 X.509 확장 인코딩은 B05에서 검증한다. 자체 서명 Root/bootstrap의 별도 정책에 이 Leaf 규칙을 무조건 적용하지 않는다.
+- 서비스 설정 행이 아직 없는 발급 요청은 conflict(`issuance_settings_not_configured`)로 거부한다. 저장된 설정의 손상·지원하지 않는 schema는 unavailable로 구분하며 기본값으로 복구하지 않는다.
+
+
+### 14.2. 전송 소비와 종료 시각
+
+소비 트랜잭션에서 잠금 획득 후 읽은 시각은 grant/delivery 기한 검사, consumed_at 및 시작 감사에 사용한다. Send가 반환하거나 panic을 회수한 뒤 payload를 정리하고 app Clock.Now()를 다시 읽어 종료 관측 시각을 정한다. 시스템 시계 역행 시 종료 시각은 consumed_at보다 이르지 않도록 둘 중 늦은 값으로 보정한다. 이 값을 Complete/Fail의 finished_at, 결과 감사, 해당 전송 실패로 새로 생성하는 폐기 변경의 revoked_at 및 반환 TransferSummary.FinishedAt에 일관되게 사용한다. 기존 폐기 기록의 시각·사유 병합 규칙은 유지한다.
+
+TransferOutcome.FinishedAt은 sink가 관측한 시각이며 app의 영속 종료 시각을 대체하지 않는다. 오류·panic으로 outcome이 비어 있어도 동일한 app 종료 시각 경로를 사용한다. 후처리 트랜잭션 재시도에는 최초 종료 관측 시각을 보존하며 재시도마다 새 종료 시각을 만들지 않는다. 성공 전송이 소비 후 수령 기한을 넘겼다는 이유만으로 소급 실패 처리하지 않는다. 기한은 소비 가능 여부를 결정하고 전송은 별도 timeout으로 제한한다. 느린 sink와 전진 clock, 실패/panic, 시계 역행을 통해 소비·종료 시각 구분과 결과 일관성을 검증한다.

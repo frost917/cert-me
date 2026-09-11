@@ -251,3 +251,53 @@ func (r pkiRepo) ListAffectedDescendants(_ context.Context, authorityID domain.A
 	sort.Slice(out, func(i, j int) bool { return out[i].ID() < out[j].ID() })
 	return out, nil
 }
+
+// GetCAKeyGeneration returns one stored ca_key_generations row
+// (docs/backend-implementation.md §14.9's required path to a CA signing
+// key).
+func (r pkiRepo) GetCAKeyGeneration(_ context.Context, id domain.CAKeyGenerationID) (port.CAKeyGeneration, error) {
+	generation, ok := r.s.caKeyGenerations[id]
+	if !ok {
+		return port.CAKeyGeneration{}, port.ErrNotFound
+	}
+	return generation, nil
+}
+
+// GetLeafCertificateRecord returns the stored leaf subtype row, the first
+// hop of a chain walk (§14.2).
+func (r pkiRepo) GetLeafCertificateRecord(_ context.Context, certificateID domain.CertificateID) (port.LeafCertificateRecord, error) {
+	record, ok := r.s.leafCertRecords[certificateID]
+	if !ok {
+		return port.LeafCertificateRecord{}, port.ErrNotFound
+	}
+	return cloneLeafCertificateRecord(record), nil
+}
+
+// GetCACertificateRecord returns the stored CA subtype row, each further
+// hop of that walk.
+func (r pkiRepo) GetCACertificateRecord(_ context.Context, certificateID domain.CertificateID) (port.CACertificateRecord, error) {
+	record, ok := r.s.caCertRecords[certificateID]
+	if !ok {
+		return port.CACertificateRecord{}, port.ErrNotFound
+	}
+	return record, nil
+}
+
+// InsertLeafCertificateRecord stores the leaf subtype row. certificate_id is
+// the primary key, so a second row for the same certificate is a duplicate.
+func (r pkiRepo) InsertLeafCertificateRecord(_ context.Context, record port.LeafCertificateRecord) error {
+	if _, ok := r.s.leafCertRecords[record.CertificateID]; ok {
+		return ErrDuplicate
+	}
+	r.s.leafCertRecords[record.CertificateID] = cloneLeafCertificateRecord(record)
+	return nil
+}
+
+// InsertCACertificateRecord stores the CA subtype row, same key rule.
+func (r pkiRepo) InsertCACertificateRecord(_ context.Context, record port.CACertificateRecord) error {
+	if _, ok := r.s.caCertRecords[record.CertificateID]; ok {
+		return ErrDuplicate
+	}
+	r.s.caCertRecords[record.CertificateID] = record
+	return nil
+}

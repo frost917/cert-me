@@ -42,6 +42,45 @@ type SeriesSnapshot struct {
 	CurrentKeyGeneration domain.LeafKeyGeneration
 }
 
+// Certificate issuance operations, the leaf_certificates.operation values
+// docs/data-model.md fixes.
+const (
+	CertificateOperationInitial   = "initial"
+	CertificateOperationRenew     = "renew"
+	CertificateOperationRekey     = "rekey"
+	CertificateOperationMigrate   = "migrate"
+	CertificateOperationEmergency = "emergency"
+	CertificateOperationImport    = "import"
+)
+
+// LeafCertificateRecord is the leaf_certificates subtype row
+// (docs/data-model.md): what a leaf certificate was issued as, and -- the
+// part docs/backend-implementation.md §14.2 turns into a hard requirement --
+// which CA certificate actually signed it. A chain is walked through this
+// stored issuer link, never reconstructed from the authority's current
+// IssuanceCertificateID, so a certificate signed before a CA rotated still
+// resolves to the chain it was issued under.
+type LeafCertificateRecord struct {
+	CertificateID         domain.CertificateID
+	SeriesID              domain.SeriesID
+	LeafKeyGenerationID   domain.LeafKeyGenerationID
+	IssuerCACertificateID domain.CertificateID
+	PreviousCertificateID domain.CertificateID // zero for a series' first certificate
+	Operation             string
+	RenewalCountAtIssue   int
+	PolicySnapshotJSON    []byte
+}
+
+// CACertificateRecord is the ca_certificates subtype row: the certificate
+// that certifies one CA key generation. IssuerCACertificateID is zero for a
+// self-signed Root, which is where a chain walk terminates
+// (docs/data-model.md "self-signed Root는 issuer 인증서 NULL").
+type CACertificateRecord struct {
+	CertificateID         domain.CertificateID
+	CAKeyGenerationID     domain.CAKeyGenerationID
+	IssuerCACertificateID domain.CertificateID // zero for a self-signed Root
+}
+
 // PKIRepository is the storage boundary for authorities, CA key
 // generations, certificates and leaf series
 // (docs/backend-implementation.md §4 table row "PKIRepository").
@@ -212,6 +251,36 @@ type PKIRepository interface {
 	// which certificates on this key are treated as untrustworthy. The safe
 	// direction is therefore the only one implemented.
 	MarkCompromised(ctx context.Context, id domain.KeyMaterialID, compromisedAt domain.Instant) error
+
+	// GetCAKeyGeneration looks up one ca_key_generations row by its id.
+	// docs/backend-implementation.md §14.9 makes this the required path to a
+	// CA's signing key: Authority.CAKeyGenerationID -> this row ->
+	// KeyMaterialID -> the ca_signing secret. Going through the authority's
+	// own certificate instead cannot see the generation's KeyDestroyedAt,
+	// and the CA certificate exists to validate issuer DN, extensions and
+	// validity -- not to stand in for the generation row. It returns
+	// ErrNotFound when id is unknown.
+	GetCAKeyGeneration(ctx context.Context, id domain.CAKeyGenerationID) (CAKeyGeneration, error)
+
+	// GetLeafCertificateRecord returns the leaf_certificates subtype row for
+	// certificateID, whose IssuerCACertificateID is the first hop of the
+	// chain walk §14.2 requires. It returns ErrNotFound when certificateID
+	// is not a leaf certificate.
+	GetLeafCertificateRecord(ctx context.Context, certificateID domain.CertificateID) (LeafCertificateRecord, error)
+
+	// GetCACertificateRecord returns the ca_certificates subtype row for
+	// certificateID, each further hop of that walk. It returns ErrNotFound
+	// when certificateID is not a CA certificate.
+	GetCACertificateRecord(ctx context.Context, certificateID domain.CertificateID) (CACertificateRecord, error)
+
+	// InsertLeafCertificateRecord stores the leaf subtype row in the same
+	// Write as its certificate (§14.2 "인증서·subtype·계보 변경을 같은
+	// Write에 저장한다"). Storing the certificate without it would leave a
+	// certificate whose chain can never be resolved.
+	InsertLeafCertificateRecord(ctx context.Context, record LeafCertificateRecord) error
+
+	// InsertCACertificateRecord stores the CA subtype row, same rule.
+	InsertCACertificateRecord(ctx context.Context, record CACertificateRecord) error
 
 	// ListAffectedDescendants returns every authority whose management
 	// chain descends from authorityID, the set an emergency transition marks

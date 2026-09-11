@@ -95,12 +95,20 @@ type KeyEngine interface {
 	Reencrypt(ctx context.Context, encrypted domain.EncryptedSecret, keys RotationKeys) (domain.EncryptedSecret, error)
 }
 
-// CertificateSigner signs a prepared issuance plan with an already-encrypted
-// CA key (docs/backend-implementation.md §6). The signing adapter checks
-// that caKey's purpose is ca_signing or bootstrap_ca and decrypts it only
-// for the lifetime of this call -- it is never cached across calls.
+// CertificateSigner signs a fully specified certificate request with an
+// already-encrypted CA key (docs/backend-implementation.md §6, §14.10). The
+// signing adapter checks that caKey's purpose is ca_signing or bootstrap_ca
+// and decrypts it only for the lifetime of this call -- it is never cached
+// across calls.
+//
+// The request carries the subject public key, the chosen identifiers and
+// the serial, and the returned domain.Certificate must match them and agree
+// with its own DER (§14.10 "signer는 지정된 ID·serial·키·정책에 맞는
+// domain.Certificate를 반환하며 DER와 해석 필드의 일치를 보장한다"). The
+// caller verifies that agreement rather than re-assembling metadata around
+// whatever came back.
 type CertificateSigner interface {
-	Sign(ctx context.Context, plan domain.IssuancePlan, caKey domain.EncryptedSecret) (domain.Certificate, error)
+	Sign(ctx context.Context, request CertificateSigningRequest, caKey domain.EncryptedSecret) (domain.Certificate, error)
 }
 
 // CRLSnapshot is the point-in-time input a CRL signing call needs, captured
