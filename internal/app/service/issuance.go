@@ -302,6 +302,11 @@ type resolvedSeriesDefaults struct {
 	Validity               domain.CalendarValidity
 	RotateEvery            int
 	PrivateDeliverySeconds int
+	// SettingsVersion is the version of the service_settings row these
+	// defaults were resolved from, kept so the commit can detect that the
+	// snapshot moved since preparation (§14.8 "설정 version이 준비 후
+	// 바뀌면 commit 전에 다시 준비하되").
+	SettingsVersion domain.Version
 }
 
 // resolveSeriesDefaults fills in an omitted validity/rotate_every from the
@@ -348,7 +353,28 @@ func resolveSeriesDefaults(ctx context.Context, tx port.TxStores, validity *cont
 		out.RotateEvery = snap.RotateEvery
 	}
 	out.PrivateDeliverySeconds = snap.PrivateDeliverySeconds
+	out.SettingsVersion = settings.Version
 	return out, nil
+}
+
+// settingsUnchanged reports whether the service_settings row still holds the
+// version a preparation resolved its defaults from. §14.8 requires a
+// preparation built on a superseded snapshot to be redone before it commits;
+// a replayed result is not affected, because replay returns before this is
+// ever reached.
+func settingsUnchanged(ctx context.Context, tx port.TxStores, prepared domain.Version) error {
+	settings, err := tx.Installation().GetSettings(ctx)
+	switch {
+	case errors.Is(err, port.ErrNotFound):
+		return contract.NewAppError(contract.ErrorKindConflict, "issuance_settings_not_configured",
+			"installation settings have not been initialized; complete Setup before issuing certificates")
+	case err != nil:
+		return storeError(err, "issuance_settings_read_failed", "could not read installation settings")
+	}
+	if settings.Version != prepared {
+		return errRePrepare
+	}
+	return nil
 }
 
 // ---- shared signing helper ----
@@ -875,6 +901,13 @@ func (s *IssuanceService) commitIssue(ctx context.Context, tx port.TxStores, met
 	if _, _, err := verifyCASigningKeyLive(ctx, tx, authority); err != nil {
 		return err
 	}
+	// §14.8: the policy this certificate was planned under came from the
+	// settings snapshot read during preparation. If an operator changed
+	// settings in between, the prepared window/rotation no longer reflects
+	// current policy, so the preparation is redone rather than committed.
+	if err := settingsUnchanged(ctx, tx, prep.defaults.SettingsVersion); err != nil {
+		return err
+	}
 	if err := ensureSerialUnused(ctx, tx, prep.plan.IssuerKeyGenerationID, prep.certificate.Serial()); err != nil {
 		return err
 	}
@@ -1076,6 +1109,7 @@ type renewPrepared struct {
 	publicKey         domain.PublicKey
 	generatedSecret   *domain.EncryptedSecret
 	deliverySeconds   int
+	settingsVersion   domain.Version
 	certificate       domain.Certificate
 }
 
@@ -1171,6 +1205,7 @@ func (s *IssuanceService) prepareRenew(ctx context.Context, meta contract.Mutati
 			return err
 		}
 		prep.deliverySeconds = defaults.PrivateDeliverySeconds
+		prep.settingsVersion = defaults.SettingsVersion
 		return nil
 	}); err != nil {
 		return renewPrepared{}, err
@@ -1336,6 +1371,11 @@ func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, met
 	// §14.9: re-verify the CA key generation/certificate consistency inside
 	// the commit as well.
 	if _, _, err := verifyCASigningKeyLive(ctx, tx, targetIssuer); err != nil {
+		return err
+	}
+	// §14.8, same rule as Issue: a renewal planned against a superseded
+	// settings snapshot is redone rather than committed.
+	if err := settingsUnchanged(ctx, tx, prep.settingsVersion); err != nil {
 		return err
 	}
 	if err := ensureSerialUnused(ctx, tx, prep.plan.IssuerKeyGenerationID, prep.certificate.Serial()); err != nil {

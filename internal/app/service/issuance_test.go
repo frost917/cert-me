@@ -1301,3 +1301,87 @@ func TestIssuanceIssueRejectsCorruptSettingsRatherThanDefaulting(t *testing.T) {
 		t.Fatalf("signer was called %d times, want 0 when settings do not decode", f.signer.calls)
 	}
 }
+
+// changeSettings writes a new settings snapshot, advancing the
+// service_settings row's version the way SettingsService would.
+func changeSettings(t *testing.T, store *porttest.Store, mutate func(*SettingsV1)) {
+	t.Helper()
+	if err := store.Write(context.Background(), func(tx port.TxStores) error {
+		current, err := tx.Installation().GetSettings(context.Background())
+		if err != nil {
+			return err
+		}
+		snapshot, err := DecodeSettingsV1(current)
+		if err != nil {
+			return err
+		}
+		mutate(&snapshot)
+		encoded, err := EncodeSettingsV1(snapshot)
+		if err != nil {
+			return err
+		}
+		return tx.Installation().SaveSettings(context.Background(), port.Settings{
+			SchemaVersion: 1,
+			SettingsJSON:  encoded,
+			Version:       current.Version.Next(),
+		}, current.Version)
+	}); err != nil {
+		t.Fatalf("change settings: %v", err)
+	}
+}
+
+// settingsChangingStore advances the settings row once, at the moment the
+// first Write opens -- i.e. after preparation resolved its defaults and
+// before the commit can store anything. That is exactly the race §14.8
+// names: "설정 version이 준비 후 바뀌면 commit 전에 다시 준비하되".
+type settingsChangingStore struct {
+	*porttest.Store
+	t       *testing.T
+	once    bool
+	mutate  func(*SettingsV1)
+	changes int
+}
+
+func (s *settingsChangingStore) Write(ctx context.Context, fn func(port.TxStores) error) error {
+	if !s.once {
+		s.once = true
+		s.changes++
+		changeSettings(s.t, s.Store, s.mutate)
+	}
+	return s.Store.Write(ctx, fn)
+}
+
+// §14.8: a preparation whose settings snapshot was superseded before the
+// commit is redone against the new snapshot, not committed as planned.
+func TestIssuanceIssueRePreparesWhenSettingsChangeBeforeCommit(t *testing.T) {
+	f := newIssuanceFixture(t)
+	racing := &settingsChangingStore{Store: f.store, t: t, mutate: func(s *SettingsV1) {
+		s.RotateEvery = 7
+	}}
+	f.svc.deps.UnitOfWork = racing
+
+	result, err := f.svc.Issue(context.Background(), issueMutationMeta(t, issuanceTestIdempotencyKey), issueCommand(f.authorityID, "web-1"))
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	if racing.changes != 1 {
+		t.Fatalf("settings changed %d times, want exactly 1", racing.changes)
+	}
+	// The stored series must carry the NEW rotation policy: the first
+	// preparation's policy was thrown away, not committed.
+	var series domain.LeafSeries
+	if err := f.store.Read(context.Background(), func(tx port.TxStores) error {
+		snapshot, readErr := tx.PKI().GetSeriesForUpdate(context.Background(), result.SeriesID)
+		series = snapshot.Series
+		return readErr
+	}); err != nil {
+		t.Fatalf("read series: %v", err)
+	}
+	if got := series.Policy().RotateEvery; got != 7 {
+		t.Fatalf("stored rotate_every = %d, want the post-change value 7", got)
+	}
+	// Re-preparation re-signs rather than reusing the stale certificate.
+	if f.signer.calls != 2 {
+		t.Fatalf("signer calls = %d, want 2 (one discarded preparation, one committed)", f.signer.calls)
+	}
+}

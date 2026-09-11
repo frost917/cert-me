@@ -60,93 +60,147 @@ func resolveSigningKey(ctx context.Context, keyEngine port.KeyEngine, ref signin
 	}
 }
 
-// signCertificate signs plan against issuerKey and assembles the final
-// domain.Certificate tied to keyMaterialID.
+// signCertificate signs request and verifies that what came back is what
+// was asked for.
 //
-// Known contract gap (reported to the lead, not guessed around): neither
-// domain.IssuancePlan nor port.CertificateSigner.Sign carries the
-// certificate's own subject public key or storage id, so nothing on this
-// side of the interface can literally tell a signer which SPKI to embed, and
-// the signer has no channel to hand back a caller-chosen CertificateID or
-// KeyMaterialID either. This function therefore trusts the signer's
-// returned domain.Certificate only for the facts that are genuinely its
-// call -- DER and Serial, the cryptographic material and the
-// randomly-chosen serial docs/certificate-lifecycle.md requires ("일련번호는
-// 암호학적 난수로 생성") -- and rebuilds the rest (ID, KeyMaterialID,
-// IssuerCAKeyGenerationID, Validity, Subject, SANs, Profile, KeyAlgorithm)
-// from facts this function already knows to be correct, via
-// domain.NewCertificate. See the B03 report for the exact citation; this is
-// flagged for a domain.IssuancePlan/port.CertificateSigner ruling before B05
-// builds a real adapter against it.
+// docs/backend-implementation.md §14.10 settles what used to be a gap here.
+// The request now carries the subject public key, the chosen identifiers and
+// the serial, and the signer returns a certificate that must agree with
+// them: "app은 반환 ID/serial/issuer/window/subject/SAN/kind/profile/
+// algorithm이 요청과 일치하는지 검사하고 불일치는 오류로 처리한다. 반환
+// DER에 관계없는 metadata를 다시 조립해 성공으로 만들지 않는다." So nothing
+// is rebuilt here -- a mismatch is an error, not something to paper over.
 func signCertificate(
 	ctx context.Context,
 	signer port.CertificateSigner,
-	ids port.IDGenerator,
-	plan domain.IssuancePlan,
+	request port.CertificateSigningRequest,
 	issuerKey domain.EncryptedSecret,
-	keyMaterialID domain.KeyMaterialID,
-	kind domain.CertificateKind,
-	createdBy domain.AccountID,
 ) (domain.Certificate, error) {
-	signed, err := signer.Sign(ctx, plan, issuerKey)
+	signed, err := signer.Sign(ctx, request, issuerKey)
 	if err != nil {
 		return domain.Certificate{}, contract.WrapAppError(contract.ErrorKindUnavailable, "issuance_sign_failed",
 			"could not sign the certificate", err)
 	}
-	certID, err := domain.ParseCertificateID(ids.NewUUID())
-	if err != nil {
-		return domain.Certificate{}, contract.FromDomainError(err)
+	if err := verifySignedCertificate(request, signed); err != nil {
+		return domain.Certificate{}, err
 	}
-	cert, err := domain.NewCertificate(domain.CertificateFacts{
-		ID:                      certID,
-		DER:                     signed.DER(),
-		KeyMaterialID:           keyMaterialID,
-		IssuerCAKeyGenerationID: plan.IssuerKeyGenerationID,
-		Serial:                  signed.Serial(),
-		Validity:                plan.Window,
-		Subject:                 plan.Subject,
-		SANs:                    plan.SANs,
-		Kind:                    kind,
-		Profile:                 plan.Profile,
-		KeyAlgorithm:            plan.KeyAlgorithm,
-		Origin:                  domain.CertificateOriginGenerated,
-		CreatedByAccountID:      createdBy,
-	})
-	if err != nil {
-		return domain.Certificate{}, contract.FromDomainError(err)
+	return signed, nil
+}
+
+// verifySignedCertificate compares every field §14.10 names. A failure is
+// unavailable rather than validation: the request itself was well-formed,
+// the signing adapter misbehaved.
+func verifySignedCertificate(request port.CertificateSigningRequest, signed domain.Certificate) error {
+	mismatch := func(field string) error {
+		return contract.NewAppError(contract.ErrorKindUnavailable, "issuance_signed_certificate_mismatch",
+			"the signer returned a certificate that does not match the request").WithField("field", field)
 	}
-	return cert, nil
+	switch {
+	case signed.ID() != request.CertificateID:
+		return mismatch("certificate_id")
+	case signed.KeyMaterialID() != request.KeyMaterialID:
+		return mismatch("key_material_id")
+	case !signed.Serial().Equal(request.Serial):
+		return mismatch("serial")
+	case signed.IssuerCAKeyGenerationID() != request.Plan.IssuerKeyGenerationID:
+		return mismatch("issuer_ca_key_generation_id")
+	case signed.Kind() != request.Kind:
+		return mismatch("kind")
+	case signed.Profile() != request.Plan.Profile:
+		return mismatch("profile")
+	case signed.KeyAlgorithm() != request.Plan.KeyAlgorithm:
+		return mismatch("key_algorithm")
+	case !sameWindow(signed.Validity(), request.Plan.Window):
+		return mismatch("validity")
+	case !sameSubject(signed.Subject(), request.Plan.Subject):
+		return mismatch("subject")
+	case !sameSANs(signed.SANs(), request.Plan.SANs):
+		return mismatch("sans")
+	case len(signed.DER()) == 0:
+		return mismatch("der")
+	}
+	return nil
+}
+
+func sameWindow(a, b domain.ValidityWindow) bool {
+	return a.NotBefore().Equal(b.NotBefore()) && a.NotAfter().Equal(b.NotAfter())
+}
+
+func sameSubject(a, b domain.Subject) bool {
+	return a.CommonName() == b.CommonName() &&
+		a.Organization() == b.Organization() &&
+		a.OrganizationalUnit() == b.OrganizationalUnit() &&
+		a.Country() == b.Country()
+}
+
+// sameSANs compares order-sensitively: the plan's SAN order is the order the
+// signer was asked to embed, so a reordered result is a different
+// certificate from the one requested, not an equivalent one.
+func sameSANs(a, b []domain.SAN) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Type() != b[i].Type() || a[i].Value() != b[i].Value() {
+			return false
+		}
+	}
+	return true
 }
 
 // prepareCertificate is the common transaction-free signing step
 // docs/backend-implementation.md §5 assigns Authority, Issuance and TLS to
 // share ("인증서 서명 공통 함수는 prepareCertificate(plan, keyRef)로 두고
 // Authority/Issuance/TLS가 사용한다"): resolve a key (generate or reuse),
-// then sign. Internal TLS issuance must call this directly rather than
-// going through IssuanceService (§5 "내부 TLS 발급이 일반 Leaf 발급
-// 서비스를 호출해 delivery를 만든 뒤 삭제하는 방식은 금지한다").
+// mint a serial, then sign and verify. Internal TLS issuance must call this
+// directly rather than going through IssuanceService (§5 "내부 TLS 발급이
+// 일반 Leaf 발급 서비스를 호출해 delivery를 만든 뒤 삭제하는 방식은
+// 금지한다"), and §14.10 requires it to use the same SerialGenerator.
 //
 // A caller that needs a limited number of re-signs after a serial collision
-// (docs/backend-implementation.md §8 "충돌은 같은 요청 ID로 새 serial을
-// 만들어 제한 재준비할 수 있다") should call resolveSigningKey once and
-// signCertificate repeatedly instead of calling this composed helper again,
-// so a collision retry never re-generates an unused second key pair.
+// (§8 "충돌은 같은 요청 ID로 새 serial을 만들어 제한 재준비할 수 있다")
+// should keep the resolved key and call signCertificate again with a new
+// serial, so a collision retry never re-generates an unused second key pair.
 func prepareCertificate(
 	ctx context.Context,
 	keyEngine port.KeyEngine,
 	signer port.CertificateSigner,
-	ids port.IDGenerator,
+	serials port.SerialGenerator,
 	plan domain.IssuancePlan,
 	ref signingKeyRef,
+	existingPublicKey domain.PublicKey,
+	certificateID domain.CertificateID,
+	issuerCertificate domain.Certificate,
 	issuerKey domain.EncryptedSecret,
 	kind domain.CertificateKind,
 	createdBy domain.AccountID,
+	crlDistributionPoints []string,
 ) (preparedCertificate, error) {
 	keyMaterialID, publicKey, generatedSecret, err := resolveSigningKey(ctx, keyEngine, ref)
 	if err != nil {
 		return preparedCertificate{}, err
 	}
-	cert, err := signCertificate(ctx, signer, ids, plan, issuerKey, keyMaterialID, kind, createdBy)
+	subjectPublicKey := publicKey
+	if ref.Fresh == nil {
+		// A reuse renewal certifies the key material's stored public half;
+		// §14.10 is explicit that this never requires the leaf private key.
+		subjectPublicKey = existingPublicKey
+	}
+	serial, err := newSerial(ctx, serials)
+	if err != nil {
+		return preparedCertificate{}, err
+	}
+	cert, err := signCertificate(ctx, signer, port.CertificateSigningRequest{
+		Plan:                  plan,
+		CertificateID:         certificateID,
+		KeyMaterialID:         keyMaterialID,
+		SubjectPublicKey:      subjectPublicKey,
+		Serial:                serial,
+		Kind:                  kind,
+		CreatedByAccountID:    createdBy,
+		IssuerCertificate:     issuerCertificate,
+		CRLDistributionPoints: crlDistributionPoints,
+	}, issuerKey)
 	if err != nil {
 		return preparedCertificate{}, err
 	}
@@ -156,4 +210,19 @@ func prepareCertificate(
 		GeneratedPublic: publicKey,
 		GeneratedSecret: generatedSecret,
 	}, nil
+}
+
+// newSerial mints one cryptographically random serial before signing
+// (§14.10; docs/certificate-lifecycle.md "일련번호는 암호학적 난수로 생성").
+func newSerial(ctx context.Context, serials port.SerialGenerator) (domain.SerialNumber, error) {
+	serial, err := serials.NewSerial(ctx)
+	if err != nil {
+		return domain.SerialNumber{}, contract.WrapAppError(contract.ErrorKindUnavailable, "issuance_serial_generate_failed",
+			"could not generate a certificate serial", err)
+	}
+	if serial.IsZero() {
+		return domain.SerialNumber{}, contract.NewAppError(contract.ErrorKindUnavailable, "issuance_serial_generate_failed",
+			"the serial generator produced an empty serial")
+	}
+	return serial, nil
 }

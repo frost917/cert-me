@@ -116,6 +116,8 @@ type state struct {
 	authorities        map[domain.AuthorityID]domain.Authority
 	certificates       map[domain.CertificateID]domain.Certificate
 	certificatesByDER  map[string]domain.CertificateID
+	leafCertRecords    map[domain.CertificateID]port.LeafCertificateRecord
+	caCertRecords      map[domain.CertificateID]port.CACertificateRecord
 	series             map[domain.SeriesID]domain.LeafSeries
 	leafKeyGenerations map[domain.LeafKeyGenerationID]domain.LeafKeyGeneration
 
@@ -183,6 +185,8 @@ func newState() *state {
 		keyMaterials:        map[domain.KeyMaterialID]port.KeyMaterial{},
 		keyMaterialsBySPKI:  map[string]domain.KeyMaterialID{},
 		caKeyGenerations:    map[domain.CAKeyGenerationID]port.CAKeyGeneration{},
+		leafCertRecords:     map[domain.CertificateID]port.LeafCertificateRecord{},
+		caCertRecords:       map[domain.CertificateID]port.CACertificateRecord{},
 		authorities:         map[domain.AuthorityID]domain.Authority{},
 		certificates:        map[domain.CertificateID]domain.Certificate{},
 		certificatesByDER:   map[string]domain.CertificateID{},
@@ -232,6 +236,8 @@ func (s *state) clone() *state {
 		keyMaterials:            make(map[domain.KeyMaterialID]port.KeyMaterial, len(s.keyMaterials)),
 		keyMaterialsBySPKI:      make(map[string]domain.KeyMaterialID, len(s.keyMaterialsBySPKI)),
 		caKeyGenerations:        make(map[domain.CAKeyGenerationID]port.CAKeyGeneration, len(s.caKeyGenerations)),
+		leafCertRecords:         make(map[domain.CertificateID]port.LeafCertificateRecord, len(s.leafCertRecords)),
+		caCertRecords:           make(map[domain.CertificateID]port.CACertificateRecord, len(s.caCertRecords)),
 		authorities:             make(map[domain.AuthorityID]domain.Authority, len(s.authorities)),
 		certificates:            make(map[domain.CertificateID]domain.Certificate, len(s.certificates)),
 		certificatesByDER:       make(map[string]domain.CertificateID, len(s.certificatesByDER)),
@@ -295,6 +301,12 @@ func (s *state) clone() *state {
 	}
 	for k, v := range s.certificatesByDER {
 		n.certificatesByDER[k] = v
+	}
+	for k, v := range s.leafCertRecords {
+		n.leafCertRecords[k] = cloneLeafCertificateRecord(v)
+	}
+	for k, v := range s.caCertRecords {
+		n.caCertRecords[k] = v
 	}
 	for k, v := range s.series {
 		n.series[k] = v
