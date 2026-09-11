@@ -138,11 +138,16 @@ type PKIRepository interface {
 	// SaveSeries(series, expectedVersion) inside the same renewal Write, both
 	// against the pair GetSeriesForUpdate locked together, so a losing
 	// concurrent renewal is already rejected by the series' own optimistic
-	// lock before this call is reached. GAP: the §4 table's terse
-	// "SaveLeafKeyGeneration/Series/Authority(expectedVersion)" reads as if
-	// expectedVersion applied to all three; it cannot for
-	// LeafKeyGeneration as the domain object stands today. Flagged for the
-	// lead/planning team rather than guessed at.
+	// lock before this call is reached.
+	//
+	// The §4 table's terse "SaveLeafKeyGeneration/Series/Authority(
+	// expectedVersion)" reads as if expectedVersion applied to all three,
+	// which it cannot for LeafKeyGeneration. That was raised as an open
+	// question and the planning team ruled on it: the method stays without a
+	// version, saved in the same Write as the GetSeriesForUpdate lock, the
+	// membership/current-generation re-check and SaveSeries(expectedVersion),
+	// with everything rolled back on conflict; no version column is added
+	// (§13).
 	SaveLeafKeyGeneration(ctx context.Context, generation domain.LeafKeyGeneration) error
 
 	// InsertCertificate stores a freshly signed or imported certificate.

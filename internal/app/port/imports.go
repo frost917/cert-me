@@ -39,12 +39,12 @@ const (
 // a batch is inserted already carrying its terminal outcome rather than
 // updated in place -- the same reasoning PKIRepository.SaveLeafKeyGeneration
 // documents for a stored entity data-model.md gives no version column to.
-// GAP: the SQL CHECK constraint also allows a 'previewed' state, but no doc
-// section describes a service flow that persists a batch before Commit
-// decides committed/failed; this repository only supports the write-once
-// terminal-state flow the docs actually describe, and does not invent an
-// update-in-place path for a 'previewed' row. Flagged for the lead rather
-// than guessed at.
+// The SQL CHECK constraint also allows a 'previewed' state, which this
+// repository deliberately has no write path for. That was raised as an open
+// question and the planning team ruled on it: "Import Preview는 batch를
+// 영속화하지 않으며 write-once 결과 저장을 유지합니다. previewed enum 때문에
+// 새 저장 흐름을 만들지 않습니다" (§13). Preview persists nothing, so there is
+// no update-in-place path to add.
 type ImportBatch struct {
 	ID          domain.ImportBatchID
 	CreatedAt   domain.Instant
