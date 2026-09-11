@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"cert-me/internal/app/contract"
@@ -302,6 +303,9 @@ type resolvedSeriesDefaults struct {
 	Validity               domain.CalendarValidity
 	RotateEvery            int
 	PrivateDeliverySeconds int
+	// ServiceURL is the validated base URL the CRL distribution point is
+	// built from (§14.1).
+	ServiceURL string
 	// SettingsVersion is the version of the service_settings row these
 	// defaults were resolved from, kept so the commit can detect that the
 	// snapshot moved since preparation (§14.8 "설정 version이 준비 후
@@ -353,6 +357,7 @@ func resolveSeriesDefaults(ctx context.Context, tx port.TxStores, validity *cont
 		out.RotateEvery = snap.RotateEvery
 	}
 	out.PrivateDeliverySeconds = snap.PrivateDeliverySeconds
+	out.ServiceURL = snap.ServiceURL
 	out.SettingsVersion = settings.Version
 	return out, nil
 }
@@ -503,24 +508,47 @@ func resignWithNewSerial(
 	createdBy domain.AccountID,
 	issuerCertificate domain.Certificate,
 	issuerKey domain.EncryptedSecret,
+	crlDistributionPoints []string,
 ) (domain.Certificate, error) {
 	serial, err := newSerial(ctx, serials)
 	if err != nil {
 		return domain.Certificate{}, err
 	}
 	return signCertificate(ctx, signer, port.CertificateSigningRequest{
-		Plan:               plan,
-		CertificateID:      certificateID,
-		KeyMaterialID:      keyMaterialID,
-		SubjectPublicKey:   subjectPublicKey,
-		Serial:             serial,
-		Kind:               kind,
-		CreatedByAccountID: createdBy,
-		IssuerCertificate:  issuerCertificate,
-		// §14: CRL distribution point URL construction is not specified by
-		// any doc this developer's scope covers (flagged for the lead).
-		CRLDistributionPoints: nil,
+		Plan:                  plan,
+		CertificateID:         certificateID,
+		KeyMaterialID:         keyMaterialID,
+		SubjectPublicKey:      subjectPublicKey,
+		Serial:                serial,
+		Kind:                  kind,
+		CreatedByAccountID:    createdBy,
+		IssuerCertificate:     issuerCertificate,
+		CRLDistributionPoints: crlDistributionPoints,
 	}, issuerKey)
+}
+
+// leafCRLDistributionPoints builds the single absolute CRL URL an operational
+// leaf is signed with, exactly as §14.1 fixes it: the validated
+// Settings.service_url with its trailing slash removed, plus
+// "/pki/ca-certificates/{issuer_certificate_id}/crl.der". No "/api/v1" is
+// inserted -- this is the public path api-contract.md already defines -- and
+// the id is the CA certificate chosen for THIS signature, never the leaf's
+// own id or an authority id. An installation path in service_url is
+// preserved.
+//
+// §14.1 also forbids signing an operational leaf with an empty list, so a
+// service_url that cannot produce a URL is an error rather than an omission.
+func leafCRLDistributionPoints(serviceURL string, issuerCertificateID domain.CertificateID) ([]string, error) {
+	base := strings.TrimRight(strings.TrimSpace(serviceURL), "/")
+	if base == "" {
+		return nil, contract.NewAppError(contract.ErrorKindUnavailable, "issuance_crl_url_unavailable",
+			"installation settings carry no service URL to build a CRL distribution point from")
+	}
+	if issuerCertificateID == "" {
+		return nil, contract.NewAppError(contract.ErrorKindUnavailable, "issuance_crl_url_unavailable",
+			"no issuing CA certificate was selected to build a CRL distribution point from")
+	}
+	return []string{base + "/pki/ca-certificates/" + string(issuerCertificateID) + "/crl.der"}, nil
 }
 
 // storeFreshKeyAndDelivery persists a freshly generated key's ciphertext and
@@ -671,7 +699,8 @@ func (s *IssuanceService) Issue(ctx context.Context, meta contract.MutationMeta,
 		return contract.IssuanceView{}, contract.WrapAppError(contract.ErrorKindUnavailable, "request_canceled",
 			"the request was canceled before it completed", err)
 	}
-	if found, err := s.replayBeforePreparation(ctx, reqKey, inputHash, &result); err != nil {
+	if found, err := s.replayBeforePreparation(ctx, reqKey, inputHash, meta.Principal, s.deps.Clock.Now(),
+		s.authorizeIssue(meta.Principal, authorityID), &result); err != nil {
 		return contract.IssuanceView{}, err
 	} else if found {
 		return result, nil
@@ -712,14 +741,41 @@ func (s *IssuanceService) Issue(ctx context.Context, meta contract.MutationMeta,
 // replayBeforePreparation is the read-only probe that keeps a duplicate
 // request from paying for a key generation and a signature at all. §8's rule
 // is that a stored successful result is replayed before the expected-version
-// check; running that lookup here as well -- outside the transaction, after
-// authorization -- means a retried request short-circuits before the
-// expensive preparation §6 guards with an admission semaphore. It is not the
-// authoritative check: commitIssue/commitRenew run ReplayStoredResult again
-// inside the Write, which is the one that decides.
-func (s *IssuanceService) replayBeforePreparation(ctx context.Context, reqKey port.OperationRequestKey, inputHash string, result *contract.IssuanceView) (bool, error) {
+// check; running that lookup here as well -- outside the transaction --
+// means a retried request short-circuits before the expensive preparation §6
+// guards with an admission semaphore.
+//
+// It authenticates and authorizes FIRST. §8 is explicit that a principal
+// without current permission does not get the stored result either ("현재
+// 인증/권한이 없는 요청은 기존 결과도 받지 못한다"), and an early replay that
+// skipped those checks would be a way around them -- which is exactly what
+// it was before this ordering was fixed: a Renew replay returned the stored
+// result without ever reaching the Authorizer, because Renew authorizes
+// inside prepareRenew, which the probe returns ahead of.
+//
+// authorize is a callback rather than a scope value because Renew's scope
+// comes from the series row, which only this transaction can read.
+//
+// It is not the authoritative check: commitIssue/commitRenew run the same
+// authentication, authorization and replay again inside the Write, which is
+// the one that decides.
+func (s *IssuanceService) replayBeforePreparation(
+	ctx context.Context,
+	reqKey port.OperationRequestKey,
+	inputHash string,
+	principal contract.Principal,
+	now domain.Instant,
+	authorize func(context.Context, port.TxStores) error,
+	result *contract.IssuanceView,
+) (bool, error) {
 	var found bool
 	err := s.deps.ReadStore.Read(ctx, func(tx port.TxStores) error {
+		if err := requireCurrentAuth(ctx, tx, principal, now); err != nil {
+			return err
+		}
+		if err := authorize(ctx, tx); err != nil {
+			return err
+		}
 		stored, ok, err := ReplayStoredResult(ctx, tx, reqKey, inputHash)
 		if err != nil || !ok {
 			return err
@@ -728,15 +784,41 @@ func (s *IssuanceService) replayBeforePreparation(ctx context.Context, reqKey po
 		if err != nil {
 			return err
 		}
-		v, err := view.toView(ctx, tx)
+		projected, err := view.toView(ctx, tx)
 		if err != nil {
 			return err
 		}
-		*result = v
+		*result = projected
 		found = true
 		return nil
 	})
 	return found, err
+}
+
+// authorizeIssue is Issue's scope callback: the authority named by the
+// command, which needs no store read of its own.
+func (s *IssuanceService) authorizeIssue(principal contract.Principal, authorityID domain.AuthorityID) func(context.Context, port.TxStores) error {
+	return func(ctx context.Context, _ port.TxStores) error {
+		return s.deps.Authorizer.Authorize(ctx, principal, port.ActionIssuanceIssue, port.NewAuthorizationScope(authorityID))
+	}
+}
+
+// authorizeRenew is Renew's scope callback. The scope is the series' own
+// management authority, which has to be read from the store -- a
+// client-supplied id is never trusted for a scope
+// (docs/backend-implementation.md §2).
+func (s *IssuanceService) authorizeRenew(principal contract.Principal, seriesID domain.SeriesID) func(context.Context, port.TxStores) error {
+	return func(ctx context.Context, tx port.TxStores) error {
+		snapshot, err := tx.PKI().GetSeriesForUpdate(ctx, seriesID)
+		if errors.Is(err, port.ErrNotFound) {
+			return contract.NewAppError(contract.ErrorKindValidation, "series_not_found", "series does not exist").
+				WithField("series_id", string(seriesID))
+		} else if err != nil {
+			return storeError(err, "issuance_series_read_failed", "could not read the series")
+		}
+		return s.deps.Authorizer.Authorize(ctx, principal, port.ActionIssuanceRenew,
+			port.NewAuthorizationScope(snapshot.Series.ManagementAuthorityID()))
+	}
 }
 
 // issuePrepared is everything Issue builds before opening its Write: the
@@ -753,7 +835,12 @@ type issuePrepared struct {
 	keyMaterialID     domain.KeyMaterialID
 	publicKey         domain.PublicKey
 	generatedSecret   *domain.EncryptedSecret
-	certificate       domain.Certificate
+	// crlDistributionPoints is resolved once per preparation and carried
+	// through a collision re-sign unchanged (§14.1 "최초 발급·갱신·serial
+	// 충돌 재서명 모두 같은 준비 snapshot의 CRLDistributionPoints를 signer에
+	// 전달한다").
+	crlDistributionPoints []string
+	certificate           domain.Certificate
 }
 
 // prepareIssue performs §8's out-of-transaction preparation. Its reads go
@@ -795,6 +882,11 @@ func (s *IssuanceService) prepareIssue(ctx context.Context, meta contract.Mutati
 		}
 		issuerSecret = secret
 		prep.issuerCertificate = issuerCert
+		points, err := leafCRLDistributionPoints(prep.defaults.ServiceURL, issuerCert.ID())
+		if err != nil {
+			return err
+		}
+		prep.crlDistributionPoints = points
 		return nil
 	}); err != nil {
 		return issuePrepared{}, err
@@ -825,7 +917,7 @@ func (s *IssuanceService) prepareIssue(ctx context.Context, meta contract.Mutati
 	if reuse != nil {
 		prep.keyMaterialID, prep.publicKey, prep.generatedSecret = reuse.keyMaterialID, reuse.publicKey, reuse.generatedSecret
 		cert, err := resignWithNewSerial(ctx, s.deps.CertificateSigner, s.deps.SerialGenerator, plan, certificateID,
-			prep.keyMaterialID, prep.publicKey, domain.CertificateKindLeaf, meta.Principal.AccountID(), prep.issuerCertificate, issuerSecret)
+			prep.keyMaterialID, prep.publicKey, domain.CertificateKindLeaf, meta.Principal.AccountID(), prep.issuerCertificate, issuerSecret, prep.crlDistributionPoints)
 		if err != nil {
 			return issuePrepared{}, err
 		}
@@ -839,7 +931,7 @@ func (s *IssuanceService) prepareIssue(ctx context.Context, meta contract.Mutati
 	}
 	ref := signingKeyRef{Fresh: &port.KeySpec{KeyMaterialID: newKeyMaterialID, Algorithm: req.KeyAlgorithm, Purpose: domain.SecretPurposeLeafDelivery}}
 	prepared, err := prepareCertificate(ctx, s.deps.KeyEngine, s.deps.CertificateSigner, s.deps.SerialGenerator, plan, ref,
-		domain.PublicKey{}, certificateID, prep.issuerCertificate, issuerSecret, domain.CertificateKindLeaf, meta.Principal.AccountID(), nil)
+		domain.PublicKey{}, certificateID, prep.issuerCertificate, issuerSecret, domain.CertificateKindLeaf, meta.Principal.AccountID(), prep.crlDistributionPoints)
 	if err != nil {
 		return issuePrepared{}, err
 	}
@@ -855,6 +947,11 @@ func (s *IssuanceService) prepareIssue(ctx context.Context, meta contract.Mutati
 // the stores, the request result and the audit row.
 func (s *IssuanceService) commitIssue(ctx context.Context, tx port.TxStores, meta contract.MutationMeta, cmd contract.IssuanceIssueCommand, reqKey port.OperationRequestKey, inputHash string, prep issuePrepared, result *contract.IssuanceView) error {
 	authorityID := cmd.AuthorityID
+	// §2/§4: the current account state, auth epoch and session are re-checked
+	// under lock, before authorization and before any replay.
+	if err := requireCurrentAuth(ctx, tx, meta.Principal, prep.now); err != nil {
+		return err
+	}
 	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionIssuanceIssue, port.NewAuthorizationScope(authorityID)); err != nil {
 		return err
 	}
@@ -1061,7 +1158,8 @@ func (s *IssuanceService) Renew(ctx context.Context, meta contract.MutationMeta,
 		return contract.IssuanceView{}, contract.WrapAppError(contract.ErrorKindUnavailable, "request_canceled",
 			"the request was canceled before it completed", err)
 	}
-	if found, err := s.replayBeforePreparation(ctx, reqKey, inputHash, &result); err != nil {
+	if found, err := s.replayBeforePreparation(ctx, reqKey, inputHash, meta.Principal, s.deps.Clock.Now(),
+		s.authorizeRenew(meta.Principal, seriesID), &result); err != nil {
 		return contract.IssuanceView{}, err
 	} else if found {
 		return result, nil
@@ -1110,6 +1208,11 @@ type renewPrepared struct {
 	generatedSecret   *domain.EncryptedSecret
 	deliverySeconds   int
 	settingsVersion   domain.Version
+	// crlDistributionPoints, same rule as Issue's (§14.1).
+	crlDistributionPoints []string
+	// sourceCertificate is the certificate being renewed, kept so the
+	// commit can re-check its revocation state under lock.
+	sourceCertificate domain.Certificate
 	certificate       domain.Certificate
 }
 
@@ -1127,6 +1230,7 @@ func (s *IssuanceService) prepareRenew(ctx context.Context, meta contract.Mutati
 		issuerCert       domain.Certificate
 		currentPublicKey domain.PublicKey
 		revoked          bool
+		keyCompromised   bool
 	)
 	if err := s.deps.ReadStore.Read(ctx, func(tx port.TxStores) error {
 		snapshot, err := tx.PKI().GetSeriesForUpdate(ctx, seriesID)
@@ -1170,6 +1274,12 @@ func (s *IssuanceService) prepareRenew(ctx context.Context, meta contract.Mutati
 			return storeError(err, "issuance_key_material_read_failed", "could not read the current key material")
 		}
 		currentPublicKey = currentKeyMaterial.PublicKey
+		// A key reported compromised is never reused by an ordinary renewal
+		// (docs/certificate-lifecycle.md "개인키 유출 | 같은 키를 사용하는
+		// 유효 인증서 모두 폐기, 새 키·인증서 발급"). Reading the public half
+		// without looking at CompromisedAt would have renewed straight onto a
+		// leaked key.
+		keyCompromised = !currentKeyMaterial.CompromisedAt.IsZero()
 
 		// A revoked or compromise-impacted key is never renewed on the
 		// ordinary path (certificate-lifecycle.md "폐기되었거나 유출 영향이
@@ -1205,6 +1315,11 @@ func (s *IssuanceService) prepareRenew(ctx context.Context, meta contract.Mutati
 			return err
 		}
 		prep.deliverySeconds = defaults.PrivateDeliverySeconds
+		points, err := leafCRLDistributionPoints(defaults.ServiceURL, issuerCACert.ID())
+		if err != nil {
+			return err
+		}
+		prep.crlDistributionPoints = points
 		prep.settingsVersion = defaults.SettingsVersion
 		return nil
 	}); err != nil {
@@ -1224,7 +1339,7 @@ func (s *IssuanceService) prepareRenew(ctx context.Context, meta contract.Mutati
 		return renewPrepared{}, contract.FromDomainError(err)
 	}
 
-	keyReady := !revoked && prep.snapshot.CurrentKeyGeneration.Custody() == domain.KeyCustodyClientHeld
+	keyReady := !revoked && !keyCompromised && prep.snapshot.CurrentKeyGeneration.Custody() == domain.KeyCustodyClientHeld
 	renewalPlan, err := prep.snapshot.Series.PlanRenewal(domain.RenewalFacts{
 		CurrentGeneration:   prep.snapshot.CurrentKeyGeneration,
 		TargetIssuerID:      prep.targetAuthorityID,
@@ -1237,6 +1352,7 @@ func (s *IssuanceService) prepareRenew(ctx context.Context, meta contract.Mutati
 	if err != nil {
 		return renewPrepared{}, contract.FromDomainError(err)
 	}
+	prep.sourceCertificate = currentCert
 	prep.renewalPlan = renewalPlan
 	prep.keyRotated = renewalPlan.Action == domain.RenewalActionRotateKey
 	prep.targetIssuerKeyID = targetIssuer.KeyGenerationID()
@@ -1263,7 +1379,7 @@ func (s *IssuanceService) prepareRenew(ctx context.Context, meta contract.Mutati
 		// 재시도는 같은 요청과 키에 새 serial을 사용해 다시 서명한다").
 		prep.keyMaterialID, prep.publicKey, prep.generatedSecret = reuse.keyMaterialID, reuse.publicKey, reuse.generatedSecret
 		cert, err := resignWithNewSerial(ctx, s.deps.CertificateSigner, s.deps.SerialGenerator, prep.plan, certificateID,
-			prep.keyMaterialID, prep.publicKey, domain.CertificateKindLeaf, meta.Principal.AccountID(), prep.issuerCertificate, issuerSecret)
+			prep.keyMaterialID, prep.publicKey, domain.CertificateKindLeaf, meta.Principal.AccountID(), prep.issuerCertificate, issuerSecret, prep.crlDistributionPoints)
 		if err != nil {
 			return renewPrepared{}, err
 		}
@@ -1290,7 +1406,7 @@ func (s *IssuanceService) prepareRenew(ctx context.Context, meta contract.Mutati
 		existingPublicKey = currentPublicKey
 	}
 	prepared, err := prepareCertificate(ctx, s.deps.KeyEngine, s.deps.CertificateSigner, s.deps.SerialGenerator, prep.plan, ref,
-		existingPublicKey, certificateID, prep.issuerCertificate, issuerSecret, domain.CertificateKindLeaf, meta.Principal.AccountID(), nil)
+		existingPublicKey, certificateID, prep.issuerCertificate, issuerSecret, domain.CertificateKindLeaf, meta.Principal.AccountID(), prep.crlDistributionPoints)
 	if err != nil {
 		return renewPrepared{}, err
 	}
@@ -1309,6 +1425,40 @@ func (s *IssuanceService) prepareRenew(ctx context.Context, meta contract.Mutati
 	return prep, nil
 }
 
+// ensureKeyStillRenewable re-reads the two facts a reuse renewal depends on
+// that no version token covers: the key material's compromise flag and the
+// source certificate's revocation state.
+//
+// Either one is terminal for the ordinary renewal path, not a reason to
+// prepare again: domain.LeafSeries.PlanRenewal refuses outright when the
+// current key is not eligible ("current key is not eligible for a normal
+// renewal"), so a second preparation could only reach the same conclusion
+// after burning another signature. A leaked or revoked key is reissued
+// through the emergency path, which always rotates -- not by quietly turning
+// this request into a rotation the operator did not ask for.
+func ensureKeyStillRenewable(ctx context.Context, tx port.TxStores, prep renewPrepared) error {
+	material, err := tx.PKI().GetKeyMaterial(ctx, prep.snapshot.CurrentKeyGeneration.KeyMaterialID())
+	if err != nil {
+		return storeError(err, "issuance_key_material_read_failed", "could not read the current key material")
+	}
+	if !material.CompromisedAt.IsZero() {
+		return contract.NewAppError(contract.ErrorKindForbidden, "issuance_key_compromised",
+			"the current key was reported compromised and cannot be renewed on the ordinary path")
+	}
+	_, err = tx.Revocations().FindForUpdate(ctx,
+		prep.sourceCertificate.IssuerCAKeyGenerationID(), prep.sourceCertificate.Serial())
+	switch {
+	case err == nil:
+		return contract.NewAppError(contract.ErrorKindForbidden, "issuance_source_certificate_revoked",
+			"the certificate being renewed was revoked and cannot be renewed on the ordinary path")
+	case errors.Is(err, port.ErrNotFound):
+		return nil
+	default:
+		return storeError(err, "issuance_revocation_read_failed",
+			"could not check the current certificate's revocation state")
+	}
+}
+
 // commitRenew is Renew's single Write, in §4's fixed order.
 func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, meta contract.MutationMeta, cmd contract.IssuanceRenewCommand, reqKey port.OperationRequestKey, inputHash string, expectedVersion domain.Version, prep renewPrepared, result *contract.IssuanceView) error {
 	snapshot, err := tx.PKI().GetSeriesForUpdate(ctx, cmd.SeriesID)
@@ -1319,6 +1469,9 @@ func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, met
 		return storeError(err, "issuance_series_read_failed", "could not read the series")
 	}
 
+	if err := requireCurrentAuth(ctx, tx, meta.Principal, prep.now); err != nil {
+		return err
+	}
 	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionIssuanceRenew, port.NewAuthorizationScope(snapshot.Series.ManagementAuthorityID())); err != nil {
 		return err
 	}
@@ -1373,6 +1526,21 @@ func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, met
 	if _, _, err := verifyCASigningKeyLive(ctx, tx, targetIssuer); err != nil {
 		return err
 	}
+	// An ordinary renewal must not reuse a key that was reported
+	// compromised, or the key of a certificate that was revoked, between
+	// preparation and this commit. Preparation checked both, but neither is
+	// covered by the series version: a MarkCompromised or a revocation
+	// insert leaves leaf_series untouched, so the optimistic lock cannot
+	// catch it. Re-checking here is what makes
+	// docs/certificate-lifecycle.md's "폐기되었거나 유출 영향이 있는
+	// 인증서의 기존 키를 일반 갱신 경로로 재사용하지 않는다" hold under a
+	// race, not only under a quiet store.
+	if !prep.keyRotated {
+		if err := ensureKeyStillRenewable(ctx, tx, prep); err != nil {
+			return err
+		}
+	}
+
 	// §14.8, same rule as Issue: a renewal planned against a superseded
 	// settings snapshot is redone rather than committed.
 	if err := settingsUnchanged(ctx, tx, prep.settingsVersion); err != nil {

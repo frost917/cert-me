@@ -440,6 +440,7 @@ func newIssuanceFixtureWithCAOptions(t *testing.T, caOpts caSeedOptions) *issuan
 	ids := &seqIDs{}
 	authorityID := seedIssuableIntermediateWithOptions(t, store, ids, testNow(), caOpts)
 	seedDefaultSettings(t, store)
+	seedAdminSessionForIssuance(t, store)
 
 	keyEngine := &fakeKeyEngine{}
 	signer := &fakeSigner{}
@@ -1252,6 +1253,7 @@ func TestIssuanceIssueRejectsWhenSettingsAreNotConfigured(t *testing.T) {
 	authorityID := seedIssuableIntermediate(t, store, ids, testNow())
 	// Deliberately do NOT seed settings.
 
+	seedAdminSessionForIssuance(t, store)
 	svc, err := NewIssuanceService(IssuanceDeps{
 		CommonDeps: CommonDeps{
 			UnitOfWork: store, ReadStore: store, Authorizer: &toggleAuthorizer{allow: true},
@@ -1383,5 +1385,56 @@ func TestIssuanceIssueRePreparesWhenSettingsChangeBeforeCommit(t *testing.T) {
 	// Re-preparation re-signs rather than reusing the stale certificate.
 	if f.signer.calls != 2 {
 		t.Fatalf("signer calls = %d, want 2 (one discarded preparation, one committed)", f.signer.calls)
+	}
+}
+
+// seedAdminSessionForIssuance stores the account and session
+// issuanceAdminPrincipal names. Issue/Renew re-check the current account
+// state, auth epoch and session under lock before replaying or committing
+// anything (docs/backend-implementation.md §2), so a fixture without these
+// rows is not an authenticated caller at all.
+func seedAdminSessionForIssuance(t *testing.T, store *porttest.Store) {
+	t.Helper()
+	hash, err := domain.NewPasswordHash("$argon2id$v=19$m=65536,t=3,p=1$c2FsdA$aGFzaA")
+	if err != nil {
+		t.Fatalf("password hash: %v", err)
+	}
+	account, err := domain.NewAccount(domain.AccountFacts{
+		ID:                  issuanceTestAdminAccountID,
+		NormalizedLoginName: "admin",
+		PasswordHash:        hash,
+		State:               domain.AccountStateActive,
+		AuthEpoch:           domain.AuthEpoch(1),
+		IsGlobalAdmin:       true,
+	})
+	if err != nil {
+		t.Fatalf("account: %v", err)
+	}
+	digest, err := domain.ParseFingerprint("11111111111111111111111111111111111111111111111111111111111111ab")
+	if err != nil {
+		t.Fatalf("fingerprint: %v", err)
+	}
+	tokenHash, err := domain.NewTokenHash(digest)
+	if err != nil {
+		t.Fatalf("token hash: %v", err)
+	}
+	session, err := domain.NewSessionState(domain.SessionStateFacts{
+		ID:                issuanceTestSessionID,
+		AccountID:         issuanceTestAdminAccountID,
+		TokenHash:         tokenHash,
+		AuthEpoch:         domain.AuthEpoch(1),
+		LastSeenAt:        testNow(),
+		AbsoluteExpiresAt: testNow().Add(domain.NewDuration(24 * time.Hour)),
+	})
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	if err := store.Write(context.Background(), func(tx port.TxStores) error {
+		if err := tx.Accounts().InsertAccount(context.Background(), account); err != nil {
+			return err
+		}
+		return tx.Accounts().InsertSession(context.Background(), session)
+	}); err != nil {
+		t.Fatalf("seed admin session: %v", err)
 	}
 }
