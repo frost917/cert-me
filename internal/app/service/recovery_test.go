@@ -16,6 +16,43 @@ func recoveryService(t *testing.T, store *porttest.Store) *DistributionService {
 	return newDistributionService(t, distDeps(t, store, store, okEncoder("payload"), &fakeRuntimeGate{}))
 }
 
+// TestRecoverInterruptedTransfers_FailureCodeIsInterruptedTransfer pins the
+// literal §14.1 name, not just the recoveryFailureCode constant against
+// itself: "감사 action/failure_code로 transfer_failed·delivery_expired·
+// interrupted_transfer 원인을 구별한다." Before this fix the constant was
+// "restart_recovery", which this exact literal comparison would have caught
+// failing.
+func TestRecoverInterruptedTransfers_FailureCodeIsInterruptedTransfer(t *testing.T) {
+	fx := seedPrivateFixture(t, distTestNow().Add(domain.NewDuration(time.Hour)), domain.DeliveryStateTransferring)
+	seedCRLStateFor(t, fx.store, fx.issuerID)
+
+	if _, err := recoveryService(t, fx.store).RecoverInterruptedTransfers(context.Background()); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if got := storedDelivery(t, fx.store, fx.deliverID).FailureCode(); got != "interrupted_transfer" {
+		t.Fatalf("failure code = %q, want %q", got, "interrupted_transfer")
+	}
+}
+
+// TestRecoverInterruptedTransfers_AuditScopeIsManagementAuthority is §14.6
+// applied to recovery: the revocation audit applyRevocations appends for an
+// interrupted transfer must be scoped to the certificate's stored
+// management authority, never empty and never the cryptographic issuer.
+// Before the fix, recovery.go built its RevocationChange with no
+// AuthorityID at all, so this scope was always empty.
+func TestRecoverInterruptedTransfers_AuditScopeIsManagementAuthority(t *testing.T) {
+	fx := seedPrivateFixture(t, distTestNow().Add(domain.NewDuration(time.Hour)), domain.DeliveryStateTransferring)
+	seedCRLStateFor(t, fx.store, fx.issuerID)
+	capture := &auditScopeCapture{}
+	wrapped := &scopeCapturingStore{inner: fx.store, capture: capture}
+	svc := newDistributionService(t, distDeps(t, wrapped, wrapped, okEncoder("payload"), &fakeRuntimeGate{}))
+
+	if _, err := svc.RecoverInterruptedTransfers(context.Background()); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	assertAllScopesAreManagementAuthority(t, capture, fx.managementAuthorityID, fx.issuerID)
+}
+
 func storedDelivery(t *testing.T, store *porttest.Store, id domain.DeliveryID) domain.Delivery {
 	t.Helper()
 	var found domain.Delivery

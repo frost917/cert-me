@@ -5,12 +5,8 @@
 package service
 
 import (
-	"archive/zip"
-	"bytes"
 	"context"
-	"encoding/pem"
 	"errors"
-	"fmt"
 	"time"
 
 	"cert-me/internal/app/contract"
@@ -45,12 +41,16 @@ var errPayloadReaderClosed = errors.New("service: download payload reader is clo
 
 // DistributionDeps is DistributionService's dependency set
 // (docs/backend-implementation.md §5 table row "Distribution: TokenCodec,
-// DeliveryEncoder, RuntimeGate").
+// DeliveryEncoder, PublicCertificateEncoder, OperationalLogger,
+// RuntimeGate" -- the §14 ruling that settled the two dependencies this row
+// used to lack).
 type DistributionDeps struct {
 	CommonDeps
-	TokenCodec      port.TokenCodec
-	DeliveryEncoder port.DeliveryEncoder
-	RuntimeGate     port.RuntimeGate
+	TokenCodec               port.TokenCodec
+	DeliveryEncoder          port.DeliveryEncoder
+	PublicCertificateEncoder port.PublicCertificateEncoder
+	OperationalLogger        port.OperationalLogger
+	RuntimeGate              port.RuntimeGate
 }
 
 // Validate reports the first missing dependency, common or Distribution-
@@ -63,6 +63,8 @@ func (d DistributionDeps) Validate() error {
 	return firstMissing(
 		required{"TokenCodec", d.TokenCodec == nil},
 		required{"DeliveryEncoder", d.DeliveryEncoder == nil},
+		required{"PublicCertificateEncoder", d.PublicCertificateEncoder == nil},
+		required{"OperationalLogger", d.OperationalLogger == nil},
 		required{"RuntimeGate", d.RuntimeGate == nil},
 	)
 }
@@ -136,24 +138,39 @@ type preparedDelivery struct {
 	filename    string
 }
 
+// validatePublicFormat rejects the format/PEMPart combinations §14.4/§14.3
+// forbid for a public (no private key) download, before anything is
+// consumed. docs/api-contract.md:119 "public 토큰은 PEM certificate/chain
+// 또는 공개 ZIP만 허용한다" -- a public PKCS#12 is not a narrower version of
+// the private one, it is undefined, so this refuses it rather than
+// inventing a key-less container shape (§14.4: "새 공개 PKCS#12 형식을
+// 설계하지 않는다"). private_key is rejected the same way a public grant can
+// never yield key material regardless of format.
+func validatePublicFormat(format port.DeliveryFormat, pemPart contract.DownloadPart) error {
+	if format == port.DeliveryFormatPKCS12 {
+		return contract.NewAppError(contract.ErrorKindValidation, "public_pkcs12_undefined",
+			"pkcs12 is not defined for a public certificate download")
+	}
+	if pemPart == contract.DownloadPartPrivateKey {
+		return contract.NewAppError(contract.ErrorKindValidation,
+			"public_download_no_private_key", "a public download cannot include the private key")
+	}
+	return nil
+}
+
 // prepare performs §7 steps 1-2: read the grant/certificate/delivery/
-// ciphertext (outside any Write, as preparation input only -- ReadStore's
-// own contract is that a read never authorizes a commit) and have the
-// payload encoder complete the in-memory bundle. An encoding failure here
-// never touches the store, so it cannot consume anything
-// (docs/backend-implementation.md §11 B03 acceptance: "인코딩 실패 시
-// 소비 0회").
+// ciphertext/chain (outside any Write, as preparation input only --
+// ReadStore's own contract is that a read never authorizes a commit) and
+// have the payload encoder complete the in-memory bundle. An encoding or
+// chain-resolution failure here never touches the store, so it cannot
+// consume anything (docs/backend-implementation.md §11 B03 acceptance:
+// "인코딩 실패 시 소비 0회"; §14.2 "누락·순환·issuer 키 불일치는 인코딩
+// 전에 오류이며 빈 chain으로 성공하지 않는다").
 //
-// KNOWN GAP (flagged for the lead, not guessed around): building a real
-// certificate chain for ChainDER would require resolving the certificate's
-// IssuerCAKeyGenerationID back to the Authority (or ca_certificates row)
-// that signed it, so the chain can be walked up to the root. Neither
-// port.PKIRepository nor any other Distribution dependency exposes that
-// lookup (there is no GetAuthorityByKeyGeneration, no CA-certificate-by-
-// key-generation read -- see internal/app/port/pki.go). ChainDER is
-// therefore always empty below. This is not a product-behavior guess; it is
-// the direct consequence of a port surface this file is not allowed to
-// extend (out of this assignment's file scope).
+// The chain is always resolved, for both purposes and every format/PEMPart
+// choice: §14.2 requires a valid stored issuer chain to exist before any
+// encoding happens, not only when the caller's chosen part/format would
+// actually surface it.
 func (s *DistributionService) prepare(ctx context.Context, cmd contract.DownloadCommand, format port.DeliveryFormat, now domain.Instant) (preparedDelivery, error) {
 	tokenHash, err := s.deps.TokenCodec.Hash(ctx, cmd.RawToken)
 	if err != nil {
@@ -165,6 +182,7 @@ func (s *DistributionService) prepare(ctx context.Context, cmd contract.Download
 		grant       domain.DownloadGrant
 		certificate domain.Certificate
 		leafSecret  domain.EncryptedSecret
+		chainDER    [][]byte
 	)
 	readErr := s.deps.ReadStore.Read(ctx, func(tx port.TxStores) error {
 		g, err := tx.Delivery().GetGrantForUpdate(ctx, tokenHash)
@@ -187,8 +205,22 @@ func (s *DistributionService) prepare(ctx context.Context, cmd contract.Download
 		grant = g
 		certificate = cert
 
+		// §14.2: the stored issuer chain must resolve before any encoding
+		// happens, regardless of purpose/format/PEMPart, and a resolution
+		// failure here is unavailable rather than validation -- the client
+		// asked for a legitimate download and the stored relations simply do
+		// not resolve. buildChainDER is the one common function every chain
+		// consumer (this file, and the CA-certificate download routes B03
+		// does not implement yet) must go through (§14.2 "app의 공통 조회
+		// 함수가 이 typed port로 chain을 구성한다").
+		chain, err := buildChainDER(ctx, tx, cert.ID())
+		if err != nil {
+			return err
+		}
+		chainDER = chain
+
 		if g.Purpose() != domain.GrantPurposeLeafPrivate {
-			return nil
+			return validatePublicFormat(format, cmd.PEMPart)
 		}
 
 		// docs/api-contract.md: "private 토큰으로 공개 자료만 받는 조합은
@@ -234,25 +266,25 @@ func (s *DistributionService) prepare(ctx context.Context, cmd contract.Download
 	if grant.Purpose() == domain.GrantPurposeLeafPrivate {
 		bundle, encErr = s.deps.DeliveryEncoder.Encode(ctx, port.DeliveryEncodeInput{
 			Certificate:    certificate,
-			ChainDER:       nil, // see the gap noted in this function's doc comment
+			ChainDER:       chainDER,
 			LeafSecret:     leafSecret,
 			Format:         format,
 			PEMPart:        string(cmd.PEMPart),
 			PKCS12Password: cmd.PKCS12Password,
 		})
 	} else {
-		// ASSUMPTION (flagged for the lead): port.DeliveryEncoder's own doc
-		// comment scopes it to "leaf_delivery 암호문만 허용" -- it exists to
-		// turn an *encrypted private key* into a client bundle, and its
-		// DeliveryEncodeInput.LeafSecret field is not optional. A public
-		// download carries no private key at all, and §5 lists no second,
-		// public-only encoder dependency for Distribution. So the public
-		// payload is built directly here, from data that is already public
-		// (the certificate DER); no decryption or DeliveryEncoder round trip
-		// is involved. If this reading is wrong, the fix is a new documented
-		// dependency, not a change to how this function calls the existing
-		// one.
-		bundle, encErr = encodePublicBundle(certificate, nil, format, string(cmd.PEMPart))
+		// §14.3: the public path never touches a decryption dependency --
+		// port.PublicCertificateEncoder's input carries only public material
+		// (the target certificate, its issuer chain, format/PEMPart), and
+		// the encoder itself decides where the target goes for each format
+		// (PEM part=chain is target→Root; ZIP splits certificate.pem/
+		// chain.pem). This file no longer builds PEM/ZIP bytes itself.
+		bundle, encErr = s.deps.PublicCertificateEncoder.Encode(ctx, port.PublicEncodeInput{
+			Certificate: certificate,
+			ChainDER:    chainDER,
+			Format:      format,
+			PEMPart:     string(cmd.PEMPart),
+		})
 	}
 	if encErr != nil {
 		return preparedDelivery{}, encErr
@@ -268,75 +300,6 @@ func (s *DistributionService) prepare(ctx context.Context, cmd contract.Download
 	}, nil
 }
 
-// encodePublicBundle builds the public (no private key) leaf download
-// payload directly, since no port encoder is scoped to this case -- see
-// prepare's doc comment. chainDER is always empty today (the same gap noted
-// there); pemPart selects which PEM blocks go in for the pem format.
-func encodePublicBundle(cert domain.Certificate, chainDER [][]byte, format port.DeliveryFormat, pemPart string) (port.EncodedBundle, error) {
-	if pemPart == string(contract.DownloadPartPrivateKey) {
-		return port.EncodedBundle{}, contract.NewAppError(contract.ErrorKindValidation,
-			"public_download_no_private_key", "a public download cannot include the private key")
-	}
-	switch format {
-	case port.DeliveryFormatPEM:
-		var buf bytes.Buffer
-		if pemPart == "" || pemPart == string(contract.DownloadPartCertificate) {
-			if err := pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: cert.DER()}); err != nil {
-				return port.EncodedBundle{}, contract.WrapAppError(contract.ErrorKindValidation, "public_bundle_encode_failed", "could not encode the certificate", err)
-			}
-		}
-		if pemPart == "" || pemPart == string(contract.DownloadPartChain) {
-			for _, der := range chainDER {
-				if err := pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
-					return port.EncodedBundle{}, contract.WrapAppError(contract.ErrorKindValidation, "public_bundle_encode_failed", "could not encode the certificate chain", err)
-				}
-			}
-		}
-		return port.NewEncodedBundle(buf.Bytes(), "application/x-pem-file"), nil
-	case port.DeliveryFormatZIP:
-		return encodePublicZIP(cert, chainDER)
-	case port.DeliveryFormatPKCS12:
-		// ASSUMPTION (flagged for the lead): a PKCS#12 container is normally
-		// used to carry a private key alongside its certificate. No document
-		// defines what a "public, key-less pkcs12" download should contain,
-		// so this refuses it rather than inventing a shape.
-		return port.EncodedBundle{}, contract.NewAppError(contract.ErrorKindValidation,
-			"public_pkcs12_undefined", "pkcs12 is not defined for a public certificate download")
-	default:
-		return port.EncodedBundle{}, contract.NewAppError(contract.ErrorKindValidation, "download_format_invalid", "unsupported download format")
-	}
-}
-
-// encodePublicZIP archives the public certificate (and any chain entries)
-// as sibling PEM files, matching the safe-fixed-filename policy inside the
-// archive too.
-func encodePublicZIP(cert domain.Certificate, chainDER [][]byte) (port.EncodedBundle, error) {
-	var buf bytes.Buffer
-	zw := zip.NewWriter(&buf)
-
-	writePEM := func(name string, der []byte) error {
-		w, err := zw.Create(name)
-		if err != nil {
-			return err
-		}
-		return pem.Encode(w, &pem.Block{Type: "CERTIFICATE", Bytes: der})
-	}
-	if err := writePEM("certificate.pem", cert.DER()); err != nil {
-		_ = zw.Close()
-		return port.EncodedBundle{}, contract.WrapAppError(contract.ErrorKindValidation, "public_bundle_encode_failed", "could not encode the certificate", err)
-	}
-	for i, der := range chainDER {
-		if err := writePEM(fmt.Sprintf("chain-%d.pem", i+1), der); err != nil {
-			_ = zw.Close()
-			return port.EncodedBundle{}, contract.WrapAppError(contract.ErrorKindValidation, "public_bundle_encode_failed", "could not encode the certificate chain", err)
-		}
-	}
-	if err := zw.Close(); err != nil {
-		return port.EncodedBundle{}, contract.WrapAppError(contract.ErrorKindValidation, "public_bundle_encode_failed", "could not finish the certificate archive", err)
-	}
-	return port.NewEncodedBundle(buf.Bytes(), "application/zip"), nil
-}
-
 // consumedTransfer is what commitConsumption's Write produces: the grant and
 // (for a private transfer) the delivery, both as they now read after being
 // consumed in that commit. Only a Write that actually reaches its Store
@@ -349,12 +312,47 @@ type consumedTransfer struct {
 	delivery domain.Delivery // zero value for a public transfer
 }
 
-// appendDistributionAudit records one Deliver-related audit event. Scope is
-// intentionally nil: resolving the owning Authority from a leaf certificate
-// requires the same certificate-to-issuer walk prepare's doc comment flags
-// as missing from PKIRepository, so this event is not scoped to any
-// authority today. Flagged for the lead alongside the chain-building gap.
-func appendDistributionAudit(ctx context.Context, tx port.TxStores, ids port.IDGenerator, now domain.Instant, meta contract.RequestMeta, action string, grantID domain.GrantID, result contract.AuditResult) error {
+// distributionManagementAuthority resolves the management authority a
+// download/delivery/recovery event is scoped to (§14.6): leaf_certificates
+// -> SeriesID -> LeafSeries.ManagementAuthorityID, both read from stored
+// relations under this same transaction. This is deliberately NOT the
+// certificate's cryptographic issuance chain buildChainDER walks (§14.2) --
+// "인증서의 역사적 발급 체인은 2번 경로로 별도로 구하고 관리 관계와 혼용하지
+// 않는다" -- and it never trusts a caller-supplied AuthorityID. Every audit
+// call in this file and in recovery.go goes through this one function so a
+// download's audit scope and the RevocationChange.AuthorityID a failed
+// transfer or recovery hands to applyRevocations cannot drift apart.
+//
+// A missing leaf record or series row is an error, never a silently empty
+// scope (§14.6 "현재 MVP도 scope를 비워 저장하지 않는다").
+func distributionManagementAuthority(ctx context.Context, tx port.TxStores, certificateID domain.CertificateID) (domain.AuthorityID, error) {
+	leaf, err := tx.PKI().GetLeafCertificateRecord(ctx, certificateID)
+	if err != nil {
+		if errors.Is(err, port.ErrNotFound) {
+			return "", contract.NewAppError(contract.ErrorKindUnavailable, "distribution_scope_leaf_record_missing",
+				"this certificate has no stored issuance record to scope the audit to").WithField("certificate_id", string(certificateID))
+		}
+		return "", storeError(err, "distribution_scope_leaf_record_read_failed", "could not read the certificate's issuance record")
+	}
+	snapshot, err := tx.PKI().GetSeriesForUpdate(ctx, leaf.SeriesID)
+	if err != nil {
+		if errors.Is(err, port.ErrNotFound) {
+			return "", contract.NewAppError(contract.ErrorKindUnavailable, "distribution_scope_series_missing",
+				"this certificate's series record is missing").WithField("certificate_id", string(certificateID))
+		}
+		return "", storeError(err, "distribution_scope_series_read_failed", "could not read the certificate's series")
+	}
+	authorityID := snapshot.Series.ManagementAuthorityID()
+	if authorityID == "" {
+		return "", contract.NewAppError(contract.ErrorKindUnavailable, "distribution_scope_empty",
+			"could not resolve a management authority for this certificate").WithField("certificate_id", string(certificateID))
+	}
+	return authorityID, nil
+}
+
+// appendDistributionAudit records one Deliver-related audit event, scoped to
+// the certificate's management authority (§14.6).
+func appendDistributionAudit(ctx context.Context, tx port.TxStores, ids port.IDGenerator, now domain.Instant, meta contract.RequestMeta, action string, grantID domain.GrantID, result contract.AuditResult, scope domain.AuthorityID) error {
 	event := port.AuditEvent{
 		ID:         ids.NewUUID(),
 		OccurredAt: now,
@@ -368,7 +366,7 @@ func appendDistributionAudit(ctx context.Context, tx port.TxStores, ids port.IDG
 		Result:     result,
 		Details:    contract.AuditDetails{SchemaVersion: 1},
 	}
-	if err := tx.Audit().Append(ctx, event, nil); err != nil {
+	if err := tx.Audit().Append(ctx, event, []domain.AuthorityID{scope}); err != nil {
 		return storeError(err, "distribution_audit_failed", "could not record the download audit event")
 	}
 	return nil
@@ -409,6 +407,11 @@ func (s *DistributionService) commitConsumption(ctx context.Context, meta contra
 			return contract.NewAppError(contract.ErrorKindConflict, "download_grant_changed", "the download link changed since it was read")
 		}
 
+		scope, err := distributionManagementAuthority(ctx, tx, prep.certificate.ID())
+		if err != nil {
+			return err
+		}
+
 		if grant.Purpose() != domain.GrantPurposeLeafPrivate {
 			consumedGrant, err := grant.Consume(now)
 			if err != nil {
@@ -417,7 +420,7 @@ func (s *DistributionService) commitConsumption(ctx context.Context, meta contra
 			if err := tx.Delivery().SaveGrant(ctx, consumedGrant, grant.Version()); err != nil {
 				return storeError(err, "download_grant_save_failed", "could not consume the download link")
 			}
-			if err := appendDistributionAudit(ctx, tx, s.deps.IDs, now, meta, "distribution.deliver.public.start", consumedGrant.ID(), contract.AuditResultSuccess); err != nil {
+			if err := appendDistributionAudit(ctx, tx, s.deps.IDs, now, meta, "distribution.deliver.public.start", consumedGrant.ID(), contract.AuditResultSuccess, scope); err != nil {
 				return err
 			}
 			result = consumedTransfer{grant: consumedGrant}
@@ -454,7 +457,7 @@ func (s *DistributionService) commitConsumption(ctx context.Context, meta contra
 		if err := tx.Delivery().InvalidatePrivateGrants(ctx, consumedDelivery.ID(), now); err != nil {
 			return storeError(err, "delivery_grant_invalidate_failed", "could not invalidate remaining private links")
 		}
-		if err := appendDistributionAudit(ctx, tx, s.deps.IDs, now, meta, "distribution.deliver.private.start", consumedGrant.ID(), contract.AuditResultSuccess); err != nil {
+		if err := appendDistributionAudit(ctx, tx, s.deps.IDs, now, meta, "distribution.deliver.private.start", consumedGrant.ID(), contract.AuditResultSuccess, scope); err != nil {
 			return err
 		}
 		result = consumedTransfer{grant: consumedGrant, delivery: consumedDelivery}

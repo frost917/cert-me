@@ -122,15 +122,36 @@ func (s *DistributionService) sendAndRecord(ctx context.Context, meta contract.R
 		}
 	} else if result.failed() {
 		// §7 step 5/§12: "public 후처리 실패는 키 폐기를 만들지 않고 정제된
-		// 오류를 운영 로그에 남긴다." Distribution has no Logger dependency
-		// (§5 lists none for it), so there is nothing further to route this
-		// to; the error is deliberately swallowed here rather than
-		// escalated to FailClosed or turned into the method's returned
-		// error, matching "키 폐기를 만들지 않는다" -- a public failure to
-		// audit must not become a private-grade incident. Flagged for the
-		// lead: this is a gap (no logging sink), not a decision that the
-		// error should vanish silently forever.
-		_ = s.recordPublicFailureAudit(postCtx, meta, consumed, now)
+		// 오류를 운영 로그에 남긴다." §14.5 gives this a home:
+		// OperationalLogger.Record, with only the fixed code/request id/
+		// stage/ids -- never the raw sendErr, a URL, a token or key material.
+		// A public failure must never become a private-grade incident (no
+		// FailClosed, no key revocation), and the operational log is not a
+		// substitute for the audit DB ("운영 로그는 감사 DB의 대체 성공
+		// 기록이 아니다"), so recordPublicFailureAudit below still runs
+		// regardless of what Record does. Record itself is best-effort/
+		// non-blocking/non-panicking by its own contract and returns
+		// nothing, so there is no error path to fold in here.
+		code := "distribution_public_send_failed"
+		if result.panicked {
+			code = "distribution_public_send_panicked"
+		}
+		if auditErr := s.recordPublicFailureAudit(postCtx, meta, prep, consumed, now); auditErr != nil {
+			// The business audit row itself could not be written. This is
+			// exactly the "public 후처리 오류" §14.5 requires a home for --
+			// recorded here rather than silently dropped as the old `_ =`
+			// discard did, but still never escalated to FailClosed or
+			// folded into Deliver's own returned error (a public transfer's
+			// audit failure is not a private-grade incident).
+			code = "distribution_public_postprocess_audit_failed"
+		}
+		s.deps.OperationalLogger.Record(port.OperationalEvent{
+			Code:          code,
+			RequestID:     meta.RequestID,
+			Stage:         port.OperationalStagePublicPostProcess,
+			GrantID:       consumed.grant.ID(),
+			CertificateID: prep.certificate.ID(),
+		})
 	}
 
 	if result.panicked {
@@ -166,6 +187,10 @@ func (s *DistributionService) recordPrivateOutcome(ctx context.Context, meta con
 		if err != nil {
 			return storeError(err, "delivery_read_failed", "could not read the delivery record")
 		}
+		scope, err := distributionManagementAuthority(ctx, tx, prep.certificate.ID())
+		if err != nil {
+			return err
+		}
 
 		if !result.failed() {
 			completed, err := delivery.Complete(now)
@@ -175,9 +200,14 @@ func (s *DistributionService) recordPrivateOutcome(ctx context.Context, meta con
 			if err := tx.Delivery().SaveDelivery(ctx, completed, delivery.Version()); err != nil {
 				return storeError(err, "delivery_save_failed", "could not record the delivery completion")
 			}
-			return appendDistributionAudit(ctx, tx, s.deps.IDs, now, meta, "distribution.deliver.private.completed", consumed.grant.ID(), contract.AuditResultSuccess)
+			return appendDistributionAudit(ctx, tx, s.deps.IDs, now, meta, "distribution.deliver.private.completed", consumed.grant.ID(), contract.AuditResultSuccess, scope)
 		}
 
+		// §14.1 settled failure_code naming: a live send failure is recorded
+		// as transfer_failed (transfer_panic distinguishes the panic case,
+		// which is not one of the three §14.1 names but is not a new CRL
+		// reason or DB enum either -- delivery.failure_code is a free-form
+		// operator-facing string).
 		code := "transfer_failed"
 		if result.panicked {
 			code = "transfer_panic"
@@ -190,18 +220,15 @@ func (s *DistributionService) recordPrivateOutcome(ctx context.Context, meta con
 			return storeError(err, "delivery_save_failed", "could not record the delivery failure")
 		}
 
-		// ASSUMPTION (flagged for the lead): no RevocationReason value maps
-		// cleanly onto "we failed to hand the key over" -- the fixed set
-		// (key_compromise, ca_compromise, affiliation_changed, superseded,
-		// cessation_of_operation, privilege_withdrawn, aa_compromise, or
-		// unspecified) has no "delivery failed" member, and no document
-		// states which of these a delivery-failure revocation should carry.
-		// unspecified is used as the conservative default. Likewise no
-		// RevocationSource value (manual/import/cascade) is defined for "the
-		// system revoked this on its own because the transfer failed";
-		// cascade is used as the closest existing meaning (a system-derived
-		// consequence of another event, not a direct admin action or an
-		// imported CRL entry). Both picks need the lead's confirmation.
+		// §14.1 settles reason=unspecified/source=cascade for a delivery
+		// failure's derived revocation: "전송 실패·수령 만료·잔류
+		// transferring 복구의 기본 reason은 unspecified, source는 cascade로
+		// 확정한다." Merge (internal/domain/revocation.go) never lets an
+		// incoming assertion downgrade a stronger existing reason -- a
+		// conflicting reason/time leaves the existing record untouched and
+		// only flags NeedsReview -- so an unspecified/cascade assertion here
+		// can never weaken an earlier key_compromise revocation on the same
+		// (issuer, serial).
 		change := RevocationChange{
 			IssuerID:      prep.certificate.IssuerCAKeyGenerationID(),
 			Serial:        prep.certificate.Serial(),
@@ -209,6 +236,7 @@ func (s *DistributionService) recordPrivateOutcome(ctx context.Context, meta con
 			RevokedAt:     now,
 			Reason:        domain.RevocationReasonUnspecified,
 			Source:        domain.RevocationSourceCascade,
+			AuthorityID:   scope,
 		}
 		revMeta := RevocationMeta{
 			Request:   meta,
@@ -228,16 +256,20 @@ func (s *DistributionService) recordPrivateOutcome(ctx context.Context, meta con
 		if _, err := applyRevocations(ctx, tx, []RevocationChange{change}, revMeta); err != nil {
 			return err
 		}
-		return appendDistributionAudit(ctx, tx, s.deps.IDs, now, meta, "distribution.deliver.private.failed", consumed.grant.ID(), contract.AuditResultFailure)
+		return appendDistributionAudit(ctx, tx, s.deps.IDs, now, meta, "distribution.deliver.private.failed", consumed.grant.ID(), contract.AuditResultFailure, scope)
 	})
 }
 
 // recordPublicFailureAudit is the public half of §7 step 5: a public
 // transfer failure gets an audit row and nothing else (no revocation, no CRL
-// job). Its own failure is swallowed by the caller -- see sendAndRecord's
-// comment on why.
-func (s *DistributionService) recordPublicFailureAudit(ctx context.Context, meta contract.RequestMeta, consumed consumedTransfer, now domain.Instant) error {
+// job). Its own failure is now surfaced to the caller (sendAndRecord routes
+// it into the §14.5 OperationalLogger call) instead of being swallowed.
+func (s *DistributionService) recordPublicFailureAudit(ctx context.Context, meta contract.RequestMeta, prep preparedDelivery, consumed consumedTransfer, now domain.Instant) error {
 	return s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
-		return appendDistributionAudit(ctx, tx, s.deps.IDs, now, meta, "distribution.deliver.public.failed", consumed.grant.ID(), contract.AuditResultFailure)
+		scope, err := distributionManagementAuthority(ctx, tx, prep.certificate.ID())
+		if err != nil {
+			return err
+		}
+		return appendDistributionAudit(ctx, tx, s.deps.IDs, now, meta, "distribution.deliver.public.failed", consumed.grant.ID(), contract.AuditResultFailure, scope)
 	})
 }

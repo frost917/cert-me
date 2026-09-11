@@ -54,12 +54,17 @@ func tokenHashFor(raw string) domain.TokenHash {
 type fakeDeliveryEncoder struct {
 	mu    sync.Mutex
 	calls int
-	fn    func(port.DeliveryEncodeInput) (port.EncodedBundle, error)
+	// inputs records every call's input, so a test can inspect what this
+	// package actually handed the encoder (e.g. ChainDER's order per §14.2)
+	// without needing a second, purpose-built double.
+	inputs []port.DeliveryEncodeInput
+	fn     func(port.DeliveryEncodeInput) (port.EncodedBundle, error)
 }
 
 func (f *fakeDeliveryEncoder) Encode(_ context.Context, in port.DeliveryEncodeInput) (port.EncodedBundle, error) {
 	f.mu.Lock()
 	f.calls++
+	f.inputs = append(f.inputs, in)
 	f.mu.Unlock()
 	return f.fn(in)
 }
@@ -68,6 +73,12 @@ func (f *fakeDeliveryEncoder) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls
+}
+
+func (f *fakeDeliveryEncoder) lastInput() port.DeliveryEncodeInput {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.inputs[len(f.inputs)-1]
 }
 
 func okEncoder(payload string) *fakeDeliveryEncoder {
@@ -234,6 +245,33 @@ func distIssuerID(t *testing.T, n int) domain.CAKeyGenerationID {
 	return id
 }
 
+func distSeriesID(t *testing.T, n int) domain.SeriesID {
+	t.Helper()
+	id, err := domain.ParseSeriesID(distID36('9', n))
+	if err != nil {
+		t.Fatalf("series id: %v", err)
+	}
+	return id
+}
+
+func distManagementAuthorityID(t *testing.T, n int) domain.AuthorityID {
+	t.Helper()
+	id, err := domain.ParseAuthorityID(distID36('8', n))
+	if err != nil {
+		t.Fatalf("authority id: %v", err)
+	}
+	return id
+}
+
+func distCACertID(t *testing.T, n int) domain.CertificateID {
+	t.Helper()
+	id, err := domain.ParseCertificateID(distID36('7', n))
+	if err != nil {
+		t.Fatalf("ca certificate id: %v", err)
+	}
+	return id
+}
+
 func distDeliveryID(t *testing.T, n int) domain.DeliveryID {
 	t.Helper()
 	id, err := domain.ParseDeliveryID(distID36('4', n))
@@ -367,6 +405,88 @@ func distDelivery(t *testing.T, n int, leafKeyGenN int, certID domain.Certificat
 	return d
 }
 
+func distSeries(t *testing.T, n int, managementAuthorityID domain.AuthorityID) domain.LeafSeries {
+	t.Helper()
+	validity, err := domain.NewCalendarValidity(1, domain.ValidityUnitYears)
+	if err != nil {
+		t.Fatalf("calendar validity: %v", err)
+	}
+	series, err := domain.NewLeafSeries(domain.LeafSeriesFacts{
+		ID:                    distSeriesID(t, n),
+		Name:                  "svc.example.internal",
+		Purpose:               domain.SeriesPurposeDistributed,
+		ManagementAuthorityID: managementAuthorityID,
+		Policy: domain.SeriesPolicy{
+			RotateEvery:         3,
+			CertificateValidity: validity,
+		},
+		Version: 1,
+	})
+	if err != nil {
+		t.Fatalf("new series: %v", err)
+	}
+	return series
+}
+
+// distRootCACert builds the self-signed Root CA certificate a leaf fixture's
+// stored issuer chain (§14.2) terminates at: its own CAKeyGenerationID
+// signs it (self-signed), and it carries no issuer certificate of its own.
+func distRootCACert(t *testing.T, n int, caKeyGenID domain.CAKeyGenerationID) domain.Certificate {
+	t.Helper()
+	cert, err := domain.NewCertificate(domain.CertificateFacts{
+		ID:                      distCACertID(t, n),
+		DER:                     []byte{0xCA, 0xCA, 0xCA, byte(n)},
+		KeyMaterialID:           distKeyMaterialID(t, 900+n),
+		IssuerCAKeyGenerationID: caKeyGenID, // self-signed: it names its own generation
+		Serial:                  distSerial(t, fmt.Sprintf("c%d", n)),
+		Validity:                distValidity(t),
+		Subject:                 distSubject(t),
+		Kind:                    domain.CertificateKindCA,
+		KeyAlgorithm:            domain.KeyAlgorithmECDSAP256,
+		Origin:                  domain.CertificateOriginGenerated,
+		Version:                 1,
+	})
+	if err != nil {
+		t.Fatalf("new ca certificate: %v", err)
+	}
+	return cert
+}
+
+// seedChainAndScope stores everything buildChainDER (§14.2) and
+// distributionManagementAuthority (§14.6) need for one leaf certificate: a
+// one-level stored issuer chain terminating at a self-signed Root, and a
+// leaf series recording the management authority. n selects distinct
+// deterministic ids so private/public fixtures do not collide.
+func seedChainAndScope(t *testing.T, store *porttest.Store, n int, certID domain.CertificateID, caKeyGenID domain.CAKeyGenerationID, managementAuthorityID domain.AuthorityID) domain.SeriesID {
+	t.Helper()
+	series := distSeries(t, n, managementAuthorityID)
+	caCert := distRootCACert(t, n, caKeyGenID)
+
+	if err := store.Write(context.Background(), func(tx port.TxStores) error {
+		if err := tx.PKI().InsertSeries(context.Background(), series); err != nil {
+			return err
+		}
+		if err := tx.PKI().InsertCertificate(context.Background(), caCert); err != nil {
+			return err
+		}
+		if err := tx.PKI().InsertCACertificateRecord(context.Background(), port.CACertificateRecord{
+			CertificateID:     caCert.ID(),
+			CAKeyGenerationID: caKeyGenID,
+		}); err != nil {
+			return err
+		}
+		return tx.PKI().InsertLeafCertificateRecord(context.Background(), port.LeafCertificateRecord{
+			CertificateID:         certID,
+			SeriesID:              series.ID(),
+			IssuerCACertificateID: caCert.ID(),
+			Operation:             port.CertificateOperationInitial,
+		})
+	}); err != nil {
+		t.Fatalf("seed chain and scope: %v", err)
+	}
+	return series.ID()
+}
+
 func seedCRLStateFor(t *testing.T, store *porttest.Store, issuer domain.CAKeyGenerationID) {
 	t.Helper()
 	state, err := domain.NewCRLState(domain.CRLStateFacts{
@@ -386,13 +506,15 @@ func seedCRLStateFor(t *testing.T, store *porttest.Store, issuer domain.CAKeyGen
 // distFixture bundles a seeded store plus the raw token/expected ids a test
 // needs to build a DownloadCommand and make assertions.
 type distFixture struct {
-	store     *porttest.Store
-	certID    domain.CertificateID
-	keyMatID  domain.KeyMaterialID
-	issuerID  domain.CAKeyGenerationID
-	deliverID domain.DeliveryID
-	grantID   domain.GrantID
-	rawToken  string
+	store                 *porttest.Store
+	certID                domain.CertificateID
+	keyMatID              domain.KeyMaterialID
+	issuerID              domain.CAKeyGenerationID
+	deliverID             domain.DeliveryID
+	grantID               domain.GrantID
+	rawToken              string
+	seriesID              domain.SeriesID
+	managementAuthorityID domain.AuthorityID
 }
 
 const privateRawToken = "private-fixture-raw-token-0123456789ABCDEF"
@@ -434,10 +556,13 @@ func seedPrivateFixture(t *testing.T, expiresAt domain.Instant, deliveryState do
 	}); err != nil {
 		t.Fatalf("seed private fixture: %v", err)
 	}
+	managementAuthorityID := distManagementAuthorityID(t, 1)
+	seriesID := seedChainAndScope(t, store, 1, cert.ID(), cert.IssuerCAKeyGenerationID(), managementAuthorityID)
 
 	return distFixture{
 		store: store, certID: cert.ID(), keyMatID: cert.KeyMaterialID(), issuerID: cert.IssuerCAKeyGenerationID(),
 		deliverID: delivery.ID(), grantID: grant.ID(), rawToken: privateRawToken,
+		seriesID: seriesID, managementAuthorityID: managementAuthorityID,
 	}
 }
 
@@ -455,10 +580,13 @@ func seedPublicFixture(t *testing.T, expiresAt domain.Instant) distFixture {
 	}); err != nil {
 		t.Fatalf("seed public fixture: %v", err)
 	}
+	managementAuthorityID := distManagementAuthorityID(t, 2)
+	seriesID := seedChainAndScope(t, store, 2, cert.ID(), cert.IssuerCAKeyGenerationID(), managementAuthorityID)
 
 	return distFixture{
 		store: store, certID: cert.ID(), keyMatID: cert.KeyMaterialID(), issuerID: cert.IssuerCAKeyGenerationID(),
 		grantID: grant.ID(), rawToken: publicRawToken,
+		seriesID: seriesID, managementAuthorityID: managementAuthorityID,
 	}
 }
 
@@ -472,10 +600,144 @@ func distDeps(t *testing.T, uow port.UnitOfWork, readStore port.ReadStore, encod
 			Clock:      fixedClock{now: distTestNow()},
 			IDs:        &seqIDs{},
 		},
-		TokenCodec:      fakeTokenCodec{},
-		DeliveryEncoder: encoder,
-		RuntimeGate:     gate,
+		TokenCodec:               fakeTokenCodec{},
+		DeliveryEncoder:          encoder,
+		PublicCertificateEncoder: okPublicEncoder("public-payload"),
+		OperationalLogger:        &fakeOperationalLogger{},
+		RuntimeGate:              gate,
 	}
+}
+
+// fakePublicCertificateEncoder is PublicCertificateEncoder's test double: it
+// records every call's input (so a test can assert the ChainDER order §14.2
+// requires) and returns whatever fn produces.
+type fakePublicCertificateEncoder struct {
+	mu    sync.Mutex
+	calls []port.PublicEncodeInput
+	fn    func(port.PublicEncodeInput) (port.EncodedBundle, error)
+}
+
+func (f *fakePublicCertificateEncoder) Encode(_ context.Context, in port.PublicEncodeInput) (port.EncodedBundle, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, in)
+	f.mu.Unlock()
+	return f.fn(in)
+}
+
+func (f *fakePublicCertificateEncoder) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
+}
+
+func (f *fakePublicCertificateEncoder) lastInput() port.PublicEncodeInput {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls[len(f.calls)-1]
+}
+
+func okPublicEncoder(payload string) *fakePublicCertificateEncoder {
+	return &fakePublicCertificateEncoder{fn: func(port.PublicEncodeInput) (port.EncodedBundle, error) {
+		return port.NewEncodedBundle([]byte(payload), "application/x-pem-file"), nil
+	}}
+}
+
+func failingPublicEncoder(err error) *fakePublicCertificateEncoder {
+	return &fakePublicCertificateEncoder{fn: func(port.PublicEncodeInput) (port.EncodedBundle, error) {
+		return port.EncodedBundle{}, err
+	}}
+}
+
+// fakeOperationalLogger records every event §14.5 hands it, so a test can
+// assert both that a code/stage/id was recorded and that nothing secret ever
+// reaches it (the struct has no field to smuggle one into in the first
+// place, but a test still checks the values it does carry).
+type fakeOperationalLogger struct {
+	mu     sync.Mutex
+	events []port.OperationalEvent
+}
+
+func (l *fakeOperationalLogger) Record(event port.OperationalEvent) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.events = append(l.events, event)
+}
+
+func (l *fakeOperationalLogger) recorded() []port.OperationalEvent {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]port.OperationalEvent(nil), l.events...)
+}
+
+// withPublicEncoder/withOperationalLogger let a test override just one
+// dependency distDeps otherwise defaults sensibly, without having to repeat
+// every other field distDeps already wires up.
+func withPublicEncoder(deps DistributionDeps, enc port.PublicCertificateEncoder) DistributionDeps {
+	deps.PublicCertificateEncoder = enc
+	return deps
+}
+
+func withOperationalLogger(deps DistributionDeps, logger port.OperationalLogger) DistributionDeps {
+	deps.OperationalLogger = logger
+	return deps
+}
+
+// auditScopeCapture records every scope slice passed to tx.Audit().Append
+// across a store's lifetime, letting a test assert §14.6 without porttest
+// exposing scopes on its own (porttest is out of this developer's assigned
+// files, so this wraps port.TxStores/UnitOfWork/ReadStore instead of adding
+// a method there).
+type auditScopeCapture struct {
+	mu     sync.Mutex
+	scopes [][]domain.AuthorityID
+}
+
+func (c *auditScopeCapture) record(scope []domain.AuthorityID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.scopes = append(c.scopes, append([]domain.AuthorityID(nil), scope...))
+}
+
+func (c *auditScopeCapture) all() [][]domain.AuthorityID {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([][]domain.AuthorityID(nil), c.scopes...)
+}
+
+type scopeCapturingStore struct {
+	inner   *porttest.Store
+	capture *auditScopeCapture
+}
+
+func (s *scopeCapturingStore) Write(ctx context.Context, fn func(port.TxStores) error) error {
+	return s.inner.Write(ctx, func(tx port.TxStores) error {
+		return fn(scopeCapturingTx{TxStores: tx, capture: s.capture})
+	})
+}
+
+func (s *scopeCapturingStore) Read(ctx context.Context, fn func(port.TxStores) error) error {
+	return s.inner.Read(ctx, func(tx port.TxStores) error {
+		return fn(scopeCapturingTx{TxStores: tx, capture: s.capture})
+	})
+}
+
+type scopeCapturingTx struct {
+	port.TxStores
+	capture *auditScopeCapture
+}
+
+func (t scopeCapturingTx) Audit() port.AuditRepository {
+	return scopeCapturingAudit{AuditRepository: t.TxStores.Audit(), capture: t.capture}
+}
+
+type scopeCapturingAudit struct {
+	port.AuditRepository
+	capture *auditScopeCapture
+}
+
+func (a scopeCapturingAudit) Append(ctx context.Context, event port.AuditEvent, scopes []domain.AuthorityID) error {
+	a.capture.record(scopes)
+	return a.AuditRepository.Append(ctx, event, scopes)
 }
 
 type alwaysAllow struct{}
@@ -1177,5 +1439,402 @@ func TestDeliver_PublicTokenRequestingPrivateKeyIsRejected(t *testing.T) {
 	}
 	if sink.callCount() != 0 {
 		t.Fatalf("sink calls = %d, want 0", sink.callCount())
+	}
+}
+
+// ---- §14 required tests ---------------------------------------------------
+
+// TestDeliver_PublicUsesPublicCertificateEncoder_NotServiceBuiltPEM proves
+// the public download path now goes through the injected
+// PublicCertificateEncoder instead of this package building PEM/ZIP bytes
+// itself (§14.3). Before the fix, distribution.go's own encodePublicBundle/
+// encodePublicZIP built the payload directly and no PublicCertificateEncoder
+// dependency existed at all, so this test would not even compile against
+// the old code -- confirming the fix is exercised, not merely present.
+func TestDeliver_PublicUsesPublicCertificateEncoder_NotServiceBuiltPEM(t *testing.T) {
+	fx := seedPublicFixture(t, distTestNow().Add(domain.NewDuration(time.Hour)))
+	publicEncoder := okPublicEncoder("from-the-injected-encoder")
+	privateEncoder := okEncoder("must-not-be-used")
+	gate := &fakeRuntimeGate{}
+	sink := &fakeSink{outcome: port.TransferOutcome{Completed: true, BytesWritten: 1, FinishedAt: distTestNow()}}
+	deps := withPublicEncoder(distDeps(t, fx.store, fx.store, privateEncoder, gate), publicEncoder)
+	svc := newDistributionService(t, deps)
+
+	_, err := svc.Deliver(context.Background(), distMeta(), distCmd(t, fx.rawToken), sink)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if publicEncoder.callCount() != 1 {
+		t.Fatalf("PublicCertificateEncoder calls = %d, want 1", publicEncoder.callCount())
+	}
+	if privateEncoder.callCount() != 0 {
+		t.Fatalf("DeliveryEncoder (private) calls = %d, want 0 for a public download", privateEncoder.callCount())
+	}
+}
+
+// TestDeliver_PublicPKCS12IsRejected_PublicEncoderNeverCalled is §14.4: a
+// public PKCS#12 request is refused before consumption and before the
+// public encoder ever runs.
+func TestDeliver_PublicPKCS12IsRejected_PublicEncoderNeverCalled(t *testing.T) {
+	fx := seedPublicFixture(t, distTestNow().Add(domain.NewDuration(time.Hour)))
+	publicEncoder := okPublicEncoder("must-not-be-used")
+	gate := &fakeRuntimeGate{}
+	sink := &fakeSink{}
+	deps := withPublicEncoder(distDeps(t, fx.store, fx.store, okEncoder("unused"), gate), publicEncoder)
+	svc := newDistributionService(t, deps)
+
+	cmd := contract.DownloadCommand{RawToken: secret.New([]byte(fx.rawToken)), Format: contract.DownloadFormatPKCS12}
+	_, err := svc.Deliver(context.Background(), distMeta(), cmd, sink)
+	if err == nil {
+		t.Fatal("want a validation error for a public pkcs12 request")
+	}
+	appErr, ok := contract.AsAppError(err)
+	if !ok || appErr.Kind() != contract.ErrorKindValidation {
+		t.Fatalf("err = %v, want a validation AppError", err)
+	}
+	if publicEncoder.callCount() != 0 {
+		t.Fatalf("PublicCertificateEncoder calls = %d, want 0", publicEncoder.callCount())
+	}
+	if sink.callCount() != 0 {
+		t.Fatalf("sink calls = %d, want 0", sink.callCount())
+	}
+}
+
+// TestDeliver_ChainDER_IsIssuerExcludedIssuerToRoot proves buildChainDER's
+// output reaches both encoders in the §14.2 shape: issuer→Root, excluding
+// the target certificate. Confirmed failing before this fix (ChainDER was
+// hard-coded nil in prepare()) and passing after it.
+func TestDeliver_ChainDER_IsIssuerExcludedIssuerToRoot(t *testing.T) {
+	t.Run("public", func(t *testing.T) {
+		fx := seedPublicFixture(t, distTestNow().Add(domain.NewDuration(time.Hour)))
+		publicEncoder := okPublicEncoder("payload")
+		gate := &fakeRuntimeGate{}
+		sink := &fakeSink{outcome: port.TransferOutcome{Completed: true, BytesWritten: 1, FinishedAt: distTestNow()}}
+		deps := withPublicEncoder(distDeps(t, fx.store, fx.store, okEncoder("unused"), gate), publicEncoder)
+		svc := newDistributionService(t, deps)
+
+		if _, err := svc.Deliver(context.Background(), distMeta(), distCmd(t, fx.rawToken), sink); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		in := publicEncoder.lastInput()
+		if len(in.ChainDER) != 1 {
+			t.Fatalf("ChainDER length = %d, want 1 (the Root, target excluded)", len(in.ChainDER))
+		}
+		wantRootDER := distRootCACert(t, 2, fx.issuerID).DER()
+		if !bytes.Equal(in.ChainDER[0], wantRootDER) {
+			t.Fatalf("ChainDER[0] does not match the seeded Root certificate DER")
+		}
+		if bytes.Equal(in.ChainDER[0], in.Certificate.DER()) {
+			t.Fatal("ChainDER must not include the target certificate itself")
+		}
+	})
+
+	t.Run("private", func(t *testing.T) {
+		fx := seedPrivateFixture(t, distTestNow().Add(domain.NewDuration(time.Hour)), domain.DeliveryStatePending)
+		privateEncoder := okEncoder("payload")
+		gate := &fakeRuntimeGate{}
+		sink := &fakeSink{outcome: port.TransferOutcome{Completed: true, BytesWritten: 1, FinishedAt: distTestNow()}}
+		svc := newDistributionService(t, distDeps(t, fx.store, fx.store, privateEncoder, gate))
+
+		if _, err := svc.Deliver(context.Background(), distMeta(), distCmd(t, fx.rawToken), sink); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if privateEncoder.callCount() != 1 {
+			t.Fatalf("DeliveryEncoder calls = %d, want 1", privateEncoder.callCount())
+		}
+		in := privateEncoder.lastInput()
+		if len(in.ChainDER) != 1 {
+			t.Fatalf("ChainDER length = %d, want 1 (the Root, target excluded)", len(in.ChainDER))
+		}
+		wantRootDER := distRootCACert(t, 1, fx.issuerID).DER()
+		if !bytes.Equal(in.ChainDER[0], wantRootDER) {
+			t.Fatalf("ChainDER[0] does not match the seeded Root certificate DER")
+		}
+	})
+}
+
+// TestDeliver_ChainMissing_ConsumesNothing is §14.2 + the "encoding failure
+// consumes nothing" rule applied to chain resolution: a certificate with no
+// stored leaf_certificates row cannot resolve a chain, and that failure must
+// happen before any Write. Confirmed failing before the fix (ChainDER was
+// simply nil, so a missing chain record was never even looked at) and
+// passing after it -- the request now fails, with the delivery still
+// pending and neither encoder ever called.
+func TestDeliver_ChainMissing_ConsumesNothing(t *testing.T) {
+	store := porttest.NewStore()
+	cert := distCertificate(t, 11, 11, 11, "b1")
+	delivery := distDelivery(t, 11, 11, cert.ID(), distTestNow().Add(domain.NewDuration(time.Hour)))
+	grant := distGrant(t, 11, domain.GrantPurposeLeafPrivate, cert.ID(), delivery.ID(), tokenHashFor("chain-missing-raw-token-0123456789AB"), distTestNow().Add(domain.NewDuration(time.Hour)))
+	secretRow := distEncryptedSecret(t, cert.KeyMaterialID())
+	if err := store.Write(context.Background(), func(tx port.TxStores) error {
+		if err := tx.PKI().InsertCertificate(context.Background(), cert); err != nil {
+			return err
+		}
+		if err := tx.Delivery().InsertDelivery(context.Background(), delivery); err != nil {
+			return err
+		}
+		if err := tx.Delivery().InsertGrant(context.Background(), grant); err != nil {
+			return err
+		}
+		return tx.Secrets().InsertEncrypted(context.Background(), secretRow)
+	}); err != nil {
+		t.Fatalf("seed fixture with no chain record: %v", err)
+	}
+	// Deliberately NOT calling seedChainAndScope: no leaf_certificates row
+	// exists for this certificate.
+
+	privateEncoder := okEncoder("must-not-run")
+	gate := &fakeRuntimeGate{}
+	sink := &fakeSink{}
+	svc := newDistributionService(t, distDeps(t, store, store, privateEncoder, gate))
+
+	cmd := contract.DownloadCommand{RawToken: secret.New([]byte("chain-missing-raw-token-0123456789AB")), Format: contract.DownloadFormatPEM}
+	_, err := svc.Deliver(context.Background(), distMeta(), cmd, sink)
+	if err == nil {
+		t.Fatal("want an error when the stored issuer chain cannot be resolved")
+	}
+	if privateEncoder.callCount() != 0 {
+		t.Fatalf("encoder calls = %d, want 0", privateEncoder.callCount())
+	}
+	if sink.callCount() != 0 {
+		t.Fatalf("sink calls = %d, want 0", sink.callCount())
+	}
+	if got := deliveryState(t, store, delivery.ID()); got != domain.DeliveryStatePending {
+		t.Fatalf("delivery state = %s, want pending (nothing consumed)", got)
+	}
+}
+
+// TestDeliver_ChainIssuerKeyMismatch_ConsumesNothing is §14.2's issuer-key-
+// mismatch case: the stored issuer certificate's CA key generation does not
+// match the one the certificate itself claims to be signed by.
+func TestDeliver_ChainIssuerKeyMismatch_ConsumesNothing(t *testing.T) {
+	store := porttest.NewStore()
+	// InsertLeafCertificateRecord/InsertCACertificateRecord have no matching
+	// Save method (§14.2's port surface is insert-once for these subtype
+	// rows), so this test seeds its own certificate/grant pair pointed at a
+	// deliberately mismatched chain rather than mutating an existing fixture.
+	wrongIssuer := distIssuerID(t, 999)
+
+	cert2 := distCertificate(t, 12, 12, 12, "b2")
+	delivery2 := distDelivery(t, 12, 12, cert2.ID(), distTestNow().Add(domain.NewDuration(time.Hour)))
+	grant2 := distGrant(t, 12, domain.GrantPurposeLeafPrivate, cert2.ID(), delivery2.ID(), tokenHashFor("mismatch-raw-token-0123456789ABCDE"), distTestNow().Add(domain.NewDuration(time.Hour)))
+	secretRow2 := distEncryptedSecret(t, cert2.KeyMaterialID())
+	mismatchedCACert := distRootCACert(t, 51, wrongIssuer)
+	series := distSeries(t, 12, distManagementAuthorityID(t, 12))
+	if err := store.Write(context.Background(), func(tx port.TxStores) error {
+		if err := tx.PKI().InsertCertificate(context.Background(), cert2); err != nil {
+			return err
+		}
+		if err := tx.Delivery().InsertDelivery(context.Background(), delivery2); err != nil {
+			return err
+		}
+		if err := tx.Delivery().InsertGrant(context.Background(), grant2); err != nil {
+			return err
+		}
+		if err := tx.Secrets().InsertEncrypted(context.Background(), secretRow2); err != nil {
+			return err
+		}
+		if err := tx.PKI().InsertSeries(context.Background(), series); err != nil {
+			return err
+		}
+		if err := tx.PKI().InsertCertificate(context.Background(), mismatchedCACert); err != nil {
+			return err
+		}
+		// The CA record claims a DIFFERENT key generation than cert2's own
+		// IssuerCAKeyGenerationID (cert2 was built with distIssuerID(t, 12)).
+		if err := tx.PKI().InsertCACertificateRecord(context.Background(), port.CACertificateRecord{
+			CertificateID:     mismatchedCACert.ID(),
+			CAKeyGenerationID: wrongIssuer,
+		}); err != nil {
+			return err
+		}
+		return tx.PKI().InsertLeafCertificateRecord(context.Background(), port.LeafCertificateRecord{
+			CertificateID:         cert2.ID(),
+			SeriesID:              series.ID(),
+			IssuerCACertificateID: mismatchedCACert.ID(),
+			Operation:             port.CertificateOperationInitial,
+		})
+	}); err != nil {
+		t.Fatalf("seed mismatch fixture: %v", err)
+	}
+
+	privateEncoder := okEncoder("must-not-run")
+	gate := &fakeRuntimeGate{}
+	sink := &fakeSink{}
+	svc := newDistributionService(t, distDeps(t, store, store, privateEncoder, gate))
+
+	cmd := contract.DownloadCommand{RawToken: secret.New([]byte("mismatch-raw-token-0123456789ABCDE")), Format: contract.DownloadFormatPEM}
+	_, err := svc.Deliver(context.Background(), distMeta(), cmd, sink)
+	if err == nil {
+		t.Fatal("want an error for a chain whose issuer certificate does not certify the recorded signing key generation")
+	}
+	if privateEncoder.callCount() != 0 {
+		t.Fatalf("encoder calls = %d, want 0", privateEncoder.callCount())
+	}
+	if sink.callCount() != 0 {
+		t.Fatalf("sink calls = %d, want 0", sink.callCount())
+	}
+	if got := deliveryState(t, store, delivery2.ID()); got != domain.DeliveryStatePending {
+		t.Fatalf("delivery state = %s, want pending (nothing consumed)", got)
+	}
+}
+
+// TestDeliver_PublicPostProcessFailure_LogsOperationalEvent is §14.5: a
+// public transfer's post-processing failure is recorded through
+// OperationalLogger with only the fixed code/request id/stage/ids, never
+// FailClosed, and no revocation. Confirmed failing before the fix (the
+// branch discarded the error with `_ =` and no OperationalLogger dependency
+// existed) and passing after it.
+func TestDeliver_PublicPostProcessFailure_LogsOperationalEvent(t *testing.T) {
+	fx := seedPublicFixture(t, distTestNow().Add(domain.NewDuration(time.Hour)))
+	logger := &fakeOperationalLogger{}
+	gate := &fakeRuntimeGate{}
+	sink := &fakeSink{err: errors.New("client aborted")}
+	meta := contract.RequestMeta{Principal: contract.AnonymousPrincipal(), RequestID: "req-public-1"}
+	deps := withOperationalLogger(distDeps(t, fx.store, fx.store, okEncoder("unused"), gate), logger)
+	svc := newDistributionService(t, deps)
+
+	_, err := svc.Deliver(context.Background(), meta, distCmd(t, fx.rawToken), sink)
+	if err == nil {
+		t.Fatal("expected the send failure to be reported")
+	}
+	if gate.callCount() != 0 {
+		t.Fatalf("a public post-process failure must never FailClosed, got %d", gate.callCount())
+	}
+	if n := countRevocations(t, fx.store, fx.issuerID, distSerial(t, "a2")); n != 0 {
+		t.Fatalf("expected 0 revocation rows for a public failure, got %d", n)
+	}
+
+	events := logger.recorded()
+	if len(events) != 1 {
+		t.Fatalf("OperationalLogger.Record calls = %d, want 1", len(events))
+	}
+	ev := events[0]
+	if ev.Stage != port.OperationalStagePublicPostProcess {
+		t.Fatalf("Stage = %q, want %q", ev.Stage, port.OperationalStagePublicPostProcess)
+	}
+	if ev.RequestID != "req-public-1" {
+		t.Fatalf("RequestID = %q, want %q", ev.RequestID, "req-public-1")
+	}
+	if ev.CertificateID != fx.certID {
+		t.Fatalf("CertificateID = %q, want %q", ev.CertificateID, fx.certID)
+	}
+	if ev.GrantID == "" {
+		t.Fatal("GrantID must not be empty")
+	}
+	if ev.Code == "" {
+		t.Fatal("Code must not be empty")
+	}
+}
+
+// TestDeliver_OperationalEvent_CarriesNoSecrets checks the §14.5 "never a
+// raw error/URL/token/private key" rule two ways: structurally (the typed
+// event has no field capable of holding one) and by value (the fields it
+// does carry are exactly the fixed identifiers, not the sink's error text).
+func TestDeliver_OperationalEvent_CarriesNoSecrets(t *testing.T) {
+	fx := seedPublicFixture(t, distTestNow().Add(domain.NewDuration(time.Hour)))
+	logger := &fakeOperationalLogger{}
+	gate := &fakeRuntimeGate{}
+	secretishErr := errors.New("client aborted while holding token=SUPER-SECRET-RAW-TOKEN-VALUE")
+	sink := &fakeSink{err: secretishErr}
+	deps := withOperationalLogger(distDeps(t, fx.store, fx.store, okEncoder("unused"), gate), logger)
+	svc := newDistributionService(t, deps)
+
+	if _, err := svc.Deliver(context.Background(), distMeta(), distCmd(t, fx.rawToken), sink); err == nil {
+		t.Fatal("expected the send failure to be reported")
+	}
+
+	events := logger.recorded()
+	if len(events) != 1 {
+		t.Fatalf("OperationalLogger.Record calls = %d, want 1", len(events))
+	}
+	// port.OperationalEvent (internal/app/port/signing.go) has exactly
+	// Code/RequestID/Stage/GrantID/DeliveryID/CertificateID -- struct
+	// reflection is unnecessary; %+v on the recorded value is enough to
+	// prove the secret-looking error text a real sink might produce never
+	// appears in what was recorded, since there is no field it could have
+	// been written into.
+	rendered := fmt.Sprintf("%+v", events[0])
+	if bytes.Contains([]byte(rendered), []byte("SUPER-SECRET-RAW-TOKEN-VALUE")) {
+		t.Fatalf("recorded operational event leaked sink error text: %s", rendered)
+	}
+}
+
+// TestDeliver_DownloadAuditScope_IsManagementAuthority_NotEmpty is §14.6:
+// the start/success/failure audit rows for both a private and a public
+// transfer are scoped to the certificate's stored management authority
+// (LeafSeries.ManagementAuthorityID), never left empty and never the
+// certificate's cryptographic issuer (which §14.2's buildChainDER resolves
+// to a different id entirely in this fixture). Confirmed failing before the
+// fix: appendDistributionAudit used to hard-code scope nil (there was no
+// distributionManagementAuthority function to call at all).
+func TestDeliver_DownloadAuditScope_IsManagementAuthority_NotEmpty(t *testing.T) {
+	t.Run("private start and completed", func(t *testing.T) {
+		fx := seedPrivateFixture(t, distTestNow().Add(domain.NewDuration(time.Hour)), domain.DeliveryStatePending)
+		seedCRLStateFor(t, fx.store, fx.issuerID)
+		capture := &auditScopeCapture{}
+		wrapped := &scopeCapturingStore{inner: fx.store, capture: capture}
+		gate := &fakeRuntimeGate{}
+		sink := &fakeSink{outcome: port.TransferOutcome{Completed: true, BytesWritten: 1, FinishedAt: distTestNow()}}
+		svc := newDistributionService(t, distDeps(t, wrapped, wrapped, okEncoder("payload"), gate))
+
+		if _, err := svc.Deliver(context.Background(), distMeta(), distCmd(t, fx.rawToken), sink); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		assertAllScopesAreManagementAuthority(t, capture, fx.managementAuthorityID, fx.issuerID)
+	})
+
+	t.Run("private failed", func(t *testing.T) {
+		fx := seedPrivateFixture(t, distTestNow().Add(domain.NewDuration(time.Hour)), domain.DeliveryStatePending)
+		seedCRLStateFor(t, fx.store, fx.issuerID)
+		capture := &auditScopeCapture{}
+		wrapped := &scopeCapturingStore{inner: fx.store, capture: capture}
+		gate := &fakeRuntimeGate{}
+		sink := &fakeSink{err: errors.New("client aborted")}
+		svc := newDistributionService(t, distDeps(t, wrapped, wrapped, okEncoder("payload"), gate))
+
+		if _, err := svc.Deliver(context.Background(), distMeta(), distCmd(t, fx.rawToken), sink); err == nil {
+			t.Fatal("expected the send failure to be reported")
+		}
+		assertAllScopesAreManagementAuthority(t, capture, fx.managementAuthorityID, fx.issuerID)
+	})
+
+	t.Run("public start and failed", func(t *testing.T) {
+		fx := seedPublicFixture(t, distTestNow().Add(domain.NewDuration(time.Hour)))
+		capture := &auditScopeCapture{}
+		wrapped := &scopeCapturingStore{inner: fx.store, capture: capture}
+		gate := &fakeRuntimeGate{}
+		sink := &fakeSink{err: errors.New("client aborted")}
+		svc := newDistributionService(t, distDeps(t, wrapped, wrapped, okEncoder("unused"), gate))
+
+		if _, err := svc.Deliver(context.Background(), distMeta(), distCmd(t, fx.rawToken), sink); err == nil {
+			t.Fatal("expected the send failure to be reported")
+		}
+		assertAllScopesAreManagementAuthority(t, capture, fx.managementAuthorityID, fx.issuerID)
+	})
+}
+
+// assertAllScopesAreManagementAuthority fails the test unless every captured
+// audit scope is non-empty, equals exactly the management authority (never
+// the unrelated CA key generation id buildChainDER walks), and at least one
+// scope was actually captured.
+func assertAllScopesAreManagementAuthority(t *testing.T, capture *auditScopeCapture, wantAuthority domain.AuthorityID, notIssuer domain.CAKeyGenerationID) {
+	t.Helper()
+	scopes := capture.all()
+	if len(scopes) == 0 {
+		t.Fatal("no audit events were recorded at all")
+	}
+	for i, scope := range scopes {
+		if len(scope) == 0 {
+			t.Fatalf("audit event %d has an empty scope, want %q", i, wantAuthority)
+		}
+		for _, id := range scope {
+			if id != wantAuthority {
+				t.Fatalf("audit event %d scope = %v, want exactly [%q]", i, scope, wantAuthority)
+			}
+			if string(id) == string(notIssuer) {
+				t.Fatalf("audit event %d scope leaked the cryptographic issuer id instead of the management authority", i)
+			}
+		}
 	}
 }

@@ -19,8 +19,11 @@ import (
 const recoveryBatchSize = 100
 
 // recoveryFailureCode is the failure_code a transfer interrupted by a
-// process exit is recorded under.
-const recoveryFailureCode = "restart_recovery"
+// process exit is recorded under. §14.1 fixes this exact name (distinct from
+// a live send failure's transfer_failed) so the audit/failure_code alone
+// tells apart a request that failed mid-transfer from one that was simply
+// still open when the previous process exited.
+const recoveryFailureCode = "interrupted_transfer"
 
 // RecoveryOutcome reports what a restart resolved, for the operator log the
 // runtime writes before opening admission.
@@ -111,6 +114,10 @@ func (s *DistributionService) failInterruptedTransfer(ctx context.Context, deliv
 		if err != nil {
 			return storeError(err, "recovery_certificate_read_failed", "could not read the interrupted delivery's certificate")
 		}
+		scope, err := distributionManagementAuthority(ctx, tx, certificate.ID())
+		if err != nil {
+			return err
+		}
 
 		failedDelivery, err := delivery.Fail(recoveryFailureCode, now)
 		if err != nil {
@@ -123,9 +130,9 @@ func (s *DistributionService) failInterruptedTransfer(ctx context.Context, deliv
 			return storeError(err, "recovery_grant_invalidate_failed", "could not invalidate the interrupted delivery's links")
 		}
 
-		// The same reason/source picks DistributionService uses for a live
-		// transfer failure; see recordPrivateOutcome's note, which is
-		// flagged for a product ruling.
+		// The same reason/source DistributionService uses for a live
+		// transfer failure -- §14.1 confirms both for "잔류 transferring
+		// 복구" too: "기본 reason은 unspecified, source는 cascade로 확정한다."
 		change := RevocationChange{
 			IssuerID:      certificate.IssuerCAKeyGenerationID(),
 			Serial:        certificate.Serial(),
@@ -133,6 +140,7 @@ func (s *DistributionService) failInterruptedTransfer(ctx context.Context, deliv
 			RevokedAt:     now,
 			Reason:        domain.RevocationReasonUnspecified,
 			Source:        domain.RevocationSourceCascade,
+			AuthorityID:   scope,
 		}
 		revMeta := RevocationMeta{
 			ActorKind: contract.AuditActorSystem,
