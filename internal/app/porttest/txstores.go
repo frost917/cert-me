@@ -25,3 +25,4 @@ func (t *txStores) Secrets() port.SecretRepository            { return secretRep
 func (t *txStores) Jobs() port.JobRepository                  { return jobRepo{t.s} }
 func (t *txStores) Audit() port.AuditRepository               { return auditRepo{t.s} }
 func (t *txStores) Imports() port.ImportRepository            { return importRepo{t.s} }
+func (t *txStores) Queries() port.QueryRepository             { return queryRepo{t.s} }

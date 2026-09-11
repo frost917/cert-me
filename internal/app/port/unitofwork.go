@@ -61,4 +61,10 @@ type TxStores interface {
 	// 포함한다." §13's governing rule is explicit that §4's table is not a
 	// ceiling on TxStores' methods.
 	Imports() ImportRepository
+	// Queries is the non-locking read side QueryService needs, added for the
+	// same reason and under the same §13 ruling as Imports: "범용 raw SQL
+	// 우회 대신 소비 서비스가 필요한 typed port를 추가한다". See queries.go
+	// for why the paged/filtered/scoped reads are a separate interface from
+	// the write path's GetXForUpdate.
+	Queries() QueryRepository
 }
