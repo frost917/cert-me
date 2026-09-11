@@ -946,14 +946,6 @@ func (s *IssuanceService) prepareIssue(ctx context.Context, meta contract.Mutati
 // order: authorization, stored-result replay, current-policy re-check, then
 // the stores, the request result and the audit row.
 func (s *IssuanceService) commitIssue(ctx context.Context, tx port.TxStores, meta contract.MutationMeta, cmd contract.IssuanceIssueCommand, reqKey port.OperationRequestKey, inputHash string, prep issuePrepared, result *contract.IssuanceView) error {
-	// The commit's own clock read. §2's "현재" checks -- is this session
-	// still live, may this issuer still issue -- have to be judged at the
-	// moment the commit happens, not at the moment preparation started: a
-	// signature and a lock wait sit in between. prep.now stays the
-	// issuance-time fact baked into the signed certificate (its NotBefore
-	// and the window the plan was built for); it is not a substitute for
-	// "now" in an eligibility check.
-	commitNow := s.deps.Clock.Now()
 	authorityID := cmd.AuthorityID
 	// §2/§4: the current account state, auth epoch and session are re-checked
 	// under lock, before authorization and before any replay.
@@ -996,6 +988,15 @@ func (s *IssuanceService) commitIssue(ctx context.Context, tx port.TxStores, met
 	// §13-3: app assembles the IssuerContext and re-checks CanIssue inside
 	// the transaction, against the same window the certificate was signed
 	// for.
+	//
+	// The clock is read HERE, with the issuer row already locked, for the
+	// same reason requireCurrentAuth reads it after locking the account:
+	// waiting for this lock takes time too, so a value read at the top of
+	// the callback is already stale by the time the check runs. prep.now
+	// stays the issuance-time fact baked into the signed certificate -- its
+	// NotBefore and the window the plan was built for -- and is never the
+	// "now" of an eligibility check.
+	commitNow := s.deps.Clock.Now()
 	if err := authority.CanIssue(domain.IssuerContext{RequestedWindow: prep.plan.Window, Intent: domain.IssuanceIntentLeaf}, commitNow); err != nil {
 		return contract.FromDomainError(err)
 	}
@@ -1469,14 +1470,6 @@ func ensureKeyStillRenewable(ctx context.Context, tx port.TxStores, prep renewPr
 
 // commitRenew is Renew's single Write, in §4's fixed order.
 func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, meta contract.MutationMeta, cmd contract.IssuanceRenewCommand, reqKey port.OperationRequestKey, inputHash string, expectedVersion domain.Version, prep renewPrepared, result *contract.IssuanceView) error {
-	// The commit's own clock read. §2's "현재" checks -- is this session
-	// still live, may this issuer still issue -- have to be judged at the
-	// moment the commit happens, not at the moment preparation started: a
-	// signature and a lock wait sit in between. prep.now stays the
-	// issuance-time fact baked into the signed certificate (its NotBefore
-	// and the window the plan was built for); it is not a substitute for
-	// "now" in an eligibility check.
-	commitNow := s.deps.Clock.Now()
 	snapshot, err := tx.PKI().GetSeriesForUpdate(ctx, cmd.SeriesID)
 	if errors.Is(err, port.ErrNotFound) {
 		return contract.NewAppError(contract.ErrorKindValidation, "series_not_found", "series does not exist").
@@ -1533,7 +1526,9 @@ func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, met
 		return errRePrepare
 	}
 	// §13-3: the IssuerContext is assembled by app and CanIssue is re-checked
-	// inside the transaction.
+	// inside the transaction, with the clock read after this issuer row is
+	// locked (see commitIssue's note).
+	commitNow := s.deps.Clock.Now()
 	if err := targetIssuer.CanIssue(domain.IssuerContext{RequestedWindow: prep.plan.Window, Intent: domain.IssuanceIntentLeaf}, commitNow); err != nil {
 		return contract.FromDomainError(err)
 	}
