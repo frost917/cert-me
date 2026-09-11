@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"time"
 
@@ -19,27 +20,20 @@ import (
 // 개발자가 결정한다"), not a product policy question.
 const maxSerialAttempts = 5
 
-// defaultLeafValidityYears/defaultRotateEvery/defaultPrivateDeliverySeconds
-// are the certificate-lifecycle.md factory defaults ("Leaf 기본 유효기간
-// 1년", "기본 교체 주기는 3회", "개인키 수령 기한은 발급 후 기본 3시간"),
-// used when an issuance omits validity/rotate_every and no installation
-// Settings row has resolved them yet (a fresh install before SettingsService
-// has ever been touched).
 const (
-	defaultLeafValidityYears      = 1
-	defaultRotateEvery            = 3
-	defaultPrivateDeliverySeconds = 3 * 60 * 60
-	issuanceOperationIssue        = "issuance.issue"
-	issuanceOperationRenew        = "issuance.renew"
+	issuanceOperationIssue = "issuance.issue"
+	issuanceOperationRenew = "issuance.renew"
 )
 
 // IssuanceDeps is IssuanceService's dependency set: CommonDeps plus the
 // signing dependencies docs/backend-implementation.md §5 names for
-// Authority/Issuance ("KeyEngine, CertificateSigner, ProfileValidator").
+// Authority/Issuance ("KeyEngine, CertificateSigner, SerialGenerator,
+// ProfileValidator").
 type IssuanceDeps struct {
 	CommonDeps
 	KeyEngine         port.KeyEngine
 	CertificateSigner port.CertificateSigner
+	SerialGenerator   port.SerialGenerator
 	ProfileValidator  port.ProfileValidator
 }
 
@@ -53,6 +47,7 @@ func (d IssuanceDeps) Validate() error {
 	return firstMissing(
 		required{"KeyEngine", d.KeyEngine == nil},
 		required{"CertificateSigner", d.CertificateSigner == nil},
+		required{"SerialGenerator", d.SerialGenerator == nil},
 		required{"ProfileValidator", d.ProfileValidator == nil},
 	)
 }
@@ -158,45 +153,60 @@ func subjectForHash(s domain.Subject) hashSubject {
 
 // ---- stored result DTOs ----
 //
-// contract.IssuanceView and contract.DeliveryView are not stored directly:
-// domain.Instant has no MarshalJSON/UnmarshalJSON of its own (its only field
-// is unexported), so encoding/json would silently serialize every
-// domain.Instant field in DeliveryView as "{}" and decode it back as the
-// zero instant -- corrupting the stored ExpiresAt on every replay. This is a
-// domain.Instant gap flagged for the lead (out of this developer's assigned
-// files); this local, service-owned wire shape works around it by carrying
-// every instant as its UnixMicro int64 instead.
-
-type storedDeliveryView struct {
-	ID              string `json:"id"`
-	CertificateID   string `json:"certificate_id"`
-	State           string `json:"state"`
-	ExpiresAtMicros int64  `json:"expires_at_micros"`
-	FailureCode     string `json:"failure_code,omitempty"`
-	Version         int64  `json:"version"`
-}
+// storedIssuanceResult is the DTO StoreRequestResult persists and
+// ReplayStoredResult later replays through DecodeStoredResult. §14.7 fixes
+// two things about it: it must carry its own schema_version=1 (checked by
+// decodeStoredIssuanceResult below, so an unknown version is an error rather
+// than a best-effort decode), and a replay must re-read the *current*
+// delivery status rather than trust whatever was true at commit time
+// ("재생 시 인증서 식별자·발급 당시 정책은 유지하되 수령 상태는 현재
+// 저장값으로 조회한다"). That second rule is why this DTO stores only
+// DeliveryID (an identifier, stable forever) and not a frozen state/expiry
+// snapshot: toView reads the live domain.Delivery row through tx at replay
+// time. It carries no domain.Instant field at all, sidestepping the
+// domain.Instant JSON gap (no MarshalJSON/UnmarshalJSON; see
+// docs/backend-implementation.md §14.7 "domain.Instant에 이 문제를 우회하기
+// 위한 범용 JSON marshaller를 추가하지 않는다") entirely rather than working
+// around it.
+const issuanceStoredResultSchemaVersion = 1
 
 type storedIssuanceResult struct {
-	SeriesID        string              `json:"series_id"`
-	CertificateID   string              `json:"certificate_id"`
-	KeyGenerationID string              `json:"key_generation_id"`
-	RenewalCount    int64               `json:"renewal_count"`
-	KeyRotated      bool                `json:"key_rotated"`
-	Delivery        *storedDeliveryView `json:"delivery,omitempty"`
+	SchemaVersion   int    `json:"schema_version"`
+	SeriesID        string `json:"series_id"`
+	CertificateID   string `json:"certificate_id"`
+	KeyGenerationID string `json:"key_generation_id"`
+	RenewalCount    int64  `json:"renewal_count"`
+	KeyRotated      bool   `json:"key_rotated"`
+	// DeliveryID is empty when this issuance/renewal produced no delivery (a
+	// reuse renewal that neither generated nor rotated a key).
+	DeliveryID string `json:"delivery_id,omitempty"`
 }
 
-func toStoredDeliveryView(d domain.Delivery) *storedDeliveryView {
-	return &storedDeliveryView{
-		ID:              string(d.ID()),
-		CertificateID:   string(d.CertificateID()),
-		State:           string(d.State()),
-		ExpiresAtMicros: d.ExpiresAt().UnixMicro(),
-		FailureCode:     d.FailureCode(),
-		Version:         d.Version().Int64(),
+// decodeStoredIssuanceResult decodes stored through DecodeStoredResult and
+// additionally rejects a schema_version this code does not understand
+// (§14.7). A future schema bump must not be silently reinterpreted under the
+// current field layout.
+func decodeStoredIssuanceResult(stored port.OperationRequestResult) (storedIssuanceResult, error) {
+	var v storedIssuanceResult
+	if err := DecodeStoredResult(stored, &v); err != nil {
+		return storedIssuanceResult{}, err
 	}
+	if v.SchemaVersion != issuanceStoredResultSchemaVersion {
+		return storedIssuanceResult{}, contract.NewAppError(contract.ErrorKindUnavailable, "issuance_stored_result_schema_unsupported",
+			"a stored issuance result carries an unsupported schema_version").
+			WithField("schema_version", fmt.Sprint(v.SchemaVersion))
+	}
+	return v, nil
 }
 
-func (v storedIssuanceResult) toView() contract.IssuanceView {
+// toView projects the stored, identifier-only DTO into the response shape,
+// re-reading delivery status live rather than trusting a frozen snapshot
+// (§14.7). tx.Delivery().GetDeliveryForUpdate is the only read this port
+// exposes for a delivery by id; it is used the same way inside a Write
+// (commitIssue/commitRenew's own replay branch) and inside a plain Read
+// (replayBeforePreparation), matching existing precedent elsewhere in this
+// package (deliver_postprocess.go, distribution.go, recovery.go).
+func (v storedIssuanceResult) toView(ctx context.Context, tx port.TxStores) (contract.IssuanceView, error) {
 	out := contract.IssuanceView{
 		SeriesID:        domain.SeriesID(v.SeriesID),
 		CertificateID:   domain.CertificateID(v.CertificateID),
@@ -204,40 +214,87 @@ func (v storedIssuanceResult) toView() contract.IssuanceView {
 		RenewalCount:    v.RenewalCount,
 		KeyRotated:      v.KeyRotated,
 	}
-	if v.Delivery != nil {
-		expires := domain.InstantFromUnixMicro(v.Delivery.ExpiresAtMicros)
-		out.Delivery = &contract.DeliveryView{
-			ID:            domain.DeliveryID(v.Delivery.ID),
-			CertificateID: domain.CertificateID(v.Delivery.CertificateID),
-			State:         domain.DeliveryState(v.Delivery.State),
-			ExpiresAt:     expires,
-			FailureCode:   v.Delivery.FailureCode,
-			Version:       domain.Version(v.Delivery.Version),
+	if v.DeliveryID != "" {
+		delivery, err := tx.Delivery().GetDeliveryForUpdate(ctx, domain.DeliveryID(v.DeliveryID))
+		if err != nil {
+			return contract.IssuanceView{}, storeError(err, "issuance_replay_delivery_read_failed",
+				"could not read the current delivery status for replay")
 		}
+		out.Delivery = toDeliveryView(delivery)
 	}
-	return out
+	return out, nil
+}
+
+// toDeliveryView projects a live domain.Delivery into its response shape.
+// ConsumedAt/FinishedAt are nullable in contract.DeliveryView and zero on a
+// domain.Delivery that has not reached that state yet, so a zero instant
+// becomes a nil pointer rather than a rendered zero time.
+func toDeliveryView(d domain.Delivery) *contract.DeliveryView {
+	return &contract.DeliveryView{
+		ID:            d.ID(),
+		CertificateID: d.CertificateID(),
+		State:         d.State(),
+		ExpiresAt:     d.ExpiresAt(),
+		ConsumedAt:    instantPtr(d.ConsumedAt()),
+		FinishedAt:    instantPtr(d.FinishedAt()),
+		FailureCode:   d.FailureCode(),
+		Version:       d.Version(),
+	}
+}
+
+func instantPtr(at domain.Instant) *domain.Instant {
+	if at.IsZero() {
+		return nil
+	}
+	return &at
+}
+
+// ---- leaf_certificates subtype snapshot (§14.2/§14.4) ----
+
+const leafPolicySnapshotSchemaVersion = 1
+
+// leafPolicySnapshotV1 is policy_snapshot_json's shape: what data-model.md's
+// leaf_certificates row requires preserved from the moment this particular
+// certificate was issued ("당시 프로필·SAN·기간·교체 주기 보존"), independent
+// of whatever the series' live Policy is by the time someone reads it back.
+type leafPolicySnapshotV1 struct {
+	SchemaVersion int                    `json:"schema_version"`
+	Profile       string                 `json:"profile"`
+	SANs          []hashSAN              `json:"sans,omitempty"`
+	Validity      settingsValidityWireV1 `json:"validity"`
+	RotateEvery   int                    `json:"rotate_every"`
+}
+
+// leafPolicySnapshotJSON builds the policy_snapshot_json blob for cert,
+// under the policy that was in force when it was planned. cert's own SANs
+// are used (the certificate that was actually signed), in their original
+// order -- unlike normalizedSANsForHash, this is a historical record, not an
+// idempotency key, so it is neither sorted nor deduplicated.
+func leafPolicySnapshotJSON(cert domain.Certificate, policy domain.SeriesPolicy) ([]byte, error) {
+	sans := cert.SANs()
+	wireSANs := make([]hashSAN, len(sans))
+	for i, s := range sans {
+		wireSANs[i] = hashSAN{Type: string(s.Type()), Value: s.Value()}
+	}
+	snap := leafPolicySnapshotV1{
+		SchemaVersion: leafPolicySnapshotSchemaVersion,
+		Profile:       string(cert.Profile()),
+		SANs:          wireSANs,
+		Validity: settingsValidityWireV1{
+			Value: policy.CertificateValidity.Value(),
+			Unit:  string(policy.CertificateValidity.Unit()),
+		},
+		RotateEvery: policy.RotateEvery,
+	}
+	encoded, err := json.Marshal(snap)
+	if err != nil {
+		return nil, contract.WrapAppError(contract.ErrorKindValidation, "issuance_policy_snapshot_encode_failed",
+			"could not encode the policy snapshot", err)
+	}
+	return encoded, nil
 }
 
 // ---- installation Settings resolution ----
-
-// installationSettingsSnapshot is the subset of the service_settings JSON
-// blob this service needs to resolve an omitted validity/rotate_every
-// (docs/backend-implementation.md §3 "생략된 기본값은 발급 시 확정해 결과에
-// 포함한다"). FLAGGED FOR THE LEAD: SettingsService (B04) has not been
-// implemented yet and no shared encoder/decoder for service_settings.
-// settings_json is reachable from this package, so the field names below
-// are this developer's placeholder guess at the wire shape, not a decided
-// contract. It only matters for a brand-new request's default resolution
-// (see StoreRequestResult/ReplayStoredResult below): the idempotency hash
-// itself never carries a resolved value, so a mismatch here cannot corrupt
-// idempotency correctness, only which default a first-time omitted field
-// gets. This must be reconciled with SettingsService before B04.
-type installationSettingsSnapshot struct {
-	LeafValidityValue      int    `json:"leaf_validity_value"`
-	LeafValidityUnit       string `json:"leaf_validity_unit"`
-	RotateEvery            int    `json:"rotate_every"`
-	PrivateDeliverySeconds int    `json:"private_delivery_seconds"`
-}
 
 // resolvedSeriesDefaults is what a fresh Issue call needs once
 // validity/rotate_every are settled, whether from the request or Settings.
@@ -248,11 +305,16 @@ type resolvedSeriesDefaults struct {
 }
 
 // resolveSeriesDefaults fills in an omitted validity/rotate_every from the
-// current installation Settings, falling back to the certificate-
-// lifecycle.md factory defaults when no Settings row has been saved yet (a
-// fresh install) or the stored blob does not decode. It always resolves
-// PrivateDeliverySeconds from Settings/the factory default, since
-// IssuanceIssueCommand carries no per-request override for that field.
+// current installation Settings. PrivateDeliverySeconds always comes from
+// Settings, since IssuanceIssueCommand carries no per-request override for
+// it. Per §14.8, a missing, corrupt, or unsupported-schema-version Settings
+// row is an issuance-time error, never silently covered by a factory
+// default: "초기 미설정은 Setup의 명시적 초기화 경로로만 처리하며 운영
+// 발급은 검증된 snapshot을 요구한다". A fresh install that has not run Setup
+// yet is therefore expected to fail Issue/Renew with
+// issuance_settings_not_configured until Setup's explicit initialization
+// path (out of this developer's assigned files) has written a validated
+// snapshot.
 func resolveSeriesDefaults(ctx context.Context, tx port.TxStores, validity *contract.ValidityInput, rotateEvery *int) (resolvedSeriesDefaults, error) {
 	out := resolvedSeriesDefaults{}
 	if validity != nil {
@@ -267,45 +329,25 @@ func resolveSeriesDefaults(ctx context.Context, tx port.TxStores, validity *cont
 		out.RotateEvery = *rotateEvery
 	}
 
-	if out.Validity.IsZero() || out.RotateEvery == 0 || out.PrivateDeliverySeconds == 0 {
-		settings, err := tx.Installation().GetSettings(ctx)
-		switch {
-		case err == nil:
-			var snap installationSettingsSnapshot
-			if decodeErr := json.Unmarshal(settings.SettingsJSON, &snap); decodeErr == nil {
-				if out.Validity.IsZero() && snap.LeafValidityValue > 0 {
-					if v, e := domain.NewCalendarValidity(snap.LeafValidityValue, domain.ValidityUnit(snap.LeafValidityUnit)); e == nil {
-						out.Validity = v
-					}
-				}
-				if out.RotateEvery == 0 && snap.RotateEvery > 0 {
-					out.RotateEvery = snap.RotateEvery
-				}
-				if snap.PrivateDeliverySeconds > 0 {
-					out.PrivateDeliverySeconds = snap.PrivateDeliverySeconds
-				}
-			}
-		case errors.Is(err, port.ErrNotFound):
-			// No Settings row yet (fresh install): fall through to the
-			// factory defaults below.
-		default:
-			return resolvedSeriesDefaults{}, storeError(err, "issuance_settings_read_failed", "could not read installation settings")
-		}
+	settings, err := tx.Installation().GetSettings(ctx)
+	switch {
+	case errors.Is(err, port.ErrNotFound):
+		return resolvedSeriesDefaults{}, contract.NewAppError(contract.ErrorKindConflict, "issuance_settings_not_configured",
+			"installation settings have not been initialized; complete Setup before issuing certificates")
+	case err != nil:
+		return resolvedSeriesDefaults{}, storeError(err, "issuance_settings_read_failed", "could not read installation settings")
 	}
-
+	snap, err := DecodeSettingsV1(settings)
+	if err != nil {
+		return resolvedSeriesDefaults{}, err
+	}
 	if out.Validity.IsZero() {
-		v, err := domain.NewCalendarValidity(defaultLeafValidityYears, domain.ValidityUnitYears)
-		if err != nil {
-			return resolvedSeriesDefaults{}, contract.FromDomainError(err)
-		}
-		out.Validity = v
+		out.Validity = snap.LeafValidity
 	}
 	if out.RotateEvery == 0 {
-		out.RotateEvery = defaultRotateEvery
+		out.RotateEvery = snap.RotateEvery
 	}
-	if out.PrivateDeliverySeconds == 0 {
-		out.PrivateDeliverySeconds = defaultPrivateDeliverySeconds
-	}
+	out.PrivateDeliverySeconds = snap.PrivateDeliverySeconds
 	return out, nil
 }
 
@@ -339,31 +381,120 @@ func ensureSerialUnused(ctx context.Context, tx port.TxStores, issuer domain.CAK
 	return nil
 }
 
-// issuerSigningSecret resolves issuer's own encrypted CA key. Authority
-// carries a CAKeyGenerationID, not a KeyMaterialID, and PKIRepository has no
-// method to read a stored CAKeyGeneration row back by id -- so this goes
-// through issuer's own certificate instead (Authority.IssuanceCertificateID
-// -> PKIRepository.GetCertificate -> Certificate.KeyMaterialID), which is
-// already guaranteed set for any authority CanIssue accepts. This is an
-// interpretation of an incomplete PKIRepository, flagged for the lead rather
-// than adding the missing method myself (internal/app/port is out of this
-// developer's assigned files).
-func issuerSigningSecret(ctx context.Context, tx port.TxStores, issuer domain.Authority) (domain.EncryptedSecret, error) {
+// verifyCASigningKeyLive performs §14.9's consistency checks against
+// issuer's current CA key generation, required in both preparation and
+// commit ("준비와 commit 양쪽에서 확인"): the generation's key must not have
+// been destroyed, and the authority's selected issuance certificate must
+// actually correspond to that same generation and key material -- otherwise
+// a stale IssuanceCertificateID pointer could sign with one key while
+// embedding a different CA certificate as issuer. It returns the issuer's
+// own certificate, needed as CertificateSigningRequest.IssuerCertificate
+// (§14.10), without touching the secret store -- the commit-side re-check
+// re-verifies these facts but has no need to re-read the actual key
+// ciphertext a second time, since prepare already did the one signature this
+// request needs.
+func verifyCASigningKeyLive(ctx context.Context, tx port.TxStores, issuer domain.Authority) (domain.Certificate, port.CAKeyGeneration, error) {
+	generation, err := tx.PKI().GetCAKeyGeneration(ctx, issuer.KeyGenerationID())
+	if errors.Is(err, port.ErrNotFound) {
+		return domain.Certificate{}, port.CAKeyGeneration{}, contract.NewAppError(contract.ErrorKindUnavailable,
+			"issuance_ca_key_generation_not_found", "the issuing authority's CA key generation could not be found")
+	} else if err != nil {
+		return domain.Certificate{}, port.CAKeyGeneration{}, storeError(err, "issuance_ca_key_generation_read_failed",
+			"could not read the issuing authority's CA key generation")
+	}
+	if !generation.KeyDestroyedAt.IsZero() {
+		return domain.Certificate{}, port.CAKeyGeneration{}, contract.NewAppError(contract.ErrorKindForbidden,
+			"issuance_ca_key_destroyed", "the issuing authority's signing key has been destroyed")
+	}
+
 	caCert, err := tx.PKI().GetCertificate(ctx, issuer.IssuanceCertificateID())
 	if err != nil {
-		return domain.EncryptedSecret{}, storeError(err, "issuance_issuer_certificate_read_failed",
+		return domain.Certificate{}, port.CAKeyGeneration{}, storeError(err, "issuance_issuer_certificate_read_failed",
 			"could not read the issuing authority's own certificate")
+	}
+	if caCert.KeyMaterialID() != generation.KeyMaterialID {
+		return domain.Certificate{}, port.CAKeyGeneration{}, contract.NewAppError(contract.ErrorKindForbidden,
+			"issuance_ca_certificate_key_mismatch",
+			"the issuing authority's certificate does not use its current CA key generation's key material")
+	}
+	caRecord, err := tx.PKI().GetCACertificateRecord(ctx, caCert.ID())
+	if err != nil {
+		return domain.Certificate{}, port.CAKeyGeneration{}, storeError(err, "issuance_ca_certificate_record_read_failed",
+			"could not read the issuing authority's CA certificate record")
+	}
+	if caRecord.CAKeyGenerationID != issuer.KeyGenerationID() {
+		return domain.Certificate{}, port.CAKeyGeneration{}, contract.NewAppError(contract.ErrorKindForbidden,
+			"issuance_ca_certificate_generation_mismatch",
+			"the issuing authority's certificate does not belong to its current CA key generation")
+	}
+	return caCert, generation, nil
+}
+
+// caSigningSecret resolves issuer's CA signing key the §14.9 way:
+// Authority.KeyGenerationID -> PKIRepository.GetCAKeyGeneration ->
+// KeyMaterialID -> the ca_signing (or bootstrap_ca) secret. §14.9 explicitly
+// rules out the older path through the authority's own certificate
+// ("issuer DN/확장/유효기간 검증용이며 세대 행 조회를 대신하지 않는다"),
+// because that path cannot see the generation row's KeyDestroyedAt. It
+// layers the actual secret fetch on top of verifyCASigningKeyLive's
+// consistency checks; use this at preparation time (where the secret is
+// actually needed to sign) and verifyCASigningKeyLive alone for the
+// commit-side re-check.
+func caSigningSecret(ctx context.Context, tx port.TxStores, issuer domain.Authority) (domain.EncryptedSecret, domain.Certificate, error) {
+	caCert, generation, err := verifyCASigningKeyLive(ctx, tx, issuer)
+	if err != nil {
+		return domain.EncryptedSecret{}, domain.Certificate{}, err
 	}
 	purpose := domain.SecretPurposeCASigning
 	if issuer.Kind() == domain.AuthorityKindBootstrap {
+		// §14.9: bootstrap issuance is a separate allowed intent under the
+		// bootstrap_ca purpose, never ca_signing.
 		purpose = domain.SecretPurposeBootstrapCA
 	}
-	secret, err := tx.Secrets().GetEncrypted(ctx, caCert.KeyMaterialID(), purpose)
+	secret, err := tx.Secrets().GetEncrypted(ctx, generation.KeyMaterialID, purpose)
 	if err != nil {
-		return domain.EncryptedSecret{}, storeError(err, "issuance_issuer_secret_read_failed",
+		return domain.EncryptedSecret{}, domain.Certificate{}, storeError(err, "issuance_issuer_secret_read_failed",
 			"could not read the issuing authority's signing key")
 	}
-	return secret, nil
+	return secret, caCert, nil
+}
+
+// resignWithNewSerial mints a fresh serial and re-signs against an already-
+// resolved key, the §14.10 collision-retry path ("serial 충돌만의 재시도는
+// 같은 요청과 키에 새 serial을 사용해 다시 서명한다"). It is the manual
+// counterpart of prepareCertificate for a retry: prepareCertificate always
+// resolves a key first, which would generate a second, unused key pair on
+// every collision if called again.
+func resignWithNewSerial(
+	ctx context.Context,
+	signer port.CertificateSigner,
+	serials port.SerialGenerator,
+	plan domain.IssuancePlan,
+	certificateID domain.CertificateID,
+	keyMaterialID domain.KeyMaterialID,
+	subjectPublicKey domain.PublicKey,
+	kind domain.CertificateKind,
+	createdBy domain.AccountID,
+	issuerCertificate domain.Certificate,
+	issuerKey domain.EncryptedSecret,
+) (domain.Certificate, error) {
+	serial, err := newSerial(ctx, serials)
+	if err != nil {
+		return domain.Certificate{}, err
+	}
+	return signCertificate(ctx, signer, port.CertificateSigningRequest{
+		Plan:               plan,
+		CertificateID:      certificateID,
+		KeyMaterialID:      keyMaterialID,
+		SubjectPublicKey:   subjectPublicKey,
+		Serial:             serial,
+		Kind:               kind,
+		CreatedByAccountID: createdBy,
+		IssuerCertificate:  issuerCertificate,
+		// §14: CRL distribution point URL construction is not specified by
+		// any doc this developer's scope covers (flagged for the lead).
+		CRLDistributionPoints: nil,
+	}, issuerKey)
 }
 
 // storeFreshKeyAndDelivery persists a freshly generated key's ciphertext and
@@ -567,11 +698,15 @@ func (s *IssuanceService) replayBeforePreparation(ctx context.Context, reqKey po
 		if err != nil || !ok {
 			return err
 		}
-		var view storedIssuanceResult
-		if err := DecodeStoredResult(stored, &view); err != nil {
+		view, err := decodeStoredIssuanceResult(stored)
+		if err != nil {
 			return err
 		}
-		*result = view.toView()
+		v, err := view.toView(ctx, tx)
+		if err != nil {
+			return err
+		}
+		*result = v
 		found = true
 		return nil
 	})
@@ -584,19 +719,27 @@ func (s *IssuanceService) replayBeforePreparation(ctx context.Context, reqKey po
 // re-checks every fact it depends on (§4 "Write callback 내부 순서는 인증/
 // 권한 확인 -> 요청 결과 재확인 -> version/현재 정책 확인 -> ...").
 type issuePrepared struct {
-	now             domain.Instant
-	policy          domain.SeriesPolicy
-	defaults        resolvedSeriesDefaults
-	plan            domain.IssuancePlan
-	keyMaterialID   domain.KeyMaterialID
-	publicKey       domain.PublicKey
-	generatedSecret *domain.EncryptedSecret
-	certificate     domain.Certificate
+	now               domain.Instant
+	policy            domain.SeriesPolicy
+	defaults          resolvedSeriesDefaults
+	plan              domain.IssuancePlan
+	issuerCertificate domain.Certificate
+	keyMaterialID     domain.KeyMaterialID
+	publicKey         domain.PublicKey
+	generatedSecret   *domain.EncryptedSecret
+	certificate       domain.Certificate
 }
 
 // prepareIssue performs §8's out-of-transaction preparation. Its reads go
 // through ReadStore, whose contract is that a read is preparation input only
 // and never authorizes a commit.
+//
+// On a serial-collision retry (reuse != nil) it keeps the previously
+// resolved key and only mints a new serial and re-signs
+// (docs/backend-implementation.md §14.10 "serial 충돌만의 재시도는 같은
+// 요청과 키에 새 serial을 사용해 다시 서명한다") instead of calling
+// prepareCertificate again, which would burn a second, unused key pair for a
+// fresh issuance's ref.Fresh.
 func (s *IssuanceService) prepareIssue(ctx context.Context, meta contract.MutationMeta, cmd contract.IssuanceIssueCommand, req domain.IssuanceRequest, rotateEvery int, rotateEveryPresent bool, authorityID domain.AuthorityID, reuse *issuePrepared) (issuePrepared, error) {
 	prep := issuePrepared{now: s.deps.Clock.Now()}
 
@@ -620,11 +763,12 @@ func (s *IssuanceService) prepareIssue(ctx context.Context, meta contract.Mutati
 		}
 		prep.defaults = defaults
 
-		secret, err := issuerSigningSecret(ctx, tx, a)
+		secret, issuerCert, err := caSigningSecret(ctx, tx, a)
 		if err != nil {
 			return err
 		}
 		issuerSecret = secret
+		prep.issuerCertificate = issuerCert
 		return nil
 	}); err != nil {
 		return issuePrepared{}, err
@@ -645,26 +789,38 @@ func (s *IssuanceService) prepareIssue(ctx context.Context, meta contract.Mutati
 	}
 	prep.plan = plan
 
+	// §14.10: the app chooses the certificate id before signing, not the
+	// signer.
+	certificateID, err := domain.ParseCertificateID(s.deps.IDs.NewUUID())
+	if err != nil {
+		return issuePrepared{}, contract.FromDomainError(err)
+	}
+
 	if reuse != nil {
 		prep.keyMaterialID, prep.publicKey, prep.generatedSecret = reuse.keyMaterialID, reuse.publicKey, reuse.generatedSecret
-	} else {
-		newKeyMaterialID, err := domain.ParseKeyMaterialID(s.deps.IDs.NewUUID())
-		if err != nil {
-			return issuePrepared{}, contract.FromDomainError(err)
-		}
-		ref := signingKeyRef{Fresh: &port.KeySpec{KeyMaterialID: newKeyMaterialID, Algorithm: req.KeyAlgorithm, Purpose: domain.SecretPurposeLeafDelivery}}
-		keyMaterialID, publicKey, generatedSecret, err := resolveSigningKey(ctx, s.deps.KeyEngine, ref)
+		cert, err := resignWithNewSerial(ctx, s.deps.CertificateSigner, s.deps.SerialGenerator, plan, certificateID,
+			prep.keyMaterialID, prep.publicKey, domain.CertificateKindLeaf, meta.Principal.AccountID(), prep.issuerCertificate, issuerSecret)
 		if err != nil {
 			return issuePrepared{}, err
 		}
-		prep.keyMaterialID, prep.publicKey, prep.generatedSecret = keyMaterialID, publicKey, generatedSecret
+		prep.certificate = cert
+		return prep, nil
 	}
 
-	cert, err := signCertificate(ctx, s.deps.CertificateSigner, s.deps.IDs, plan, issuerSecret, prep.keyMaterialID, domain.CertificateKindLeaf, meta.Principal.AccountID())
+	newKeyMaterialID, err := domain.ParseKeyMaterialID(s.deps.IDs.NewUUID())
+	if err != nil {
+		return issuePrepared{}, contract.FromDomainError(err)
+	}
+	ref := signingKeyRef{Fresh: &port.KeySpec{KeyMaterialID: newKeyMaterialID, Algorithm: req.KeyAlgorithm, Purpose: domain.SecretPurposeLeafDelivery}}
+	prepared, err := prepareCertificate(ctx, s.deps.KeyEngine, s.deps.CertificateSigner, s.deps.SerialGenerator, plan, ref,
+		domain.PublicKey{}, certificateID, prep.issuerCertificate, issuerSecret, domain.CertificateKindLeaf, meta.Principal.AccountID(), nil)
 	if err != nil {
 		return issuePrepared{}, err
 	}
-	prep.certificate = cert
+	prep.keyMaterialID = prepared.KeyMaterialID
+	prep.publicKey = prepared.GeneratedPublic
+	prep.generatedSecret = prepared.GeneratedSecret
+	prep.certificate = prepared.Certificate
 	return prep, nil
 }
 
@@ -680,11 +836,15 @@ func (s *IssuanceService) commitIssue(ctx context.Context, tx port.TxStores, met
 	if stored, found, err := ReplayStoredResult(ctx, tx, reqKey, inputHash); err != nil {
 		return err
 	} else if found {
-		var view storedIssuanceResult
-		if err := DecodeStoredResult(stored, &view); err != nil {
+		view, err := decodeStoredIssuanceResult(stored)
+		if err != nil {
 			return err
 		}
-		*result = view.toView()
+		v, err := view.toView(ctx, tx)
+		if err != nil {
+			return err
+		}
+		*result = v
 		return nil
 	}
 
@@ -707,6 +867,13 @@ func (s *IssuanceService) commitIssue(ctx context.Context, tx port.TxStores, met
 	// for.
 	if err := authority.CanIssue(domain.IssuerContext{RequestedWindow: prep.plan.Window, Intent: domain.IssuanceIntentLeaf}, prep.now); err != nil {
 		return contract.FromDomainError(err)
+	}
+	// §14.9: the CA key generation's destroyed/mismatch state is re-checked
+	// inside the commit as well as during preparation -- a key destroyed
+	// between the two must still block the store, even though the signature
+	// itself was already produced.
+	if _, _, err := verifyCASigningKeyLive(ctx, tx, authority); err != nil {
+		return err
 	}
 	if err := ensureSerialUnused(ctx, tx, prep.plan.IssuerKeyGenerationID, prep.certificate.Serial()); err != nil {
 		return err
@@ -751,6 +918,24 @@ func (s *IssuanceService) commitIssue(ctx context.Context, tx port.TxStores, met
 	if err := tx.PKI().InsertCertificate(ctx, cert); err != nil {
 		return storeError(err, "issuance_certificate_store_failed", "could not store the certificate")
 	}
+	policySnapshot, err := leafPolicySnapshotJSON(cert, prep.policy)
+	if err != nil {
+		return err
+	}
+	// §14.2/§14.4: the leaf_certificates subtype row is stored in the same
+	// Write as the certificate itself -- without it this certificate's chain
+	// could never be resolved.
+	if err := tx.PKI().InsertLeafCertificateRecord(ctx, port.LeafCertificateRecord{
+		CertificateID:         cert.ID(),
+		SeriesID:              seriesID,
+		LeafKeyGenerationID:   leafKeyGenID,
+		IssuerCACertificateID: prep.issuerCertificate.ID(),
+		Operation:             port.CertificateOperationInitial,
+		RenewalCountAtIssue:   0,
+		PolicySnapshotJSON:    policySnapshot,
+	}); err != nil {
+		return storeError(err, "issuance_leaf_certificate_record_store_failed", "could not store the leaf certificate record")
+	}
 	if err := tx.PKI().InsertSeries(ctx, series); err != nil {
 		return storeError(err, "issuance_series_store_failed", "could not store the series")
 	}
@@ -764,12 +949,13 @@ func (s *IssuanceService) commitIssue(ctx context.Context, tx port.TxStores, met
 	}
 
 	view := storedIssuanceResult{
+		SchemaVersion:   issuanceStoredResultSchemaVersion,
 		SeriesID:        string(seriesID),
 		CertificateID:   string(cert.ID()),
 		KeyGenerationID: string(leafKeyGenID),
 		RenewalCount:    0,
 		KeyRotated:      true,
-		Delivery:        toStoredDeliveryView(delivery),
+		DeliveryID:      string(delivery.ID()),
 	}
 	if err := StoreRequestResult(ctx, tx, reqKey, inputHash, view); err != nil {
 		return err
@@ -777,7 +963,11 @@ func (s *IssuanceService) commitIssue(ctx context.Context, tx port.TxStores, met
 	if err := appendIssuanceAudit(ctx, tx, s.deps.IDs, prep.now, meta, "issuance.issue", cert, authorityID); err != nil {
 		return err
 	}
-	*result = view.toView()
+	v, err := view.toView(ctx, tx)
+	if err != nil {
+		return err
+	}
+	*result = v
 	return nil
 }
 
@@ -878,6 +1068,7 @@ type renewPrepared struct {
 	snapshot          port.SeriesSnapshot
 	targetAuthorityID domain.AuthorityID
 	targetIssuerKeyID domain.CAKeyGenerationID
+	issuerCertificate domain.Certificate
 	renewalPlan       domain.RenewalPlan
 	plan              domain.IssuancePlan
 	keyRotated        bool
@@ -896,10 +1087,12 @@ func (s *IssuanceService) prepareRenew(ctx context.Context, meta contract.Mutati
 	prep := renewPrepared{now: s.deps.Clock.Now()}
 
 	var (
-		currentCert  domain.Certificate
-		targetIssuer domain.Authority
-		issuerSecret domain.EncryptedSecret
-		revoked      bool
+		currentCert      domain.Certificate
+		targetIssuer     domain.Authority
+		issuerSecret     domain.EncryptedSecret
+		issuerCert       domain.Certificate
+		currentPublicKey domain.PublicKey
+		revoked          bool
 	)
 	if err := s.deps.ReadStore.Read(ctx, func(tx port.TxStores) error {
 		snapshot, err := tx.PKI().GetSeriesForUpdate(ctx, seriesID)
@@ -930,6 +1123,20 @@ func (s *IssuanceService) prepareRenew(ctx context.Context, meta contract.Mutati
 		}
 		currentCert = cert
 
+		// §14.10: the subject public key for a reuse renewal is the stored
+		// key material's public half, read by id -- the leaf private key
+		// itself is never read on this path (certificate-lifecycle.md "일반
+		// 갱신에 서버 보관 Leaf 개인키는 필요하지 않다"). This is fetched
+		// unconditionally here (before the rotate-vs-reuse decision, which
+		// depends on facts not yet known) so it is available if the decision
+		// below turns out to be a reuse; a rotation path simply does not use
+		// it.
+		currentKeyMaterial, err := tx.PKI().GetKeyMaterial(ctx, snapshot.CurrentKeyGeneration.KeyMaterialID())
+		if err != nil {
+			return storeError(err, "issuance_key_material_read_failed", "could not read the current key material")
+		}
+		currentPublicKey = currentKeyMaterial.PublicKey
+
 		// A revoked or compromise-impacted key is never renewed on the
 		// ordinary path (certificate-lifecycle.md "폐기되었거나 유출 영향이
 		// 있는 인증서의 기존 키를 일반 갱신 경로로 재사용하지 않는다").
@@ -952,11 +1159,12 @@ func (s *IssuanceService) prepareRenew(ctx context.Context, meta contract.Mutati
 		}
 		targetIssuer = issuer
 
-		secret, err := issuerSigningSecret(ctx, tx, issuer)
+		secret, issuerCACert, err := caSigningSecret(ctx, tx, issuer)
 		if err != nil {
 			return err
 		}
 		issuerSecret = secret
+		issuerCert = issuerCACert
 
 		defaults, err := resolveSeriesDefaults(ctx, tx, nil, nil)
 		if err != nil {
@@ -997,6 +1205,7 @@ func (s *IssuanceService) prepareRenew(ctx context.Context, meta contract.Mutati
 	prep.renewalPlan = renewalPlan
 	prep.keyRotated = renewalPlan.Action == domain.RenewalActionRotateKey
 	prep.targetIssuerKeyID = targetIssuer.KeyGenerationID()
+	prep.issuerCertificate = issuerCert
 	prep.plan = domain.IssuancePlan{
 		Profile:               currentCert.Profile(),
 		Subject:               currentCert.Subject(),
@@ -1007,34 +1216,61 @@ func (s *IssuanceService) prepareRenew(ctx context.Context, meta contract.Mutati
 		IssuerKeyGenerationID: targetIssuer.KeyGenerationID(),
 	}
 
-	switch {
-	case reuse != nil && reuse.keyRotated == prep.keyRotated:
+	// §14.10: the app chooses the certificate id before signing.
+	certificateID, err := domain.ParseCertificateID(s.deps.IDs.NewUUID())
+	if err != nil {
+		return renewPrepared{}, contract.FromDomainError(err)
+	}
+
+	if reuse != nil && reuse.keyRotated == prep.keyRotated {
 		// Collision retry: re-sign against the key the first attempt already
-		// resolved instead of generating another one.
+		// resolved instead of generating another one (§14.10 "serial 충돌만의
+		// 재시도는 같은 요청과 키에 새 serial을 사용해 다시 서명한다").
 		prep.keyMaterialID, prep.publicKey, prep.generatedSecret = reuse.keyMaterialID, reuse.publicKey, reuse.generatedSecret
-	case !prep.keyRotated:
-		// An ordinary renewal signs against the stored public key; the leaf
-		// private key is never read (certificate-lifecycle.md "일반 갱신에
-		// 서버 보관 Leaf 개인키는 필요하지 않다").
-		prep.keyMaterialID = prep.snapshot.CurrentKeyGeneration.KeyMaterialID()
-	default:
+		cert, err := resignWithNewSerial(ctx, s.deps.CertificateSigner, s.deps.SerialGenerator, prep.plan, certificateID,
+			prep.keyMaterialID, prep.publicKey, domain.CertificateKindLeaf, meta.Principal.AccountID(), prep.issuerCertificate, issuerSecret)
+		if err != nil {
+			return renewPrepared{}, err
+		}
+		prep.certificate = cert
+		return prep, nil
+	}
+
+	var (
+		ref               signingKeyRef
+		existingPublicKey domain.PublicKey
+	)
+	if prep.keyRotated {
 		newKeyMaterialID, err := domain.ParseKeyMaterialID(s.deps.IDs.NewUUID())
 		if err != nil {
 			return renewPrepared{}, contract.FromDomainError(err)
 		}
-		ref := signingKeyRef{Fresh: &port.KeySpec{KeyMaterialID: newKeyMaterialID, Algorithm: currentCert.KeyAlgorithm(), Purpose: domain.SecretPurposeLeafDelivery}}
-		keyMaterialID, publicKey, generatedSecret, err := resolveSigningKey(ctx, s.deps.KeyEngine, ref)
-		if err != nil {
-			return renewPrepared{}, err
-		}
-		prep.keyMaterialID, prep.publicKey, prep.generatedSecret = keyMaterialID, publicKey, generatedSecret
+		ref = signingKeyRef{Fresh: &port.KeySpec{KeyMaterialID: newKeyMaterialID, Algorithm: currentCert.KeyAlgorithm(), Purpose: domain.SecretPurposeLeafDelivery}}
+	} else {
+		// An ordinary renewal signs against the stored public key read
+		// during preparation; the leaf private key is never read
+		// (certificate-lifecycle.md "일반 갱신에 서버 보관 Leaf 개인키는
+		// 필요하지 않다").
+		ref = signingKeyRef{Existing: prep.snapshot.CurrentKeyGeneration.KeyMaterialID()}
+		existingPublicKey = currentPublicKey
 	}
-
-	cert, err := signCertificate(ctx, s.deps.CertificateSigner, s.deps.IDs, prep.plan, issuerSecret, prep.keyMaterialID, domain.CertificateKindLeaf, meta.Principal.AccountID())
+	prepared, err := prepareCertificate(ctx, s.deps.KeyEngine, s.deps.CertificateSigner, s.deps.SerialGenerator, prep.plan, ref,
+		existingPublicKey, certificateID, prep.issuerCertificate, issuerSecret, domain.CertificateKindLeaf, meta.Principal.AccountID(), nil)
 	if err != nil {
 		return renewPrepared{}, err
 	}
-	prep.certificate = cert
+	prep.keyMaterialID = prepared.KeyMaterialID
+	prep.generatedSecret = prepared.GeneratedSecret
+	if prep.keyRotated {
+		prep.publicKey = prepared.GeneratedPublic
+	} else {
+		// prepareCertificate's preparedCertificate.GeneratedPublic is zero
+		// for a reused key (nothing was generated); the subject public key
+		// for a resign-only retry must still be available, so it is tracked
+		// independently of that struct here.
+		prep.publicKey = existingPublicKey
+	}
+	prep.certificate = prepared.Certificate
 	return prep, nil
 }
 
@@ -1055,11 +1291,15 @@ func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, met
 	if stored, found, err := ReplayStoredResult(ctx, tx, reqKey, inputHash); err != nil {
 		return err
 	} else if found {
-		var view storedIssuanceResult
-		if err := DecodeStoredResult(stored, &view); err != nil {
+		view, err := decodeStoredIssuanceResult(stored)
+		if err != nil {
 			return err
 		}
-		*result = view.toView()
+		v, err := view.toView(ctx, tx)
+		if err != nil {
+			return err
+		}
+		*result = v
 		return nil
 	}
 
@@ -1093,6 +1333,11 @@ func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, met
 	if err := targetIssuer.CanIssue(domain.IssuerContext{RequestedWindow: prep.plan.Window, Intent: domain.IssuanceIntentLeaf}, prep.now); err != nil {
 		return contract.FromDomainError(err)
 	}
+	// §14.9: re-verify the CA key generation/certificate consistency inside
+	// the commit as well.
+	if _, _, err := verifyCASigningKeyLive(ctx, tx, targetIssuer); err != nil {
+		return err
+	}
 	if err := ensureSerialUnused(ctx, tx, prep.plan.IssuerKeyGenerationID, prep.certificate.Serial()); err != nil {
 		return err
 	}
@@ -1103,7 +1348,7 @@ func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, met
 	}
 
 	var leafKeyGenID domain.LeafKeyGenerationID
-	var deliveryView *storedDeliveryView
+	var deliveryID domain.DeliveryID
 	if prep.keyRotated {
 		newGenID, err := domain.ParseLeafKeyGenerationID(s.deps.IDs.NewUUID())
 		if err != nil {
@@ -1132,7 +1377,7 @@ func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, met
 		if err != nil {
 			return err
 		}
-		deliveryView = toStoredDeliveryView(delivery)
+		deliveryID = delivery.ID()
 	} else {
 		leafKeyGenID = prep.renewalPlan.KeyGenerationID
 		updatedGen, err := domain.NewLeafKeyGeneration(domain.LeafKeyGenerationFacts{
@@ -1169,13 +1414,43 @@ func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, met
 		return storeError(err, "issuance_series_save_failed", "could not update the series")
 	}
 
+	// §14.2/§14.4: the leaf_certificates subtype row, in the same Write as
+	// the certificate. Operation distinguishes an ordinary reuse renewal
+	// from one that rotated to a new key, per data-model.md's
+	// operation=initial/renew/rekey/migrate/emergency/import enum; no doc in
+	// this developer's scope names which of renew/rekey applies to which
+	// case, so this maps key-reuse to "renew" and key-rotation to "rekey" as
+	// the most literal reading of the enum names -- flagged for the lead to
+	// confirm.
+	operation := port.CertificateOperationRenew
+	if prep.keyRotated {
+		operation = port.CertificateOperationRekey
+	}
+	policySnapshot, err := leafPolicySnapshotJSON(cert, snapshot.Series.Policy())
+	if err != nil {
+		return err
+	}
+	if err := tx.PKI().InsertLeafCertificateRecord(ctx, port.LeafCertificateRecord{
+		CertificateID:         cert.ID(),
+		SeriesID:              snapshot.Series.ID(),
+		LeafKeyGenerationID:   leafKeyGenID,
+		IssuerCACertificateID: prep.issuerCertificate.ID(),
+		PreviousCertificateID: cmd.SourceCertificateID,
+		Operation:             operation,
+		RenewalCountAtIssue:   prep.renewalPlan.NextRenewalCount,
+		PolicySnapshotJSON:    policySnapshot,
+	}); err != nil {
+		return storeError(err, "issuance_leaf_certificate_record_store_failed", "could not store the leaf certificate record")
+	}
+
 	view := storedIssuanceResult{
+		SchemaVersion:   issuanceStoredResultSchemaVersion,
 		SeriesID:        string(snapshot.Series.ID()),
 		CertificateID:   string(cert.ID()),
 		KeyGenerationID: string(leafKeyGenID),
 		RenewalCount:    int64(prep.renewalPlan.NextRenewalCount),
 		KeyRotated:      prep.keyRotated,
-		Delivery:        deliveryView,
+		DeliveryID:      string(deliveryID),
 	}
 	if err := StoreRequestResult(ctx, tx, reqKey, inputHash, view); err != nil {
 		return err
@@ -1183,6 +1458,10 @@ func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, met
 	if err := appendIssuanceAudit(ctx, tx, s.deps.IDs, prep.now, meta, "issuance.renew", cert, targetIssuer.ID()); err != nil {
 		return err
 	}
-	*result = view.toView()
+	v, err := view.toView(ctx, tx)
+	if err != nil {
+		return err
+	}
+	*result = v
 	return nil
 }

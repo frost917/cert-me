@@ -63,51 +63,76 @@ func (e *fakeKeyEngine) Reencrypt(context.Context, domain.EncryptedSecret, port.
 	return domain.EncryptedSecret{}, errors.New("fakeKeyEngine: Reencrypt not supported")
 }
 
-// fakeSigner is a deterministic port.CertificateSigner. serials, when set,
-// names the hex serial each successive call returns (a repeated value lets a
-// test force a collision); once exhausted it falls back to a counter-derived
-// serial so an unconfigured test still gets distinct values.
+// fakeSigner is a deterministic port.CertificateSigner. Per §14.10 the
+// signer must return exactly the identifiers/serial/subject the request
+// asked for, so by default this fake faithfully echoes request back into a
+// domain.Certificate -- every "wrong signer" scenario is expressed instead
+// through mutateFacts, which lets a test perturb exactly one field of the
+// otherwise-faithful CertificateFacts before NewCertificate builds it
+// (TestSignCertificateRejectsAMismatchedResponse in certificate_test.go).
 type fakeSigner struct {
+	calls       int
+	fail        error
+	mutateFacts func(domain.CertificateFacts) domain.CertificateFacts
+	// requests records every CertificateSigningRequest this fake received,
+	// so a test can assert what the app actually asked to be signed (§14.10
+	// "B03은 recording signer 대역으로 public key·ID·serial 전달 ... 을
+	// 검사").
+	requests []port.CertificateSigningRequest
+}
+
+func (s *fakeSigner) Sign(_ context.Context, request port.CertificateSigningRequest, _ domain.EncryptedSecret) (domain.Certificate, error) {
+	idx := s.calls
+	s.calls++
+	s.requests = append(s.requests, request)
+	if s.fail != nil {
+		return domain.Certificate{}, s.fail
+	}
+	facts := domain.CertificateFacts{
+		ID:                      request.CertificateID,
+		DER:                     []byte(fmt.Sprintf("der-%d-%s", idx, request.Serial.Hex())),
+		KeyMaterialID:           request.KeyMaterialID,
+		IssuerCAKeyGenerationID: request.Plan.IssuerKeyGenerationID,
+		Serial:                  request.Serial,
+		Validity:                request.Plan.Window,
+		Subject:                 request.Plan.Subject,
+		SANs:                    request.Plan.SANs,
+		Kind:                    request.Kind,
+		Profile:                 request.Plan.Profile,
+		KeyAlgorithm:            request.Plan.KeyAlgorithm,
+		Origin:                  domain.CertificateOriginGenerated,
+	}
+	if s.mutateFacts != nil {
+		facts = s.mutateFacts(facts)
+	}
+	return domain.NewCertificate(facts)
+}
+
+// fakeSerialGenerator is a deterministic port.SerialGenerator. serials, when
+// set, names the hex serial each successive call returns (a repeated value
+// lets a test force a signing collision); once exhausted it falls back to a
+// counter-derived serial so an unconfigured test still gets distinct values.
+// Splitting this out from fakeSigner reflects §14.10: the serial is minted
+// by SerialGenerator *before* signing, not chosen by the signer, so a fake
+// signer can no longer substitute its own serial into the response --
+// signCertificate would reject that as a mismatch.
+type fakeSerialGenerator struct {
 	calls   int
 	serials []string
 	fail    error
 }
 
-func (s *fakeSigner) Sign(_ context.Context, plan domain.IssuancePlan, _ domain.EncryptedSecret) (domain.Certificate, error) {
-	idx := s.calls
-	s.calls++
-	if s.fail != nil {
-		return domain.Certificate{}, s.fail
+func (g *fakeSerialGenerator) NewSerial(context.Context) (domain.SerialNumber, error) {
+	idx := g.calls
+	g.calls++
+	if g.fail != nil {
+		return domain.SerialNumber{}, g.fail
 	}
 	hex := fmt.Sprintf("%x", 1000+idx)
-	if idx < len(s.serials) {
-		hex = s.serials[idx]
+	if idx < len(g.serials) {
+		hex = g.serials[idx]
 	}
-	ser, err := domain.ParseSerialNumber(hex)
-	if err != nil {
-		return domain.Certificate{}, err
-	}
-	// signCertificate only reads DER() and Serial() off this value -- every
-	// other field is rebuilt from plan/keyMaterialID by the caller (see
-	// certificate.go's signCertificate doc comment on the CertificateSigner
-	// contract gap) -- so the placeholder id/key material below are never
-	// observed by production code, only by this fake's own constructor.
-	placeholderID, _ := domain.ParseCertificateID("00000000-0000-4000-8000-000000000000")
-	placeholderKey, _ := domain.ParseKeyMaterialID("00000000-0000-4000-8000-000000000001")
-	return domain.NewCertificate(domain.CertificateFacts{
-		ID:                      placeholderID,
-		DER:                     []byte(fmt.Sprintf("der-%d-%s", idx, hex)),
-		KeyMaterialID:           placeholderKey,
-		IssuerCAKeyGenerationID: plan.IssuerKeyGenerationID,
-		Serial:                  ser,
-		Validity:                plan.Window,
-		Subject:                 plan.Subject,
-		SANs:                    plan.SANs,
-		Kind:                    domain.CertificateKindLeaf,
-		Profile:                 plan.Profile,
-		KeyAlgorithm:            plan.KeyAlgorithm,
-		Origin:                  domain.CertificateOriginGenerated,
-	})
+	return domain.ParseSerialNumber(hex)
 }
 
 // toggleAuthorizer lets a test flip authorization between calls, simulating
@@ -210,11 +235,31 @@ func issueMutationMeta(t *testing.T, idempotencyKey string) contract.MutationMet
 }
 
 // seedIssuableIntermediate inserts an Intermediate authority whose own
-// signing certificate and encrypted CA key are stored, so
-// Authority.CanIssue succeeds and issuerSigningSecret can resolve its key
-// (see issuance.go's issuerSigningSecret doc comment for why that goes
-// through GetCertificate rather than a CAKeyGeneration-by-id lookup).
+// signing certificate, CA key generation row, CA certificate subtype record
+// and encrypted CA key are all stored, so Authority.CanIssue succeeds and
+// caSigningSecret can resolve its key the §14.9 way (generation -> key
+// material -> ca_signing secret, with the CA certificate record checked for
+// generation/key-material consistency).
 func seedIssuableIntermediate(t *testing.T, store *porttest.Store, ids port.IDGenerator, now domain.Instant) domain.AuthorityID {
+	t.Helper()
+	return seedIssuableIntermediateWithOptions(t, store, ids, now, caSeedOptions{})
+}
+
+// caSeedOptions lets a §14.9 test seed a CA whose key generation/certificate
+// consistency is already broken, instead of seedIssuableIntermediate's
+// always-consistent default.
+type caSeedOptions struct {
+	// keyDestroyedAt, when non-zero, is stored on the ca_key_generations row
+	// so caSigningSecret's KeyDestroyedAt check rejects issuance.
+	keyDestroyedAt domain.Instant
+	// mismatchCACertificateRecord, when true, stores the CA certificate
+	// record under a CA key generation id that is NOT the authority's own,
+	// so caSigningSecret's generation/certificate consistency check rejects
+	// issuance.
+	mismatchCACertificateRecord bool
+}
+
+func seedIssuableIntermediateWithOptions(t *testing.T, store *porttest.Store, ids port.IDGenerator, now domain.Instant, opts caSeedOptions) domain.AuthorityID {
 	t.Helper()
 	ctx := context.Background()
 
@@ -296,10 +341,26 @@ func seedIssuableIntermediate(t *testing.T, store *porttest.Store, ids port.IDGe
 		if err := tx.PKI().InsertKeyMaterial(ctx, port.KeyMaterial{ID: caKeyMaterialID, PublicKey: pub, Origin: "generated"}); err != nil {
 			return err
 		}
-		if err := tx.PKI().InsertKeyGeneration(ctx, port.CAKeyGeneration{ID: caKeyGenID, AuthorityID: authorityID, KeyMaterialID: caKeyMaterialID, GenerationNo: 1}); err != nil {
+		if err := tx.PKI().InsertKeyGeneration(ctx, port.CAKeyGeneration{
+			ID: caKeyGenID, AuthorityID: authorityID, KeyMaterialID: caKeyMaterialID, GenerationNo: 1,
+			KeyDestroyedAt: opts.keyDestroyedAt,
+		}); err != nil {
 			return err
 		}
 		if err := tx.PKI().InsertCertificate(ctx, caCert); err != nil {
+			return err
+		}
+		// §14.9's cross-check: the CA certificate record must name this same
+		// CA key generation, or caSigningSecret rejects the pair as
+		// mismatched. mismatchCACertificateRecord deliberately breaks this.
+		recordGenID := caKeyGenID
+		if opts.mismatchCACertificateRecord {
+			recordGenID = caKeyID(t, 999999)
+		}
+		if err := tx.PKI().InsertCACertificateRecord(ctx, port.CACertificateRecord{
+			CertificateID:     caCertID,
+			CAKeyGenerationID: recordGenID,
+		}); err != nil {
 			return err
 		}
 		if err := tx.Secrets().InsertEncrypted(ctx, secret); err != nil {
@@ -313,6 +374,48 @@ func seedIssuableIntermediate(t *testing.T, store *porttest.Store, ids port.IDGe
 	return authorityID
 }
 
+// defaultTestSettingsV1 is a fully-resolved, in-range SettingsV1 snapshot
+// (§14.8): every issuance test seeds one, since resolveSeriesDefaults now
+// requires a validated Settings row to exist before Issue/Renew can resolve
+// PrivateDeliverySeconds (there is no factory-default fallback any more).
+func defaultTestSettingsV1() SettingsV1 {
+	leafValidity, _ := domain.NewCalendarValidity(1, domain.ValidityUnitYears)
+	rootValidity, _ := domain.NewCalendarValidity(10, domain.ValidityUnitYears)
+	intermediateValidity, _ := domain.NewCalendarValidity(5, domain.ValidityUnitYears)
+	return SettingsV1{
+		ServiceURL:             "https://cert.example.test",
+		LeafValidity:           leafValidity,
+		RootValidity:           rootValidity,
+		IntermediateValidity:   intermediateValidity,
+		RotateEvery:            3,
+		PrivateDeliverySeconds: 3 * 60 * 60,
+		PublicLinkSeconds:      600,
+		CRLIntervalSeconds:     43200,
+		CRLValiditySeconds:     172800,
+		AuditRetentionDays:     365,
+	}
+}
+
+// seedDefaultSettings writes defaultTestSettingsV1 as the installation's
+// service_settings row, schema_version=1, through the same EncodeSettingsV1
+// codec B04's SettingsService would use to write it for real.
+func seedDefaultSettings(t *testing.T, store *porttest.Store) {
+	t.Helper()
+	encoded, err := EncodeSettingsV1(defaultTestSettingsV1())
+	if err != nil {
+		t.Fatalf("encode settings: %v", err)
+	}
+	err = store.Write(context.Background(), func(tx port.TxStores) error {
+		return tx.Installation().SaveSettings(context.Background(), port.Settings{
+			SchemaVersion: 1,
+			SettingsJSON:  encoded,
+		}, 0)
+	})
+	if err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+}
+
 // issuanceFixture bundles one IssuanceService with its deterministic
 // dependencies and the store/authority it was built against.
 type issuanceFixture struct {
@@ -320,6 +423,7 @@ type issuanceFixture struct {
 	ids         *seqIDs
 	keyEngine   *fakeKeyEngine
 	signer      *fakeSigner
+	serials     *fakeSerialGenerator
 	authorizer  *toggleAuthorizer
 	svc         *IssuanceService
 	authorityID domain.AuthorityID
@@ -327,12 +431,19 @@ type issuanceFixture struct {
 
 func newIssuanceFixture(t *testing.T) *issuanceFixture {
 	t.Helper()
+	return newIssuanceFixtureWithCAOptions(t, caSeedOptions{})
+}
+
+func newIssuanceFixtureWithCAOptions(t *testing.T, caOpts caSeedOptions) *issuanceFixture {
+	t.Helper()
 	store := porttest.NewStore()
 	ids := &seqIDs{}
-	authorityID := seedIssuableIntermediate(t, store, ids, testNow())
+	authorityID := seedIssuableIntermediateWithOptions(t, store, ids, testNow(), caOpts)
+	seedDefaultSettings(t, store)
 
 	keyEngine := &fakeKeyEngine{}
 	signer := &fakeSigner{}
+	serials := &fakeSerialGenerator{}
 	authorizer := &toggleAuthorizer{allow: true}
 
 	svc, err := NewIssuanceService(IssuanceDeps{
@@ -345,12 +456,13 @@ func newIssuanceFixture(t *testing.T) *issuanceFixture {
 		},
 		KeyEngine:         keyEngine,
 		CertificateSigner: signer,
+		SerialGenerator:   serials,
 		ProfileValidator:  noopProfileValidator{},
 	})
 	if err != nil {
 		t.Fatalf("new issuance service: %v", err)
 	}
-	return &issuanceFixture{store: store, ids: ids, keyEngine: keyEngine, signer: signer, authorizer: authorizer, svc: svc, authorityID: authorityID}
+	return &issuanceFixture{store: store, ids: ids, keyEngine: keyEngine, signer: signer, serials: serials, authorizer: authorizer, svc: svc, authorityID: authorityID}
 }
 
 func issueCommand(authorityID domain.AuthorityID, name string) contract.IssuanceIssueCommand {
@@ -503,7 +615,7 @@ func TestIssuanceIssueUnauthorizedPrincipalCannotReplay(t *testing.T) {
 // never by editing the already-signed DER's serial field.
 func TestIssuanceIssueSerialCollisionRetriesWithANewSignature(t *testing.T) {
 	f := newIssuanceFixture(t)
-	f.signer.serials = []string{"10", "10", "20"}
+	f.serials.serials = []string{"10", "10", "20"}
 
 	// Pre-seed a certificate that already uses serial 0x10 under this
 	// issuer, so the first two signing attempts collide.
@@ -574,7 +686,7 @@ func TestIssuanceIssueSerialCollisionRetriesWithANewSignature(t *testing.T) {
 // whose revocation is on record must never be handed out again.
 func TestIssuanceIssueSerialCollidingWithARevocationIsReSigned(t *testing.T) {
 	f := newIssuanceFixture(t)
-	f.signer.serials = []string{"10", "20"}
+	f.serials.serials = []string{"10", "20"}
 
 	authorityID := f.authorityID
 	var issuerKeyGenID domain.CAKeyGenerationID
@@ -916,4 +1028,276 @@ func currentLeafKeyMaterialID(t *testing.T, f *issuanceFixture, seriesID domain.
 		t.Fatalf("read series: %v", err)
 	}
 	return keyID
+}
+
+// ---- §14.10: recording signer pass-through ----
+
+// TestIssuanceIssuePassesSigningInputToTheSigner is the recording-signer
+// check §14.10 explicitly calls for at the B03 level: the app must actually
+// hand the signer the resolved subject public key, the app-chosen
+// certificate/key material ids, the minted serial and the issuer's
+// certificate -- not some placeholder the signer is expected to overwrite.
+func TestIssuanceIssuePassesSigningInputToTheSigner(t *testing.T) {
+	f := newIssuanceFixture(t)
+	result, err := f.svc.Issue(context.Background(), issueMutationMeta(t, issuanceTestIdempotencyKey), issueCommand(f.authorityID, "web-1"))
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	if len(f.signer.requests) != 1 {
+		t.Fatalf("signer received %d requests, want 1", len(f.signer.requests))
+	}
+	got := f.signer.requests[0]
+	if got.SubjectPublicKey.IsZero() {
+		t.Fatal("signer did not receive a non-zero subject public key")
+	}
+	if string(got.CertificateID) != string(result.CertificateID) {
+		t.Fatalf("signer received certificate id %s, want %s", got.CertificateID, result.CertificateID)
+	}
+	if got.KeyMaterialID == "" {
+		t.Fatal("signer did not receive a key material id")
+	}
+	if got.Serial.IsZero() {
+		t.Fatal("signer received a zero serial")
+	}
+	if got.IssuerCertificate.ID() == "" {
+		t.Fatal("signer did not receive an issuer certificate")
+	}
+}
+
+// ---- §14.9: destroyed/mismatched CA key generation ----
+
+func TestIssuanceIssueRejectsWhenCAKeyGenerationIsDestroyed(t *testing.T) {
+	f := newIssuanceFixtureWithCAOptions(t, caSeedOptions{keyDestroyedAt: testNow().Add(domain.NewDuration(-time.Hour))})
+	_, err := f.svc.Issue(context.Background(), issueMutationMeta(t, issuanceTestIdempotencyKey), issueCommand(f.authorityID, "web-1"))
+	var appErr *contract.AppError
+	if !errors.As(err, &appErr) || appErr.Kind() != contract.ErrorKindForbidden {
+		t.Fatalf("err = %v, want a forbidden AppError", err)
+	}
+	if appErr.Code() != "issuance_ca_key_destroyed" {
+		t.Fatalf("code = %q, want issuance_ca_key_destroyed", appErr.Code())
+	}
+	if f.signer.calls != 0 {
+		t.Fatalf("signer was called %d times, want 0 for a destroyed CA key", f.signer.calls)
+	}
+}
+
+func TestIssuanceIssueRejectsWhenCACertificateGenerationMismatches(t *testing.T) {
+	f := newIssuanceFixtureWithCAOptions(t, caSeedOptions{mismatchCACertificateRecord: true})
+	_, err := f.svc.Issue(context.Background(), issueMutationMeta(t, issuanceTestIdempotencyKey), issueCommand(f.authorityID, "web-1"))
+	var appErr *contract.AppError
+	if !errors.As(err, &appErr) || appErr.Kind() != contract.ErrorKindForbidden {
+		t.Fatalf("err = %v, want a forbidden AppError", err)
+	}
+	if appErr.Code() != "issuance_ca_certificate_generation_mismatch" {
+		t.Fatalf("code = %q, want issuance_ca_certificate_generation_mismatch", appErr.Code())
+	}
+	if f.signer.calls != 0 {
+		t.Fatalf("signer was called %d times, want 0 for a mismatched CA certificate", f.signer.calls)
+	}
+}
+
+// ---- §14.2/§14.4: leaf_certificates subtype row ----
+
+// TestIssuanceIssueStoresTheLeafCertificateRecordWithTheCertificate checks
+// that the leaf subtype row lands in the same commit as the certificate,
+// with the fields §14.2/§14.4 require: the CA certificate that actually
+// signed it, the series/key generation it belongs to, the initial operation,
+// and a non-empty policy snapshot.
+func TestIssuanceIssueStoresTheLeafCertificateRecordWithTheCertificate(t *testing.T) {
+	f := newIssuanceFixture(t)
+	result, err := f.svc.Issue(context.Background(), issueMutationMeta(t, issuanceTestIdempotencyKey), issueCommand(f.authorityID, "web-1"))
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	var record port.LeafCertificateRecord
+	if err := f.store.Read(context.Background(), func(tx port.TxStores) error {
+		var readErr error
+		record, readErr = tx.PKI().GetLeafCertificateRecord(context.Background(), result.CertificateID)
+		return readErr
+	}); err != nil {
+		t.Fatalf("read leaf certificate record: %v", err)
+	}
+	if record.SeriesID != result.SeriesID {
+		t.Fatalf("record series id = %s, want %s", record.SeriesID, result.SeriesID)
+	}
+	if record.LeafKeyGenerationID != result.KeyGenerationID {
+		t.Fatalf("record key generation id = %s, want %s", record.LeafKeyGenerationID, result.KeyGenerationID)
+	}
+	if record.Operation != port.CertificateOperationInitial {
+		t.Fatalf("record operation = %q, want %q", record.Operation, port.CertificateOperationInitial)
+	}
+	if record.PreviousCertificateID != "" {
+		t.Fatalf("record previous certificate id = %q, want empty for a series' first certificate", record.PreviousCertificateID)
+	}
+	if record.IssuerCACertificateID == "" {
+		t.Fatal("record issuer CA certificate id is empty")
+	}
+	if len(record.PolicySnapshotJSON) == 0 {
+		t.Fatal("record policy snapshot is empty")
+	}
+}
+
+// TestIssuanceIssueRollbackLeavesNoLeafCertificateRecord is the rollback
+// half of the same requirement: a failure inside the Write must leave
+// neither the certificate nor its subtype row behind. It is checked by
+// retrying with the SAME idempotency key after fixing the signer: if the
+// failed attempt had left a certificate, series or leaf_certificates row
+// behind under any id, the retry would either collide with it or replay a
+// half-formed result instead of running a clean, brand-new issuance.
+func TestIssuanceIssueRollbackLeavesNoLeafCertificateRecord(t *testing.T) {
+	f := newIssuanceFixture(t)
+	f.signer.fail = errors.New("signing backend unavailable")
+	meta := issueMutationMeta(t, issuanceTestIdempotencyKey)
+	cmd := issueCommand(f.authorityID, "web-1")
+
+	if _, err := f.svc.Issue(context.Background(), meta, cmd); err == nil {
+		t.Fatal("want an error when signing fails")
+	}
+	if len(f.store.AuditEvents()) != 0 {
+		t.Fatalf("audit events = %d, want 0 after a failed issuance", len(f.store.AuditEvents()))
+	}
+
+	f.signer.fail = nil
+	result, err := f.svc.Issue(context.Background(), meta, cmd)
+	if err != nil {
+		t.Fatalf("retry with the same idempotency key after the prior failure: %v", err)
+	}
+	if err := f.store.Read(context.Background(), func(tx port.TxStores) error {
+		_, err := tx.PKI().GetLeafCertificateRecord(context.Background(), result.CertificateID)
+		return err
+	}); err != nil {
+		t.Fatalf("clean retry's leaf certificate record should exist: %v", err)
+	}
+}
+
+// ---- §14.7: stored replay DTO ----
+
+// TestIssuanceIssueReplayRereadsCurrentDeliveryStatus is the delivery half of
+// §14.7's replay rule: a replayed result must report the delivery's CURRENT
+// state, not whatever it was at the moment of the original commit.
+func TestIssuanceIssueReplayRereadsCurrentDeliveryStatus(t *testing.T) {
+	f := newIssuanceFixture(t)
+	meta := issueMutationMeta(t, issuanceTestIdempotencyKey)
+	cmd := issueCommand(f.authorityID, "web-1")
+
+	first, err := f.svc.Issue(context.Background(), meta, cmd)
+	if err != nil {
+		t.Fatalf("first issue: %v", err)
+	}
+	if first.Delivery == nil || first.Delivery.State != domain.DeliveryStatePending {
+		t.Fatalf("first delivery = %+v, want a pending delivery", first.Delivery)
+	}
+
+	// Mutate the delivery's stored state directly, simulating a failure
+	// recorded after the original issuance committed.
+	if err := f.store.Write(context.Background(), func(tx port.TxStores) error {
+		delivery, err := tx.Delivery().GetDeliveryForUpdate(context.Background(), first.Delivery.ID)
+		if err != nil {
+			return err
+		}
+		failed, err := delivery.Fail("transfer_failed", testNow())
+		if err != nil {
+			return err
+		}
+		return tx.Delivery().SaveDelivery(context.Background(), failed, delivery.Version())
+	}); err != nil {
+		t.Fatalf("fail delivery: %v", err)
+	}
+
+	replayed, err := f.svc.Issue(context.Background(), meta, cmd)
+	if err != nil {
+		t.Fatalf("replay issue: %v", err)
+	}
+	if replayed.CertificateID != first.CertificateID {
+		t.Fatalf("replayed certificate id = %s, want %s", replayed.CertificateID, first.CertificateID)
+	}
+	// Fault check: a naive replay that decoded a frozen delivery snapshot
+	// from the stored result DTO would still report "pending" here.
+	if replayed.Delivery == nil || replayed.Delivery.State != domain.DeliveryStateFailed {
+		t.Fatalf("replayed delivery = %+v, want the current failed state", replayed.Delivery)
+	}
+}
+
+// TestIssuanceReplayRejectsAnUnsupportedStoredSchemaVersion is §14.7's other
+// half: a stored request result whose schema_version this code does not
+// understand must be an error, not a best-effort decode under the current
+// field layout.
+func TestIssuanceReplayRejectsAnUnsupportedStoredSchemaVersion(t *testing.T) {
+	// decodeStoredIssuanceResult is exercised directly against a hand-built
+	// port.OperationRequestResult: forcing an actual bad-version row through
+	// the store is not possible (StoreRequestResult always writes the
+	// current schema_version, and InsertResult never overwrites an existing
+	// row), so this is the unit-level guarantee that a future schema bump
+	// cannot be silently reinterpreted under today's field layout.
+	badResult := port.OperationRequestResult{
+		InputHash:  "irrelevant",
+		ResultJSON: []byte(`{"schema_version":2,"series_id":"x","certificate_id":"y","key_generation_id":"z"}`),
+	}
+	_, err := decodeStoredIssuanceResult(badResult)
+	var appErr *contract.AppError
+	if !errors.As(err, &appErr) || appErr.Code() != "issuance_stored_result_schema_unsupported" {
+		t.Fatalf("err = %v, want issuance_stored_result_schema_unsupported", err)
+	}
+}
+
+// ---- §14.8: Settings required for issuance ----
+
+// TestIssuanceIssueRejectsWhenSettingsAreNotConfigured is the "초기 미설정은
+// Setup의 명시적 초기화 경로로만 처리" half of §14.8: a fresh install with no
+// service_settings row at all must fail Issue rather than silently apply a
+// factory default.
+func TestIssuanceIssueRejectsWhenSettingsAreNotConfigured(t *testing.T) {
+	store := porttest.NewStore()
+	ids := &seqIDs{}
+	authorityID := seedIssuableIntermediate(t, store, ids, testNow())
+	// Deliberately do NOT seed settings.
+
+	svc, err := NewIssuanceService(IssuanceDeps{
+		CommonDeps: CommonDeps{
+			UnitOfWork: store, ReadStore: store, Authorizer: &toggleAuthorizer{allow: true},
+			Clock: fixedClock{now: testNow()}, IDs: ids,
+		},
+		KeyEngine: &fakeKeyEngine{}, CertificateSigner: &fakeSigner{}, SerialGenerator: &fakeSerialGenerator{},
+		ProfileValidator: noopProfileValidator{},
+	})
+	if err != nil {
+		t.Fatalf("new issuance service: %v", err)
+	}
+
+	_, err = svc.Issue(context.Background(), issueMutationMeta(t, issuanceTestIdempotencyKey), issueCommand(authorityID, "web-1"))
+	var appErr *contract.AppError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("err = %v, want an AppError", err)
+	}
+	if appErr.Code() != "issuance_settings_not_configured" {
+		t.Fatalf("code = %q, want issuance_settings_not_configured", appErr.Code())
+	}
+}
+
+// TestIssuanceIssueRejectsCorruptSettingsRatherThanDefaulting is the "깨진
+// JSON·범위 오류를 공장 기본값으로 덮지 않는다" half: a Settings row that
+// exists but does not decode/validate must fail Issue rather than fall back
+// to a factory default.
+func TestIssuanceIssueRejectsCorruptSettingsRatherThanDefaulting(t *testing.T) {
+	f := newIssuanceFixture(t)
+	if err := f.store.Write(context.Background(), func(tx port.TxStores) error {
+		return tx.Installation().SaveSettings(context.Background(), port.Settings{
+			SchemaVersion: 1,
+			SettingsJSON:  []byte(`{not json`),
+		}, 0)
+	}); err != nil {
+		t.Fatalf("corrupt settings: %v", err)
+	}
+
+	_, err := f.svc.Issue(context.Background(), issueMutationMeta(t, issuanceTestIdempotencyKey), issueCommand(f.authorityID, "web-1"))
+	var appErr *contract.AppError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("err = %v, want an AppError", err)
+	}
+	if appErr.Code() != "settings_json_malformed" {
+		t.Fatalf("code = %q, want settings_json_malformed", appErr.Code())
+	}
+	if f.signer.calls != 0 {
+		t.Fatalf("signer was called %d times, want 0 when settings do not decode", f.signer.calls)
+	}
 }
