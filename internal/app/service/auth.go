@@ -34,10 +34,16 @@ var SessionIdleTimeout = domain.NewDuration(time.Hour)
 // 기존 결과도 받지 못한다") applies to authentication just as much as to
 // authorization. An early replay that skipped this would be a way around it.
 //
+// The validation time is read from clock HERE, after the account and session
+// rows are locked -- never carried in from the caller. A preparation
+// timestamp is minutes old by the time a signature is produced and a lock is
+// acquired, and validating against it lets a session that expired in that
+// window through. The expiry boundary has to be the commit's own moment.
+//
 // Non-admin principals carry no session to check: an internal or anonymous
 // principal is authenticated by the caller's own mechanism (an internal
 // operation grant, a download token), not by an account row.
-func requireCurrentAuth(ctx context.Context, tx port.TxStores, principal contract.Principal, now domain.Instant) error {
+func requireCurrentAuth(ctx context.Context, tx port.TxStores, principal contract.Principal, clock port.Clock) error {
 	if !principal.IsAdmin() {
 		return nil
 	}
@@ -66,6 +72,9 @@ func requireCurrentAuth(ctx context.Context, tx port.TxStores, principal contrac
 		}
 		return storeError(err, "session_read_failed", "could not read the session")
 	}
+	// Read the clock only now, with both rows already locked: this is the
+	// instant the commit is actually happening at.
+	now := clock.Now()
 	// ValidateAt owns the rest: session/account ownership, the account's
 	// current state, the epoch again, and both expiry rules.
 	if err := session.ValidateAt(now, SessionIdleTimeout, domain.SessionAccountFacts{

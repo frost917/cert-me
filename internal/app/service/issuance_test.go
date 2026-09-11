@@ -257,6 +257,10 @@ type caSeedOptions struct {
 	// so caSigningSecret's generation/certificate consistency check rejects
 	// issuance.
 	mismatchCACertificateRecord bool
+	// certificateNotAfter, when non-zero, overrides the CA certificate's own
+	// expiry, so a test can make the issuer stop being eligible at a chosen
+	// moment rather than in five years.
+	certificateNotAfter domain.Instant
 }
 
 func seedIssuableIntermediateWithOptions(t *testing.T, store *porttest.Store, ids port.IDGenerator, now domain.Instant, opts caSeedOptions) domain.AuthorityID {
@@ -288,7 +292,11 @@ func seedIssuableIntermediateWithOptions(t *testing.T, store *porttest.Store, id
 	if err != nil {
 		t.Fatalf("ca public key: %v", err)
 	}
-	window, err := domain.NewValidityWindow(now.Add(domain.NewDuration(-time.Hour)), now.Add(domain.NewDuration(24*365*5*time.Hour)))
+	notAfter := now.Add(domain.NewDuration(24 * 365 * 5 * time.Hour))
+	if !opts.certificateNotAfter.IsZero() {
+		notAfter = opts.certificateNotAfter
+	}
+	window, err := domain.NewValidityWindow(now.Add(domain.NewDuration(-time.Hour)), notAfter)
 	if err != nil {
 		t.Fatalf("ca window: %v", err)
 	}

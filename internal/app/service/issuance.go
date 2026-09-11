@@ -770,7 +770,7 @@ func (s *IssuanceService) replayBeforePreparation(
 ) (bool, error) {
 	var found bool
 	err := s.deps.ReadStore.Read(ctx, func(tx port.TxStores) error {
-		if err := requireCurrentAuth(ctx, tx, principal, now); err != nil {
+		if err := requireCurrentAuth(ctx, tx, principal, s.deps.Clock); err != nil {
 			return err
 		}
 		if err := authorize(ctx, tx); err != nil {
@@ -946,10 +946,18 @@ func (s *IssuanceService) prepareIssue(ctx context.Context, meta contract.Mutati
 // order: authorization, stored-result replay, current-policy re-check, then
 // the stores, the request result and the audit row.
 func (s *IssuanceService) commitIssue(ctx context.Context, tx port.TxStores, meta contract.MutationMeta, cmd contract.IssuanceIssueCommand, reqKey port.OperationRequestKey, inputHash string, prep issuePrepared, result *contract.IssuanceView) error {
+	// The commit's own clock read. §2's "현재" checks -- is this session
+	// still live, may this issuer still issue -- have to be judged at the
+	// moment the commit happens, not at the moment preparation started: a
+	// signature and a lock wait sit in between. prep.now stays the
+	// issuance-time fact baked into the signed certificate (its NotBefore
+	// and the window the plan was built for); it is not a substitute for
+	// "now" in an eligibility check.
+	commitNow := s.deps.Clock.Now()
 	authorityID := cmd.AuthorityID
 	// §2/§4: the current account state, auth epoch and session are re-checked
 	// under lock, before authorization and before any replay.
-	if err := requireCurrentAuth(ctx, tx, meta.Principal, prep.now); err != nil {
+	if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 		return err
 	}
 	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionIssuanceIssue, port.NewAuthorizationScope(authorityID)); err != nil {
@@ -988,7 +996,7 @@ func (s *IssuanceService) commitIssue(ctx context.Context, tx port.TxStores, met
 	// §13-3: app assembles the IssuerContext and re-checks CanIssue inside
 	// the transaction, against the same window the certificate was signed
 	// for.
-	if err := authority.CanIssue(domain.IssuerContext{RequestedWindow: prep.plan.Window, Intent: domain.IssuanceIntentLeaf}, prep.now); err != nil {
+	if err := authority.CanIssue(domain.IssuerContext{RequestedWindow: prep.plan.Window, Intent: domain.IssuanceIntentLeaf}, commitNow); err != nil {
 		return contract.FromDomainError(err)
 	}
 	// §14.9: the CA key generation's destroyed/mismatch state is re-checked
@@ -1073,7 +1081,7 @@ func (s *IssuanceService) commitIssue(ctx context.Context, tx port.TxStores, met
 		return contract.NewAppError(contract.ErrorKindUnavailable, "issuance_missing_generated_secret",
 			"a fresh issuance did not produce a key to store")
 	}
-	delivery, err := storeFreshKeyAndDelivery(ctx, tx, s.deps.IDs, prep.now, prep.keyMaterialID, prep.publicKey, *prep.generatedSecret, leafKeyGenID, cert.ID(), prep.defaults.PrivateDeliverySeconds)
+	delivery, err := storeFreshKeyAndDelivery(ctx, tx, s.deps.IDs, commitNow, prep.keyMaterialID, prep.publicKey, *prep.generatedSecret, leafKeyGenID, cert.ID(), prep.defaults.PrivateDeliverySeconds)
 	if err != nil {
 		return err
 	}
@@ -1090,7 +1098,7 @@ func (s *IssuanceService) commitIssue(ctx context.Context, tx port.TxStores, met
 	if err := StoreRequestResult(ctx, tx, reqKey, inputHash, view); err != nil {
 		return err
 	}
-	if err := appendIssuanceAudit(ctx, tx, s.deps.IDs, prep.now, meta, "issuance.issue", cert, authorityID); err != nil {
+	if err := appendIssuanceAudit(ctx, tx, s.deps.IDs, commitNow, meta, "issuance.issue", cert, authorityID); err != nil {
 		return err
 	}
 	v, err := view.toView(ctx, tx)
@@ -1461,6 +1469,14 @@ func ensureKeyStillRenewable(ctx context.Context, tx port.TxStores, prep renewPr
 
 // commitRenew is Renew's single Write, in §4's fixed order.
 func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, meta contract.MutationMeta, cmd contract.IssuanceRenewCommand, reqKey port.OperationRequestKey, inputHash string, expectedVersion domain.Version, prep renewPrepared, result *contract.IssuanceView) error {
+	// The commit's own clock read. §2's "현재" checks -- is this session
+	// still live, may this issuer still issue -- have to be judged at the
+	// moment the commit happens, not at the moment preparation started: a
+	// signature and a lock wait sit in between. prep.now stays the
+	// issuance-time fact baked into the signed certificate (its NotBefore
+	// and the window the plan was built for); it is not a substitute for
+	// "now" in an eligibility check.
+	commitNow := s.deps.Clock.Now()
 	snapshot, err := tx.PKI().GetSeriesForUpdate(ctx, cmd.SeriesID)
 	if errors.Is(err, port.ErrNotFound) {
 		return contract.NewAppError(contract.ErrorKindValidation, "series_not_found", "series does not exist").
@@ -1469,7 +1485,7 @@ func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, met
 		return storeError(err, "issuance_series_read_failed", "could not read the series")
 	}
 
-	if err := requireCurrentAuth(ctx, tx, meta.Principal, prep.now); err != nil {
+	if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 		return err
 	}
 	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionIssuanceRenew, port.NewAuthorizationScope(snapshot.Series.ManagementAuthorityID())); err != nil {
@@ -1518,7 +1534,7 @@ func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, met
 	}
 	// §13-3: the IssuerContext is assembled by app and CanIssue is re-checked
 	// inside the transaction.
-	if err := targetIssuer.CanIssue(domain.IssuerContext{RequestedWindow: prep.plan.Window, Intent: domain.IssuanceIntentLeaf}, prep.now); err != nil {
+	if err := targetIssuer.CanIssue(domain.IssuerContext{RequestedWindow: prep.plan.Window, Intent: domain.IssuanceIntentLeaf}, commitNow); err != nil {
 		return contract.FromDomainError(err)
 	}
 	// §14.9: re-verify the CA key generation/certificate consistency inside
@@ -1581,7 +1597,7 @@ func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, met
 			return contract.NewAppError(contract.ErrorKindUnavailable, "issuance_missing_generated_secret",
 				"a key rotation did not produce a key to store")
 		}
-		delivery, err := storeFreshKeyAndDelivery(ctx, tx, s.deps.IDs, prep.now, prep.keyMaterialID, prep.publicKey, *prep.generatedSecret, newGenID, cert.ID(), prep.deliverySeconds)
+		delivery, err := storeFreshKeyAndDelivery(ctx, tx, s.deps.IDs, commitNow, prep.keyMaterialID, prep.publicKey, *prep.generatedSecret, newGenID, cert.ID(), prep.deliverySeconds)
 		if err != nil {
 			return err
 		}
@@ -1663,7 +1679,7 @@ func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, met
 	if err := StoreRequestResult(ctx, tx, reqKey, inputHash, view); err != nil {
 		return err
 	}
-	if err := appendIssuanceAudit(ctx, tx, s.deps.IDs, prep.now, meta, "issuance.renew", cert, targetIssuer.ID()); err != nil {
+	if err := appendIssuanceAudit(ctx, tx, s.deps.IDs, commitNow, meta, "issuance.renew", cert, targetIssuer.ID()); err != nil {
 		return err
 	}
 	v, err := view.toView(ctx, tx)
