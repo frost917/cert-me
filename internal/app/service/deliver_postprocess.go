@@ -84,7 +84,7 @@ func invokeSink(ctx context.Context, sink port.DownloadSink, descriptor port.Fil
 // produced a consumedTransfer -- i.e. only for the one request that actually
 // won the consuming commit (§7 step 4: "commit 패자에게는 sink 호출이
 // 없다").
-func (s *DistributionService) sendAndRecord(ctx context.Context, meta contract.RequestMeta, sink port.DownloadSink, prep preparedDelivery, consumed consumedTransfer, now domain.Instant) (contract.TransferSummary, error) {
+func (s *DistributionService) sendAndRecord(ctx context.Context, meta contract.RequestMeta, sink port.DownloadSink, prep preparedDelivery, consumed consumedTransfer, consumedAt domain.Instant) (contract.TransferSummary, error) {
 	descriptor := port.FileDescriptor{
 		ContentType: prep.contentType,
 		Filename:    prep.filename,
@@ -99,6 +99,18 @@ func (s *DistributionService) sendAndRecord(ctx context.Context, meta contract.R
 	// anything else, regardless of outcome.
 	prep.bundle.Close()
 
+	// §14.2: the finish time is read HERE, after Send returned or its panic
+	// was recovered and the payload was cleaned up -- not carried over from
+	// the consuming commit. Reusing consumedAt would record
+	// finished_at == consumed_at even for a transfer that took minutes, and
+	// would disagree with the TransferSummary the caller gets back.
+	//
+	// It is computed exactly once and then used everywhere the transfer's
+	// end is recorded, so a post-processing retry cannot invent a second
+	// finish time ("후처리 트랜잭션 재시도에는 최초 종료 관측 시각을
+	// 보존하며").
+	finishedAt := s.finishObservedAt(consumedAt)
+
 	// The recording context is deliberately independent of ctx (the
 	// caller's request context) and of sendCtx: §7 step 5 requires it
 	// detached from server runtime lifetime, with its own bounded budget.
@@ -106,7 +118,7 @@ func (s *DistributionService) sendAndRecord(ctx context.Context, meta contract.R
 	defer postCancel()
 
 	if prep.purpose == domain.GrantPurposeLeafPrivate {
-		if postErr := s.recordPrivateOutcome(postCtx, meta, prep, consumed, result, now); postErr != nil {
+		if postErr := s.recordPrivateOutcome(postCtx, meta, prep, consumed, result, finishedAt); postErr != nil {
 			code := "distribution_private_postprocess_failed"
 			if errors.Is(postErr, port.ErrCommitUnknown) {
 				code = "distribution_private_postprocess_commit_unknown"
@@ -136,7 +148,7 @@ func (s *DistributionService) sendAndRecord(ctx context.Context, meta contract.R
 		if result.panicked {
 			code = "distribution_public_send_panicked"
 		}
-		if auditErr := s.recordPublicFailureAudit(postCtx, meta, prep, consumed, now); auditErr != nil {
+		if auditErr := s.recordPublicFailureAudit(postCtx, meta, prep, consumed, finishedAt); auditErr != nil {
 			// The business audit row itself could not be written. This is
 			// exactly the "public 후처리 오류" §14.5 requires a home for --
 			// recorded here rather than silently dropped as the old `_ =`
@@ -166,7 +178,7 @@ func (s *DistributionService) sendAndRecord(ctx context.Context, meta contract.R
 		// DB의 대체가 아니다" case §14.5 warns about, because the business
 		// audit call above (recordPublicSuccessAudit) is still attempted
 		// first; the log only records that attempt's own failure.
-		if auditErr := s.recordPublicSuccessAudit(postCtx, meta, prep, consumed, now); auditErr != nil {
+		if auditErr := s.recordPublicSuccessAudit(postCtx, meta, prep, consumed, finishedAt); auditErr != nil {
 			s.deps.OperationalLogger.Record(port.OperationalEvent{
 				Code:          "distribution_public_postprocess_audit_failed",
 				RequestID:     meta.RequestID,
@@ -190,7 +202,10 @@ func (s *DistributionService) sendAndRecord(ctx context.Context, meta contract.R
 		TokenID:      consumed.grant.ID(),
 		Completed:    result.outcome.Completed,
 		BytesWritten: result.outcome.BytesWritten,
-		FinishedAt:   result.outcome.FinishedAt,
+		// §14.2: the persisted/reported finish time is the app's, not the
+		// sink's. TransferOutcome.FinishedAt stays an observation and does
+		// not replace it -- and it is empty on an error or a panic anyway.
+		FinishedAt: finishedAt,
 	}
 	if prep.purpose == domain.GrantPurposeLeafPrivate {
 		summary.DeliveryID = consumed.delivery.ID()
@@ -204,7 +219,7 @@ func (s *DistributionService) sendAndRecord(ctx context.Context, meta contract.R
 // through the shared applyRevocations path -- never a hand-rolled
 // revocation (docs/backend-implementation.md §5: "Distribution의 실패/만료
 // ... 이 함수를 사용한다").
-func (s *DistributionService) recordPrivateOutcome(ctx context.Context, meta contract.RequestMeta, prep preparedDelivery, consumed consumedTransfer, result sendResult, now domain.Instant) error {
+func (s *DistributionService) recordPrivateOutcome(ctx context.Context, meta contract.RequestMeta, prep preparedDelivery, consumed consumedTransfer, result sendResult, finishedAt domain.Instant) error {
 	return s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
 		delivery, err := tx.Delivery().GetDeliveryForUpdate(ctx, consumed.delivery.ID())
 		if err != nil {
@@ -216,14 +231,14 @@ func (s *DistributionService) recordPrivateOutcome(ctx context.Context, meta con
 		}
 
 		if !result.failed() {
-			completed, err := delivery.Complete(now)
+			completed, err := delivery.Complete(finishedAt)
 			if err != nil {
 				return contract.FromDomainError(err)
 			}
 			if err := tx.Delivery().SaveDelivery(ctx, completed, delivery.Version()); err != nil {
 				return storeError(err, "delivery_save_failed", "could not record the delivery completion")
 			}
-			return appendDistributionAudit(ctx, tx, s.deps.IDs, now, meta, "distribution.deliver.private.completed", consumed.grant.ID(), contract.AuditResultSuccess, scope)
+			return appendDistributionAudit(ctx, tx, s.deps.IDs, finishedAt, meta, "distribution.deliver.private.completed", consumed.grant.ID(), contract.AuditResultSuccess, scope)
 		}
 
 		// §14.1 settled failure_code naming: a live send failure is recorded
@@ -235,7 +250,7 @@ func (s *DistributionService) recordPrivateOutcome(ctx context.Context, meta con
 		if result.panicked {
 			code = "transfer_panic"
 		}
-		failedDelivery, err := delivery.Fail(code, now)
+		failedDelivery, err := delivery.Fail(code, finishedAt)
 		if err != nil {
 			return contract.FromDomainError(err)
 		}
@@ -256,7 +271,7 @@ func (s *DistributionService) recordPrivateOutcome(ctx context.Context, meta con
 			IssuerID:      prep.certificate.IssuerCAKeyGenerationID(),
 			Serial:        prep.certificate.Serial(),
 			CertificateID: prep.certificate.ID(),
-			RevokedAt:     now,
+			RevokedAt:     finishedAt,
 			Reason:        domain.RevocationReasonUnspecified,
 			Source:        domain.RevocationSourceCascade,
 			AuthorityID:   scope,
@@ -267,7 +282,7 @@ func (s *DistributionService) recordPrivateOutcome(ctx context.Context, meta con
 			ActorID:   string(consumed.grant.ID()),
 			TokenID:   string(consumed.grant.ID()),
 			Action:    "distribution.deliver.private.failed",
-			Now:       now,
+			Now:       finishedAt,
 			IDs:       s.deps.IDs,
 		}
 		// applyRevocations owns the revocation merge, the issuer's CRL
@@ -279,7 +294,7 @@ func (s *DistributionService) recordPrivateOutcome(ctx context.Context, meta con
 		if _, err := applyRevocations(ctx, tx, []RevocationChange{change}, revMeta); err != nil {
 			return err
 		}
-		return appendDistributionAudit(ctx, tx, s.deps.IDs, now, meta, "distribution.deliver.private.failed", consumed.grant.ID(), contract.AuditResultFailure, scope)
+		return appendDistributionAudit(ctx, tx, s.deps.IDs, finishedAt, meta, "distribution.deliver.private.failed", consumed.grant.ID(), contract.AuditResultFailure, scope)
 	})
 }
 
@@ -287,13 +302,13 @@ func (s *DistributionService) recordPrivateOutcome(ctx context.Context, meta con
 // transfer failure gets an audit row and nothing else (no revocation, no CRL
 // job). Its own failure is now surfaced to the caller (sendAndRecord routes
 // it into the §14.5 OperationalLogger call) instead of being swallowed.
-func (s *DistributionService) recordPublicFailureAudit(ctx context.Context, meta contract.RequestMeta, prep preparedDelivery, consumed consumedTransfer, now domain.Instant) error {
+func (s *DistributionService) recordPublicFailureAudit(ctx context.Context, meta contract.RequestMeta, prep preparedDelivery, consumed consumedTransfer, finishedAt domain.Instant) error {
 	return s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
 		scope, err := distributionManagementAuthority(ctx, tx, prep.certificate.ID())
 		if err != nil {
 			return err
 		}
-		return appendDistributionAudit(ctx, tx, s.deps.IDs, now, meta, "distribution.deliver.public.failed", consumed.grant.ID(), contract.AuditResultFailure, scope)
+		return appendDistributionAudit(ctx, tx, s.deps.IDs, finishedAt, meta, "distribution.deliver.public.failed", consumed.grant.ID(), contract.AuditResultFailure, scope)
 	})
 }
 
@@ -305,12 +320,28 @@ func (s *DistributionService) recordPublicFailureAudit(ctx context.Context, meta
 // own write failure is never a private-grade incident: no FailClosed, no
 // revocation. sendAndRecord folds a failure here into an OperationalLogger
 // event instead.
-func (s *DistributionService) recordPublicSuccessAudit(ctx context.Context, meta contract.RequestMeta, prep preparedDelivery, consumed consumedTransfer, now domain.Instant) error {
+func (s *DistributionService) recordPublicSuccessAudit(ctx context.Context, meta contract.RequestMeta, prep preparedDelivery, consumed consumedTransfer, finishedAt domain.Instant) error {
 	return s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
 		scope, err := distributionManagementAuthority(ctx, tx, prep.certificate.ID())
 		if err != nil {
 			return err
 		}
-		return appendDistributionAudit(ctx, tx, s.deps.IDs, now, meta, "distribution.deliver.public.completed", consumed.grant.ID(), contract.AuditResultSuccess, scope)
+		return appendDistributionAudit(ctx, tx, s.deps.IDs, finishedAt, meta, "distribution.deliver.public.completed", consumed.grant.ID(), contract.AuditResultSuccess, scope)
 	})
+}
+
+// finishObservedAt is §14.2's finish timestamp: read after Send returned (or
+// its panic was recovered) and the payload was cleaned up, then clamped so it
+// can never precede the consumption it belongs to.
+//
+// The clamp exists for a system clock that steps backwards between the two
+// reads ("시스템 시계 역행 시 종료 시각은 consumed_at보다 이르지 않도록 둘 중
+// 늦은 값으로 보정한다"). Without it a delivery could be stored as having
+// finished before it was consumed.
+func (s *DistributionService) finishObservedAt(consumedAt domain.Instant) domain.Instant {
+	observed := s.deps.Clock.Now()
+	if observed.Before(consumedAt) {
+		return consumedAt
+	}
+	return observed
 }
