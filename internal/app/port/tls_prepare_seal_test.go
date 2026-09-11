@@ -38,6 +38,15 @@ type fakeInstaller struct {
 	applied   int
 	rejected  int
 	discarded int
+	// configMarker is what the next Prepare records for its handle. Tests
+	// give the previous and the new candidate different markers so a wrong
+	// swap is visible rather than looking like a no-op.
+	configMarker string
+	// failSwap injects a failure inside Apply AFTER the registry lookup has
+	// succeeded and BEFORE the live configuration is replaced -- the real
+	// apply-time failure a listener swap can hit. Deleting the entry before
+	// calling Apply instead would only exercise the unregistered-handle path.
+	failSwap bool
 	// lastApplied is the config fakeInstaller's own Apply most recently
 	// installed, read back out of its private registry -- never anything a
 	// caller could have supplied directly.
@@ -52,7 +61,11 @@ type fakeInstaller struct {
 var _ port.TLSInstaller = (*fakeInstaller)(nil)
 
 func newFakeInstaller() *fakeInstaller {
-	return &fakeInstaller{token: port.NewTLSPrepareToken(), configs: map[any]string{}}
+	return &fakeInstaller{
+		token:        port.NewTLSPrepareToken(),
+		configs:      map[any]string{},
+		configMarker: "real-config",
+	}
 }
 
 // discarded counts released-but-never-applied entries, so a test can tell a
@@ -67,7 +80,7 @@ func (f *fakeInstaller) Prepare(ctx context.Context, candidate domain.TLSVersion
 	// the handle is returned. Nothing about the handle itself carries the
 	// config, so nothing about the handle can be used to change it later.
 	prepared := port.NewPreparedTLSConfig(f.token)
-	f.configs[prepared.ID()] = "real-config"
+	f.configs[prepared.ID()] = f.configMarker
 	return prepared, nil
 }
 
@@ -90,6 +103,15 @@ func (f *fakeInstaller) Apply(ctx context.Context, prepared port.PreparedTLSConf
 	// rejected, and a deferred Discard on the success path has nothing left
 	// to release (docs/backend-implementation.md §13).
 	delete(f.configs, prepared.ID())
+	if f.failSwap {
+		// The swap itself failed. The prepared entry is still released, but
+		// the live listener keeps serving whatever it had
+		// (docs/backend-implementation.md §9 "Apply 실패는 DB/메모리 모두
+		// 원복한다"; §13 "실패 시 registry 항목을 제거하되 기존 listener를
+		// 유지한다").
+		f.rejected++
+		return errors.New("tls: swapping the listener onto the prepared configuration failed")
+	}
 	f.applied++
 	f.lastApplied = cfg
 	return nil
@@ -288,10 +310,19 @@ func TestTLSInstaller_DiscardIsIdempotent(t *testing.T) {
 	}
 }
 
-// A failed Apply must release the entry but leave the previous listener
-// serving, and the handle must not be replayable afterwards.
+// An Apply that fails AFTER its registry lookup succeeded must still release
+// the prepared entry and leave the previous listener serving.
+//
+// An earlier version of this test deleted the registry entry before calling
+// Apply, which only exercised the unregistered-handle path: its final
+// "registry is empty" assertion passed even with no failure handling at all,
+// because the entry was already gone. The failure is now injected inside
+// Apply, after a valid lookup and before the swap, and the previous and new
+// candidates carry different markers so a wrong swap is visible.
 func TestTLSInstaller_FailedApplyReleasesTheEntryAndKeepsTheOldListener(t *testing.T) {
 	inst := newFakeInstaller()
+
+	inst.configMarker = "old-active-config"
 	first, err := inst.Prepare(context.Background(), domain.TLSVersion{}, domain.EncryptedSecret{})
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
@@ -299,23 +330,74 @@ func TestTLSInstaller_FailedApplyReleasesTheEntryAndKeepsTheOldListener(t *testi
 	if err := inst.Apply(context.Background(), first); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
+	if inst.lastApplied != "old-active-config" {
+		t.Fatalf("setup did not install the first candidate: %q", inst.lastApplied)
+	}
 
-	// A second candidate whose Apply fails: drop its registry entry behind
-	// its back to simulate the installer's own apply-time failure path.
+	// A second candidate, distinguishable from the active one, whose swap
+	// fails inside Apply.
+	inst.configMarker = "new-candidate-config"
 	second, err := inst.Prepare(context.Background(), domain.TLSVersion{}, domain.EncryptedSecret{})
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
-	delete(inst.configs, second.ID())
+	if inst.prepared() != 1 {
+		t.Fatalf("the candidate was not registered: %d entries", inst.prepared())
+	}
+	inst.failSwap = true
+
 	if err := inst.Apply(context.Background(), second); err == nil {
-		t.Fatal("Apply succeeded with no registered configuration")
+		t.Fatal("Apply reported success even though the swap failed")
 	}
-	if inst.lastApplied != "real-config" {
-		t.Fatalf("a failed Apply disturbed the active configuration: %q", inst.lastApplied)
-	}
-	inst.Discard(second) // the service's deferred cleanup still runs
+
+	// Checked before the deferred Discard would run: the failure path itself
+	// must have released the entry.
 	if inst.prepared() != 0 {
-		t.Fatalf("%d entries survived, want 0", inst.prepared())
+		t.Fatalf("a failed Apply left %d prepared entries behind, want 0", inst.prepared())
+	}
+	if inst.lastApplied != "old-active-config" {
+		t.Fatalf("a failed Apply changed the live configuration to %q", inst.lastApplied)
+	}
+	if inst.applied != 1 {
+		t.Fatalf("applied=%d, want the failed Apply not to be counted", inst.applied)
+	}
+
+	// The consumed-and-failed handle must not be replayable.
+	inst.failSwap = false
+	if err := inst.Apply(context.Background(), second); err == nil {
+		t.Fatal("Apply accepted a handle whose earlier Apply had failed")
+	}
+	if inst.lastApplied != "old-active-config" {
+		t.Fatalf("the replay installed %q", inst.lastApplied)
+	}
+
+	// The service's deferred Discard still runs on this path and must be
+	// harmless.
+	inst.Discard(second)
+	if inst.prepared() != 0 || inst.lastApplied != "old-active-config" {
+		t.Fatalf("the deferred Discard was not harmless: %d entries, active=%q", inst.prepared(), inst.lastApplied)
+	}
+}
+
+// The unregistered-handle path is kept as its own case: a handle this
+// installer's own Prepare never registered must be refused rather than
+// applying a zero value.
+func TestTLSInstaller_ApplyRejectsAnUnregisteredHandle(t *testing.T) {
+	inst := newFakeInstaller()
+	prepared, err := inst.Prepare(context.Background(), domain.TLSVersion{}, domain.EncryptedSecret{})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	delete(inst.configs, prepared.ID())
+
+	if err := inst.Apply(context.Background(), prepared); err == nil {
+		t.Fatal("Apply accepted a handle with no registered configuration")
+	}
+	if inst.applied != 0 {
+		t.Fatalf("applied=%d, want 0", inst.applied)
+	}
+	if inst.lastApplied != "" {
+		t.Fatalf("an unregistered handle installed %q", inst.lastApplied)
 	}
 }
 
