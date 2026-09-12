@@ -85,6 +85,21 @@ func cloneAuditEvent(e port.AuditEvent) port.AuditEvent {
 	return e
 }
 
+func cloneAuditRows(rows []auditRow) []auditRow {
+	if rows == nil {
+		return nil
+	}
+	out := make([]auditRow, len(rows))
+	for i, row := range rows {
+		out[i] = auditRow{
+			event:     cloneAuditEvent(row.event),
+			scopeKind: row.scopeKind,
+			scopes:    cloneAuthorityIDs(row.scopes),
+		}
+	}
+	return out
+}
+
 // cloneManifestFiles copies a PublicImportManifest.Files slice. Each element
 // (contract.ImportManifestFileFacts) is a flat struct of value types
 // (string/domain.Fingerprint/domain.CertificateID), so copying the slice

@@ -103,7 +103,7 @@ func TestWrite_CallbackErrorRollsBackEveryRepository(t *testing.T) {
 		}); err != nil {
 			return err
 		}
-		if err := tx.Audit().Append(ctx, port.AuditEvent{Action: "revoke"}, nil); err != nil {
+		if err := tx.Audit().Append(ctx, port.AuditEvent{Action: "revoke"}, port.NewInstallationAuditScope()); err != nil {
 			return err
 		}
 		if err := tx.Jobs().UpsertDemand(ctx, "crl:"+issuerID, "crl_publish", 1, []byte("{}")); err != nil {
@@ -392,7 +392,7 @@ func TestAudit_CopiesDetailFields(t *testing.T) {
 		return tx.Audit().Append(context.Background(), port.AuditEvent{
 			Action:  "revoke",
 			Details: contract.AuditDetails{SchemaVersion: 1, Fields: fields},
-		}, []domain.AuthorityID{domain.AuthorityID(authID)})
+		}, port.NewAuthoritiesAuditScope(domain.AuthorityID(authID)))
 	})
 	if err != nil {
 		t.Fatalf("append: %v", err)

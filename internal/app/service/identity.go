@@ -94,7 +94,7 @@ func appendAccountAudit(ctx context.Context, tx port.TxStores, ids port.IDGenera
 		Result:     contract.AuditResultSuccess,
 		Details:    contract.AuditDetails{SchemaVersion: 1},
 	}
-	if err := tx.Audit().Append(ctx, event, nil); err != nil {
+	if err := tx.Audit().Append(ctx, event, port.NewInstallationAuditScope()); err != nil {
 		return storeError(err, "identity_audit_failed", "could not record the audit event")
 	}
 	return nil

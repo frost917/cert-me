@@ -1,69 +1,8 @@
-// Package service: tls.go implements the subset of TLSService
-// (docs/backend-implementation.md §3 TLSService row; §9; §13 ruling 5) this
-// developer could build against the ports/contracts actually confirmed to
-// exist for it: Status, UploadCandidate, IssueCandidate, Activate and
-// Reconcile.
-//
-// Reload and Bootstrap are deliberately NOT implemented here, the same way
-// authority.go leaves DestroyKey/Archive out of its assigned scope -- each is
-// blocked on a concrete, reported gap rather than worked around by widening
-// internal/domain or internal/app/port:
-//
-//   - Reload needs everything UploadCandidate needs (see UploadCandidate's
-//     own doc comment below), PLUS the "허용된 파일 소스" §5 names but never
-//     defines anywhere in internal/app/port -- grepping the port package
-//     finds no FileSource-shaped interface at all. Reload additionally has
-//     no defined input command shape for "reload from this file source"
-//     (contract.TLSReloadCommand is the empty struct §3 mandates for a
-//     no-argument command, so it carries no path/identifier of its own
-//     either). Undefined dependency and undefined input, reported.
-//
-//     An earlier draft of this file also listed UploadCandidate here as
-//     blocked on the same "PKIParser is missing from §5's TLS dependency
-//     table" reasoning. On review, that reasoning does not hold:
-//     TLSUploadCandidateCommand carries the certificate/chain/key bytes
-//     directly in the command (§3's own upload-command convention: "업로드
-//     command는 파일 바이트와 키별 secret.Input을 소유"), so UploadCandidate
-//     needs no file source at all, and every port method it needs already
-//     exists (PKIParser.ParseCertificateBundle, PKIParser.ParseInternalTLSKey,
-//     KeyEngine.ImportTLS). §5's table omitting PKIParser from TLS's row is
-//     the same kind of incompleteness §14.10 already established for
-//     SerialGenerator/ProfileValidator (see TLSDeps's own comment below) --
-//     not a genuine blocker, just an omission this developer is not
-//     required to defer to when the concrete port surface says otherwise.
-//     PKIParser is added to TLSDeps accordingly (an injected dependency on
-//     an already-existing port, not a new port).
-//
-//   - Bootstrap's command is an explicit empty command
-//     (contract.TLSBootstrapCommand{}), and unlike UploadCandidate/Reload it
-//     is not blocked on a missing PORT -- KeyEngine/CertificateSigner/
-//     SerialGenerator/domain.PlanBootstrapIssuance already exist and are
-//     enough to generate a bootstrap CA and sign its temporary Leaf. What is
-//     missing is PRODUCT INPUT no doc supplies: the bootstrap CA/Leaf's
-//     Subject (architecture.md names only the CN "cert-me" in prose, never a
-//     typed Subject), the Leaf's SAN set (a serverAuth certificate needs at
-//     least one dns/ip SAN, and "실제 접속 DNS/IP를 ... 초기 구동의 조건으로
-//     요구하지 않는다" tells us what the SAN must NOT be checked against,
-//     never what value it should actually carry), and the key algorithm
-//     (domain.DefaultKeyAlgorithm is a plausible guess, but nothing pins it
-//     for this specific path). setup.go's own toSetupView comment already
-//     flags an adjacent inference here as unconfirmed ("this developer's
-//     inference ... not a confirmed product decision"). Inventing a Subject/
-//     SAN/algorithm for the one credential every browser will actually see
-//     is exactly the kind of product behavior "never invent" forbids.
-//     Reported.
-//
-// Every remaining method's scope for Authorizer.Authorize and
-// tx.Audit().Append is a second, separate open question, also reported
-// rather than guessed: TLS status/candidate-activation/reconcile are
-// properties of the single installation-wide row, with no per-authority
-// relation for a non-empty docs/backend-implementation.md §14.6-style scope
-// to be built from (IssueCandidate is the one exception -- its scope is the
-// issuing Authority, exactly like ordinary Issuance). settings_service.go's
-// settingsScope() already hit this identical tension for SettingsService and
-// flagged it as a blocking open question for the planning team rather than
-// inventing an answer; tlsScope() below mirrors that exact precedent for the
-// same reason, and its nil is not this developer's answer either.
+// Package service contains the application orchestration for TLS candidate
+// management, explicit file reload, bootstrap HTTPS and restart recovery.
+// Preparation happens outside writes; every commit path re-checks the
+// authoritative installation/PKI facts while holding its transaction lock
+// (docs/backend-implementation.md §§8–9, 15.3).
 package service
 
 import (
@@ -82,22 +21,9 @@ import (
 	"cert-me/internal/domain"
 )
 
-// TLSDeps is TLSService's dependency set (docs/backend-implementation.md §5
-// "TLS: KeyEngine, CertificateSigner, ChainValidator, TLSInstaller, 허용된
-// 파일 소스"). SerialGenerator is added even though §5's table omits it: §14.10
-// is explicit and specific -- "TLS 내부 발급에도 같은 입력 계약과
-// SerialGenerator를 사용한다" -- and prepareCertificate/signCertificate (which
-// §5 also assigns TLS to share with Authority/Issuance) hard-require one.
-// This is the "doc contradicts itself" case the assignment says to report
-// rather than silently pick a side on; this developer's reading is that
-// §14.10's later, narrower, TLS-issuance-specific ruling controls over §5's
-// general table (which also omits ProfileValidator, an equally-required
-// certificate.go/domain dependency for the same shared signing path -- the
-// table was evidently not meant as an exhaustive ceiling here either).
-// PKIParser is injected for UploadCandidate (parsing the uploaded
-// certificate/chain bundle and the uploaded private key -- see this file's
-// package comment for why §5's table omitting it is not treated as a
-// blocker).
+// TLSDeps is TLSService's dependency set. The file source is intentionally a
+// narrow configured-source port: Reload has an empty command and never
+// accepts an arbitrary path from the request.
 type TLSDeps struct {
 	CommonDeps
 	KeyEngine         port.KeyEngine
@@ -106,6 +32,8 @@ type TLSDeps struct {
 	ChainValidator    port.ChainValidator
 	TLSInstaller      port.TLSInstaller
 	PKIParser         port.PKIParser
+	FileSource        port.TLSFileSource
+	RuntimeGate       port.RuntimeGate
 }
 
 // Validate reports the first missing dependency, common or TLS-specific.
@@ -120,11 +48,12 @@ func (d TLSDeps) Validate() error {
 		required{"ChainValidator", d.ChainValidator == nil},
 		required{"TLSInstaller", d.TLSInstaller == nil},
 		required{"PKIParser", d.PKIParser == nil},
+		required{"FileSource", d.FileSource == nil},
+		required{"RuntimeGate", d.RuntimeGate == nil},
 	)
 }
 
-// TLSService implements Status, IssueCandidate, Activate and Reconcile (see
-// this file's package comment for the three methods left out and why).
+// TLSService implements the complete B04 TLS service surface.
 //
 // mu is the "프로세스 내 TLS 변경 mutex" §9 requires under Activate: it
 // serializes the whole prepare-validate-commit-apply-record sequence (and
@@ -147,12 +76,10 @@ func NewTLSService(deps TLSDeps) (*TLSService, error) {
 	return &TLSService{deps: deps}, nil
 }
 
-// tlsScope is the Authorizer/Audit scope for every TLS method that is not
-// IssueCandidate. See this file's package comment: this is an open question
-// reported to the lead, not a settled design choice, mirroring
-// settings_service.go's settingsScope() precedent for the identical
-// no-authority-relation tension.
-func tlsScope() []domain.AuthorityID { return nil }
+// tlsScope is the installation-wide scope for TLS management events. It is a
+// typed installation scope, not an empty authority list that could be
+// misinterpreted as unrestricted access.
+func tlsScope() port.AuditScope { return port.NewInstallationAuditScope() }
 
 // requireInternalOperation is §13 ruling 5's gate for TLS.Bootstrap/
 // TLS.Reconcile: "대응 내부 operation만 허용한다
@@ -322,12 +249,12 @@ func (s *TLSService) buildValidationFacts(ctx context.Context, tx port.TxStores,
 		}
 		chainDER = chain
 	} else {
-		// bootstrap/external: not implemented by this developer (see the
-		// package comment), so this branch only exists so Reconcile does not
-		// crash if it ever encounters one of these; it cannot inspect a
-		// certificate this service never parsed, so it trusts the stored
-		// chain_bundle's own PEM split and assumes the purpose/key facts a
-		// real parser would have already checked at upload time.
+		// Bootstrap and uploaded external candidates are immutable snapshots.
+		// Bootstrap facts are fixed by prepareBootstrap; external facts were
+		// parsed and checked by uploadCandidate before their snapshot was
+		// stored. Reconcile still parses the stored chain bytes and always
+		// reruns chain validation below, while the purpose/key facts come from
+		// that earlier typed validation rather than from a request payload.
 		chain, err := splitPEMChain(candidate.ChainBundle())
 		if err != nil {
 			return domain.TLSValidationFacts{}, err
@@ -369,7 +296,7 @@ func (s *TLSService) Status(ctx context.Context, meta contract.RequestMeta, cmd 
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTLSStatus, port.NewAuthorizationScope(tlsScope()...)); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTLSStatus, port.NewAuthorizationScope()); err != nil {
 			return err
 		}
 		installation, err := tx.Installation().GetForUpdate(ctx)
@@ -447,6 +374,10 @@ func (s *TLSService) Status(ctx context.Context, meta contract.RequestMeta, cmd 
 // upload order -- the natural reading of two distinct fields, but not a
 // literal rule any doc states in those words.
 func (s *TLSService) UploadCandidate(ctx context.Context, meta contract.MutationMeta, cmd contract.TLSUploadCandidateCommand) (contract.TLSVersionView, error) {
+	return s.uploadCandidate(ctx, meta, cmd, port.ActionTLSUploadCandidate, "tls.upload_candidate", false)
+}
+
+func (s *TLSService) uploadCandidate(ctx context.Context, meta contract.MutationMeta, cmd contract.TLSUploadCandidateCommand, action port.Action, auditAction string, admitted bool) (contract.TLSVersionView, error) {
 	if err := cmd.Validate(); err != nil {
 		return contract.TLSVersionView{}, err
 	}
@@ -454,23 +385,29 @@ func (s *TLSService) UploadCandidate(ctx context.Context, meta contract.Mutation
 		return contract.TLSVersionView{}, contract.NewAppError(contract.ErrorKindForbidden, "tls_requires_admin",
 			"uploading a TLS candidate requires an administrator session")
 	}
-	// §6/§8: admission is checked before any expensive parsing/import work.
-	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTLSUploadCandidate, port.NewAuthorizationScope(tlsScope()...)); err != nil {
-		return contract.TLSVersionView{}, err
+	if !admitted {
+		// §6/§8: admission is checked before any expensive parsing/import work.
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, action, port.NewAuthorizationScope()); err != nil {
+			return contract.TLSVersionView{}, err
+		}
+		if err := ctx.Err(); err != nil {
+			return contract.TLSVersionView{}, contract.WrapAppError(contract.ErrorKindUnavailable, "request_canceled",
+				"the request was canceled before it completed", err)
+		}
+		// Authentication can become stale while the request is being prepared.
+		// Re-check it before parsing/importing the supplied key so an expired or
+		// superseded session cannot spend work or reach the write path. The write
+		// below repeats this check under the commit transaction for the required
+		// TOCTOU protection.
+		if err := s.deps.ReadStore.Read(ctx, func(tx port.TxStores) error {
+			return requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock)
+		}); err != nil {
+			return contract.TLSVersionView{}, err
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return contract.TLSVersionView{}, contract.WrapAppError(contract.ErrorKindUnavailable, "request_canceled",
 			"the request was canceled before it completed", err)
-	}
-	// Authentication can become stale while the request is being prepared.
-	// Re-check it before parsing/importing the supplied key so an expired or
-	// superseded session cannot spend work or reach the write path. The write
-	// below repeats this check under the commit transaction for the required
-	// TOCTOU protection.
-	if err := s.deps.ReadStore.Read(ctx, func(tx port.TxStores) error {
-		return requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock)
-	}); err != nil {
-		return contract.TLSVersionView{}, err
 	}
 
 	leafBundle, err := s.deps.PKIParser.ParseCertificateBundle(ctx, port.CertificateBundleInput{Data: cmd.Certificate})
@@ -484,6 +421,22 @@ func (s *TLSService) UploadCandidate(ctx context.Context, meta contract.Mutation
 			WithField("count", fmt.Sprintf("%d", len(leafBundle.Certificates)))
 	}
 	leaf := leafBundle.Certificates[0]
+	if err := validateParsedCertificateFacts(leaf); err != nil {
+		return contract.TLSVersionView{}, contract.WrapAppError(contract.ErrorKindValidation, "tls_upload_certificate_facts_invalid",
+			"the uploaded certificate facts are inconsistent", err)
+	}
+	if leaf.Kind != domain.CertificateKindLeaf {
+		return contract.TLSVersionView{}, contract.NewAppError(contract.ErrorKindValidation, "tls_upload_certificate_kind",
+			"the TLS certificate must be a leaf certificate")
+	}
+	if leaf.Profile != domain.CertificateProfileServerTLS {
+		return contract.TLSVersionView{}, contract.NewAppError(contract.ErrorKindValidation, "tls_upload_certificate_purpose",
+			"the TLS certificate must have the serverAuth profile")
+	}
+	if err := domain.ValidateSANsForProfile(leaf.Profile, leaf.SANs); err != nil {
+		return contract.TLSVersionView{}, contract.WrapAppError(contract.ErrorKindValidation, "tls_upload_certificate_purpose",
+			"the TLS certificate SANs do not satisfy the serverAuth profile", err)
+	}
 
 	var chainDER [][]byte
 	if len(cmd.Chain) > 0 {
@@ -493,8 +446,20 @@ func (s *TLSService) UploadCandidate(ctx context.Context, meta contract.Mutation
 				"the uploaded chain could not be parsed", err)
 		}
 		for _, c := range chainBundle.Certificates {
+			if err := validateParsedCertificateFacts(c); err != nil {
+				return contract.TLSVersionView{}, contract.WrapAppError(contract.ErrorKindValidation, "tls_upload_chain_facts_invalid",
+					"the uploaded chain facts are inconsistent", err)
+			}
+			if c.Kind != domain.CertificateKindCA {
+				return contract.TLSVersionView{}, contract.NewAppError(contract.ErrorKindValidation, "tls_upload_chain_not_ca",
+					"every uploaded TLS chain certificate must be a CA certificate")
+			}
 			chainDER = append(chainDER, c.DER)
 		}
+	}
+	if err := s.deps.ChainValidator.Validate(ctx, leaf.DER, chainDER, s.deps.Clock.Now()); err != nil {
+		return contract.TLSVersionView{}, contract.WrapAppError(contract.ErrorKindValidation, "tls_upload_chain_invalid",
+			"the uploaded TLS certificate chain could not be verified", err)
 	}
 
 	// ParseInternalTLSKey both decrypts (if cmd.Passphrase is set) and
@@ -508,6 +473,13 @@ func (s *TLSService) UploadCandidate(ctx context.Context, meta contract.Mutation
 	if err != nil {
 		return contract.TLSVersionView{}, contract.WrapAppError(contract.ErrorKindValidation, "tls_upload_key_invalid",
 			"the uploaded key could not be validated against the certificate", err)
+	}
+	if validated.PrivateKey == nil || !validated.PublicKey.Equal(leaf.PublicKey) {
+		if validated.PrivateKey != nil {
+			_ = validated.PrivateKey.Close()
+		}
+		return contract.TLSVersionView{}, contract.NewAppError(contract.ErrorKindValidation, "tls_upload_key_invalid",
+			"the uploaded key parser returned an inconsistent key")
 	}
 	defer validated.PrivateKey.Close()
 
@@ -563,7 +535,7 @@ func (s *TLSService) UploadCandidate(ctx context.Context, meta contract.Mutation
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTLSUploadCandidate, port.NewAuthorizationScope(tlsScope()...)); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, action, port.NewAuthorizationScope()); err != nil {
 			return err
 		}
 		if err := tx.PKI().InsertKeyMaterial(ctx, port.KeyMaterial{ID: keyMaterialID, PublicKey: generated.PublicKey, Origin: "imported"}); err != nil {
@@ -583,14 +555,10 @@ func (s *TLSService) UploadCandidate(ctx context.Context, meta contract.Mutation
 		now := s.deps.Clock.Now()
 		event := port.AuditEvent{
 			ID: s.deps.IDs.NewUUID(), OccurredAt: now, ActorKind: contract.AuditActorAccount,
-			ActorID: string(meta.Principal.AccountID()), Action: "tls.upload_candidate", TargetType: "tls_version",
+			ActorID: string(meta.Principal.AccountID()), Action: auditAction, TargetType: "tls_version",
 			TargetID: string(tlsVersionID), ClientIP: clientIP(meta.RequestMeta), Result: contract.AuditResultSuccess,
 			Details: contract.AuditDetails{SchemaVersion: 1},
 		}
-		// tlsScope() is nil -- see this file's package comment: UploadCandidate
-		// has the identical no-authority-relation tension Activate/Reconcile
-		// already carry as an open question, not a new one this method
-		// invents an answer for.
 		if err := tx.Audit().Append(ctx, event, tlsScope()); err != nil {
 			return storeError(err, "tls_audit_failed", "could not record the TLS upload audit event")
 		}
@@ -602,6 +570,579 @@ func (s *TLSService) UploadCandidate(ctx context.Context, meta contract.Mutation
 		return contract.TLSVersionView{}, writeErr
 	}
 	return result, nil
+}
+
+// Reload explicitly re-reads the configured certificate source and stores a
+// new external candidate. The empty command carries no path: runtime/config
+// owns source selection, while this method owns validation, encryption and
+// secret cleanup. It never calls Activate or changes the listener.
+func (s *TLSService) Reload(ctx context.Context, meta contract.MutationMeta, cmd contract.TLSReloadCommand) (contract.TLSVersionView, error) {
+	if err := cmd.Validate(); err != nil {
+		return contract.TLSVersionView{}, err
+	}
+	if !meta.Principal.IsAdmin() {
+		return contract.TLSVersionView{}, contract.NewAppError(contract.ErrorKindForbidden, "tls_requires_admin",
+			"reloading a TLS candidate requires an administrator session")
+	}
+	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTLSReload, port.NewAuthorizationScope()); err != nil {
+		return contract.TLSVersionView{}, err
+	}
+	if err := s.deps.ReadStore.Read(ctx, func(tx port.TxStores) error {
+		return requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock)
+	}); err != nil {
+		return contract.TLSVersionView{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return contract.TLSVersionView{}, contract.WrapAppError(contract.ErrorKindUnavailable, "request_canceled",
+			"the request was canceled before the configured TLS source was loaded", err)
+	}
+
+	input, err := s.deps.FileSource.Load(ctx)
+	if err != nil {
+		return contract.TLSVersionView{}, contract.WrapAppError(contract.ErrorKindUnavailable, "tls_reload_source_failed",
+			"the configured TLS source could not be loaded", err)
+	}
+	if input.Passphrase != nil {
+		defer input.Passphrase.Close()
+	}
+	return s.uploadCandidate(ctx, meta, contract.TLSUploadCandidateCommand{
+		Certificate: input.Certificate,
+		Chain:       input.Chain,
+		Key:         input.Key,
+		Passphrase:  input.Passphrase,
+	}, port.ActionTLSReload, "tls.reload", true)
+}
+
+// tlsBootstrapPrepared contains the complete bootstrap graph prepared before
+// the activation transaction. The Root, its bootstrap key generation, the
+// temporary Leaf, its series and the TLS snapshot are committed together so
+// a restart can recover one coherent public history.
+type tlsBootstrapPrepared struct {
+	authority       domain.Authority
+	hasExisting     bool
+	existingVersion domain.Version
+	rootKeyMaterial port.KeyMaterial
+	rootGeneration  port.CAKeyGeneration
+	rootCertificate domain.Certificate
+	rootSecret      domain.EncryptedSecret
+	leafKeyMaterial port.KeyMaterial
+	leafGeneration  domain.LeafKeyGeneration
+	leafCertificate domain.Certificate
+	leafRecord      port.LeafCertificateRecord
+	series          domain.LeafSeries
+	crlState        domain.CRLState
+	version         domain.TLSVersion
+	leafSecret      domain.EncryptedSecret
+}
+
+func validateGeneratedKey(generated port.GeneratedKey, keyMaterialID domain.KeyMaterialID, purpose domain.SecretPurpose, algorithm domain.KeyAlgorithm) error {
+	if generated.PublicKey.IsZero() || generated.PublicKey.Algorithm() != algorithm {
+		return contract.NewAppError(contract.ErrorKindUnavailable, "tls_bootstrap_key_invalid",
+			"the key engine returned an inconsistent bootstrap public key")
+	}
+	secret := generated.EncryptedSecret
+	if secret.IsZero() || secret.OwnerKeyID() != keyMaterialID || secret.Purpose() != purpose {
+		return contract.NewAppError(contract.ErrorKindUnavailable, "tls_bootstrap_secret_invalid",
+			"the key engine returned an inconsistent bootstrap secret")
+	}
+	return nil
+}
+
+// findBootstrapAuthority reads the single local bootstrap management row, if
+// one exists. The query repository is used only for this preparation read;
+// Bootstrap re-reads the selected row with GetIssuerForUpdate before writing,
+// so a concurrent change cannot be mistaken for the snapshot we prepared.
+func (s *TLSService) findBootstrapAuthority(ctx context.Context) (domain.Authority, bool, error) {
+	var found domain.Authority
+	foundOne := false
+	cursor := ""
+	err := s.deps.ReadStore.Read(ctx, func(tx port.TxStores) error {
+		for {
+			page, err := tx.Queries().ListAuthorities(ctx, contract.AuthorityListQuery{
+				Page: contract.PageRequest{Cursor: cursor, Limit: 200},
+			}, port.QueryScope{All: true})
+			if err != nil {
+				return storeError(err, "tls_bootstrap_authority_lookup_failed", "could not find the bootstrap authority")
+			}
+			for _, authority := range page.Items {
+				if authority.Kind() != domain.AuthorityKindBootstrap {
+					continue
+				}
+				if foundOne {
+					return contract.NewAppError(contract.ErrorKindUnavailable, "tls_bootstrap_authority_ambiguous",
+						"more than one bootstrap authority exists")
+				}
+				found = authority
+				foundOne = true
+			}
+			if page.NextCursor == nil {
+				return nil
+			}
+			if *page.NextCursor == cursor {
+				return contract.NewAppError(contract.ErrorKindUnavailable, "tls_bootstrap_authority_cursor_invalid",
+					"the bootstrap authority query returned a repeating cursor")
+			}
+			cursor = *page.NextCursor
+		}
+	})
+	if err != nil {
+		return domain.Authority{}, false, err
+	}
+	return found, foundOne, nil
+}
+
+// prepareBootstrap creates the fixed local Root and temporary serverAuth Leaf
+// specified by docs/architecture.md and backend-implementation.md §15.3.
+// It does not inspect hostnames, mutate setup state or create a delivery.
+func (s *TLSService) prepareBootstrap(ctx context.Context, existing *domain.Authority) (tlsBootstrapPrepared, error) {
+	const bootstrapName = "cert-me"
+	const bootstrapDays = 30
+
+	prepared := tlsBootstrapPrepared{}
+	var err error
+	authorityID := domain.AuthorityID("")
+	rootGenerationNo := 1
+	if existing != nil {
+		if existing.Kind() != domain.AuthorityKindBootstrap {
+			return tlsBootstrapPrepared{}, contract.NewAppError(contract.ErrorKindUnavailable, "tls_bootstrap_authority_invalid",
+				"the stored bootstrap authority has an invalid kind")
+		}
+		if existing.IsArchived() {
+			return tlsBootstrapPrepared{}, contract.NewAppError(contract.ErrorKindConflict, "tls_bootstrap_authority_archived",
+				"an archived bootstrap authority cannot be regenerated")
+		}
+		if existing.IssuanceState() != domain.IssuanceStateEnabled {
+			return tlsBootstrapPrepared{}, contract.NewAppError(contract.ErrorKindConflict, "tls_bootstrap_authority_not_enabled",
+				"the bootstrap authority is not enabled")
+		}
+		if existing.Affected() || existing.PendingTakeover() {
+			return tlsBootstrapPrepared{}, contract.NewAppError(contract.ErrorKindConflict, "tls_bootstrap_authority_not_eligible",
+				"the bootstrap authority carries an unresolved impact or takeover state")
+		}
+		authorityID = existing.ID()
+		prepared.hasExisting = true
+		prepared.existingVersion = existing.Version()
+		var generation port.CAKeyGeneration
+		if err := s.deps.ReadStore.Read(ctx, func(tx port.TxStores) error {
+			var err error
+			generation, err = tx.PKI().GetCAKeyGeneration(ctx, existing.KeyGenerationID())
+			return err
+		}); err != nil {
+			if errors.Is(err, port.ErrNotFound) {
+				return tlsBootstrapPrepared{}, contract.NewAppError(contract.ErrorKindUnavailable, "tls_bootstrap_generation_missing",
+					"the bootstrap authority's current key generation could not be found")
+			}
+			return tlsBootstrapPrepared{}, storeError(err, "tls_bootstrap_generation_read_failed", "could not read the bootstrap key generation")
+		}
+		if generation.AuthorityID != authorityID {
+			return tlsBootstrapPrepared{}, contract.NewAppError(contract.ErrorKindUnavailable, "tls_bootstrap_generation_mismatch",
+				"the bootstrap authority's key generation belongs to another authority")
+		}
+		rootGenerationNo = generation.GenerationNo + 1
+	} else {
+		var parseErr error
+		authorityID, parseErr = domain.ParseAuthorityID(s.deps.IDs.NewUUID())
+		if parseErr != nil {
+			return tlsBootstrapPrepared{}, contract.FromDomainError(parseErr)
+		}
+	}
+	rootGenerationID, err := domain.ParseCAKeyGenerationID(s.deps.IDs.NewUUID())
+	if err != nil {
+		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
+	}
+	rootKeyMaterialID, err := domain.ParseKeyMaterialID(s.deps.IDs.NewUUID())
+	if err != nil {
+		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
+	}
+	rootCertificateID, err := domain.ParseCertificateID(s.deps.IDs.NewUUID())
+	if err != nil {
+		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
+	}
+	leafGenerationID, err := domain.ParseLeafKeyGenerationID(s.deps.IDs.NewUUID())
+	if err != nil {
+		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
+	}
+	if prepared.leafKeyMaterial.ID, err = domain.ParseKeyMaterialID(s.deps.IDs.NewUUID()); err != nil {
+		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
+	}
+	leafCertificateID, err := domain.ParseCertificateID(s.deps.IDs.NewUUID())
+	if err != nil {
+		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
+	}
+	prepared.rootKeyMaterial.ID = rootKeyMaterialID
+	prepared.rootGeneration.ID = rootGenerationID
+	prepared.rootGeneration.AuthorityID = authorityID
+	prepared.rootGeneration.GenerationNo = rootGenerationNo
+	seriesID, err := domain.ParseSeriesID(s.deps.IDs.NewUUID())
+	if err != nil {
+		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
+	}
+	tlsVersionID, err := domain.ParseTLSVersionID(s.deps.IDs.NewUUID())
+	if err != nil {
+		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
+	}
+
+	now := s.deps.Clock.Now()
+	validity, err := domain.NewCalendarValidity(bootstrapDays, domain.ValidityUnitDays)
+	if err != nil {
+		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
+	}
+	window, err := validity.Window(now)
+	if err != nil {
+		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
+	}
+	subject, err := domain.NewSubject(domain.SubjectFacts{CommonName: bootstrapName})
+	if err != nil {
+		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
+	}
+	leafSAN, err := domain.NewBootstrapDNSNameSAN()
+	if err != nil {
+		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
+	}
+	const algorithm = domain.KeyAlgorithmECDSAP256
+
+	rootGenerated, err := s.deps.KeyEngine.Generate(ctx, port.KeySpec{
+		KeyMaterialID: prepared.rootKeyMaterial.ID,
+		Algorithm:     algorithm,
+		Purpose:       domain.SecretPurposeBootstrapCA,
+	})
+	if err != nil {
+		return tlsBootstrapPrepared{}, contract.WrapAppError(contract.ErrorKindUnavailable, "tls_bootstrap_root_key_generate_failed",
+			"could not generate the bootstrap root key", err)
+	}
+	if err := validateGeneratedKey(rootGenerated, prepared.rootKeyMaterial.ID, domain.SecretPurposeBootstrapCA, algorithm); err != nil {
+		return tlsBootstrapPrepared{}, err
+	}
+	prepared.rootKeyMaterial.PublicKey = rootGenerated.PublicKey
+	prepared.rootKeyMaterial.Origin = "generated"
+	prepared.rootSecret = rootGenerated.EncryptedSecret
+	prepared.rootGeneration.KeyMaterialID = prepared.rootKeyMaterial.ID
+	prepared.rootGeneration.GenerationNo = rootGenerationNo
+
+	rootPlan := domain.IssuancePlan{
+		Subject: subject, KeyAlgorithm: algorithm, Window: window,
+		IssuerAuthorityID: authorityID, IssuerKeyGenerationID: rootGenerationID,
+	}
+	rootSerial, err := newSerial(ctx, s.deps.SerialGenerator)
+	if err != nil {
+		return tlsBootstrapPrepared{}, err
+	}
+	root, err := signCertificate(ctx, s.deps.CertificateSigner, port.CertificateSigningRequest{
+		Plan: rootPlan, CertificateID: rootCertificateID, KeyMaterialID: prepared.rootKeyMaterial.ID,
+		SubjectPublicKey: rootGenerated.PublicKey, Kind: domain.CertificateKindCA,
+		Serial:            rootSerial,
+		IssuerCertificate: domain.Certificate{},
+	}, prepared.rootSecret)
+	if err != nil {
+		return tlsBootstrapPrepared{}, err
+	}
+	prepared.rootCertificate = root
+
+	authorityVersion := domain.Version(0)
+	if existing != nil {
+		authorityVersion = existing.Version().Next()
+	}
+	prepared.authority, err = domain.NewAuthority(domain.AuthorityFacts{
+		ID: authorityID, Kind: domain.AuthorityKindBootstrap, Name: bootstrapName,
+		IssuanceState: domain.IssuanceStateEnabled, IssuanceCertificateID: root.ID(),
+		KeyGenerationID: rootGenerationID, KeyAvailable: true,
+		CertificateWindow: window, Version: authorityVersion,
+	})
+	if err != nil {
+		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
+	}
+	leafValidity := domain.IssuanceRequest{
+		Profile: domain.CertificateProfileServerTLS, Subject: subject,
+		SANs: []domain.SAN{leafSAN}, KeyAlgorithm: algorithm, Window: window,
+	}
+	plan, err := domain.PlanBootstrapIssuance(prepared.authority, leafValidity, now)
+	if err != nil {
+		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
+	}
+	leafPrepared, err := prepareCertificate(ctx, s.deps.KeyEngine, s.deps.CertificateSigner, s.deps.SerialGenerator,
+		plan, signingKeyRef{Fresh: &port.KeySpec{
+			KeyMaterialID: prepared.leafKeyMaterial.ID, Algorithm: algorithm, Purpose: domain.SecretPurposeInternalTLS,
+		}}, domain.PublicKey{}, leafCertificateID, prepared.rootCertificate, prepared.rootSecret,
+		domain.CertificateKindLeaf, domain.AccountID(""), nil)
+	if err != nil {
+		return tlsBootstrapPrepared{}, err
+	}
+	if leafPrepared.GeneratedSecret == nil || leafPrepared.KeyMaterialID != prepared.leafKeyMaterial.ID {
+		return tlsBootstrapPrepared{}, contract.NewAppError(contract.ErrorKindUnavailable, "tls_bootstrap_leaf_key_invalid",
+			"the bootstrap leaf key generation returned no usable secret")
+	}
+	if err := validateGeneratedKey(port.GeneratedKey{
+		PublicKey: leafPrepared.GeneratedPublic, EncryptedSecret: *leafPrepared.GeneratedSecret,
+	}, prepared.leafKeyMaterial.ID, domain.SecretPurposeInternalTLS, algorithm); err != nil {
+		return tlsBootstrapPrepared{}, err
+	}
+	prepared.leafKeyMaterial.PublicKey = leafPrepared.GeneratedPublic
+	prepared.leafKeyMaterial.Origin = "generated"
+	prepared.leafSecret = *leafPrepared.GeneratedSecret
+	prepared.leafCertificate = leafPrepared.Certificate
+
+	prepared.leafGeneration, err = domain.NewLeafKeyGeneration(domain.LeafKeyGenerationFacts{
+		ID: leafGenerationID, SeriesID: seriesID, KeyMaterialID: prepared.leafKeyMaterial.ID,
+		GenerationNo: 1, RenewalCount: 0, Custody: domain.KeyCustodyInternal,
+	})
+	if err != nil {
+		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
+	}
+	policy := domain.SeriesPolicy{RotateEvery: 1, CertificateValidity: validity}
+	if err := policy.Validate(); err != nil {
+		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
+	}
+	policySnapshot, err := leafPolicySnapshotJSON(prepared.leafCertificate, policy)
+	if err != nil {
+		return tlsBootstrapPrepared{}, err
+	}
+	prepared.leafRecord = port.LeafCertificateRecord{
+		CertificateID: prepared.leafCertificate.ID(), SeriesID: seriesID,
+		LeafKeyGenerationID: leafGenerationID, IssuerCACertificateID: prepared.rootCertificate.ID(),
+		Operation: port.CertificateOperationInitial, RenewalCountAtIssue: 0, PolicySnapshotJSON: policySnapshot,
+	}
+	prepared.series, err = domain.NewLeafSeries(domain.LeafSeriesFacts{
+		ID: seriesID, Name: bootstrapName, Purpose: domain.SeriesPurposeBootstrapTLS,
+		ManagementAuthorityID: prepared.authority.ID(), CurrentCertificateID: prepared.leafCertificate.ID(),
+		CurrentKeyGenerationID: leafGenerationID, Policy: policy,
+	})
+	if err != nil {
+		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
+	}
+	prepared.crlState, err = domain.NewCRLState(domain.CRLStateFacts{
+		CAKeyGenerationID:      prepared.rootGeneration.ID,
+		PublicationState:       domain.PublicationStateInactive,
+		SigningCACertificateID: prepared.rootCertificate.ID(),
+	})
+	if err != nil {
+		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
+	}
+	if err := s.deps.ChainValidator.Validate(ctx, prepared.leafCertificate.DER(), [][]byte{prepared.rootCertificate.DER()}, now); err != nil {
+		return tlsBootstrapPrepared{}, contract.WrapAppError(contract.ErrorKindValidation, "tls_bootstrap_chain_invalid",
+			"the generated bootstrap certificate chain could not be verified", err)
+	}
+	prepared.version, err = domain.NewTLSVersion(domain.TLSVersionFacts{
+		ID: tlsVersionID, Source: domain.TLSSourceBootstrap, KeyMaterialID: prepared.leafKeyMaterial.ID,
+		LeafDER: prepared.leafCertificate.DER(), ChainBundle: pemEncodeChain([][]byte{prepared.rootCertificate.DER()}),
+		NotAfter: prepared.leafCertificate.Validity().NotAfter(),
+	})
+	if err != nil {
+		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
+	}
+	return prepared, nil
+}
+
+// Bootstrap creates or explicitly regenerates the local temporary HTTPS
+// chain. It is internal-only and never resets account/setup state. An
+// operational TLS version blocks the operation; expiration alone never
+// triggers it.
+func (s *TLSService) Bootstrap(ctx context.Context, meta contract.MutationMeta, cmd contract.TLSBootstrapCommand) (contract.TLSStatusView, error) {
+	if err := cmd.Validate(); err != nil {
+		return contract.TLSStatusView{}, err
+	}
+	if err := requireInternalOperation(meta.Principal, port.ActionTLSBootstrap); err != nil {
+		return contract.TLSStatusView{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return contract.TLSStatusView{}, contract.WrapAppError(contract.ErrorKindUnavailable, "request_canceled",
+			"the request was canceled before bootstrap started", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	existing, found, err := s.findBootstrapAuthority(ctx)
+	if err != nil {
+		return contract.TLSStatusView{}, err
+	}
+	var existingPtr *domain.Authority
+	if found {
+		existingPtr = &existing
+	}
+	prepared, err := s.prepareBootstrap(ctx, existingPtr)
+	if err != nil {
+		return contract.TLSStatusView{}, err
+	}
+
+	var outcome tlsActivationOutcome
+	writeErr := s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
+		installation, err := tx.Installation().GetForUpdate(ctx)
+		if err != nil {
+			return storeError(err, "tls_installation_read_failed", "could not read the installation state")
+		}
+		var previousVersionID domain.TLSVersionID
+		if active, activeErr := tx.TLS().GetActiveForUpdate(ctx); activeErr == nil {
+			if active.Phase() != domain.TLSChangePhaseApplied {
+				return contract.NewAppError(contract.ErrorKindConflict, "tls_bootstrap_blocked_pending_reconcile",
+					"the current TLS pointer is not an applied bootstrap version; run Reconcile first")
+			}
+			activeVersion, err := tx.TLS().GetVersion(ctx, active.CandidateVersionID())
+			if err != nil {
+				return storeError(err, "tls_bootstrap_active_version_read_failed", "could not read the active TLS version")
+			}
+			if activeVersion.Source() != domain.TLSSourceBootstrap {
+				return contract.NewAppError(contract.ErrorKindConflict, "tls_bootstrap_operational_active",
+					"bootstrap cannot replace an operational TLS version")
+			}
+			previousVersionID = active.CandidateVersionID()
+		} else if errors.Is(activeErr, port.ErrNotFound) {
+			if installation.ActiveTLSVersionID != "" {
+				return contract.NewAppError(contract.ErrorKindUnavailable, "tls_bootstrap_active_change_missing",
+					"the installation names an active TLS version with no change record")
+			}
+		} else {
+			return storeError(activeErr, "tls_bootstrap_active_change_read_failed", "could not read the active TLS change")
+		}
+
+		if err := tx.PKI().InsertKeyMaterial(ctx, prepared.rootKeyMaterial); err != nil {
+			return storeError(err, "tls_bootstrap_root_key_material_store_failed", "could not store the bootstrap root public key")
+		}
+		if err := tx.Secrets().InsertEncrypted(ctx, prepared.rootSecret); err != nil {
+			return storeError(err, "tls_bootstrap_root_secret_store_failed", "could not store the bootstrap root secret")
+		}
+		if err := tx.PKI().InsertKeyGeneration(ctx, prepared.rootGeneration); err != nil {
+			return storeError(err, "tls_bootstrap_root_generation_store_failed", "could not store the bootstrap root key generation")
+		}
+		if err := tx.PKI().InsertCertificate(ctx, prepared.rootCertificate); err != nil {
+			return storeError(err, "tls_bootstrap_root_certificate_store_failed", "could not store the bootstrap root certificate")
+		}
+		if err := tx.PKI().InsertCACertificateRecord(ctx, port.CACertificateRecord{
+			CertificateID: prepared.rootCertificate.ID(), CAKeyGenerationID: prepared.rootGeneration.ID,
+		}); err != nil {
+			return storeError(err, "tls_bootstrap_ca_record_store_failed", "could not store the bootstrap CA certificate record")
+		}
+		if prepared.hasExisting {
+			current, err := tx.PKI().GetIssuerForUpdate(ctx, prepared.authority.ID())
+			if err != nil {
+				return storeError(err, "tls_bootstrap_authority_read_failed", "could not lock the bootstrap authority")
+			}
+			if current.Version() != prepared.existingVersion || current.Kind() != domain.AuthorityKindBootstrap {
+				return contract.NewAppError(contract.ErrorKindConflict, "tls_bootstrap_authority_changed",
+					"the bootstrap authority changed while regeneration was being prepared")
+			}
+			if err := tx.PKI().SaveAuthority(ctx, prepared.authority, prepared.existingVersion); err != nil {
+				return storeError(err, "tls_bootstrap_authority_store_failed", "could not update the bootstrap authority")
+			}
+		} else if err := tx.PKI().InsertAuthority(ctx, prepared.authority); err != nil {
+			return storeError(err, "tls_bootstrap_authority_store_failed", "could not store the bootstrap authority")
+		}
+		if err := tx.CRLs().SaveState(ctx, prepared.crlState, 0); err != nil {
+			return storeError(err, "tls_bootstrap_crl_state_store_failed", "could not store the bootstrap CRL state")
+		}
+		if err := tx.PKI().InsertKeyMaterial(ctx, prepared.leafKeyMaterial); err != nil {
+			return storeError(err, "tls_bootstrap_leaf_key_material_store_failed", "could not store the bootstrap leaf public key")
+		}
+		if err := tx.Secrets().InsertEncrypted(ctx, prepared.leafSecret); err != nil {
+			return storeError(err, "tls_bootstrap_leaf_secret_store_failed", "could not store the bootstrap TLS secret")
+		}
+		if err := tx.PKI().InsertLeafKeyGeneration(ctx, prepared.leafGeneration); err != nil {
+			return storeError(err, "tls_bootstrap_leaf_generation_store_failed", "could not store the bootstrap leaf key generation")
+		}
+		if err := tx.PKI().InsertCertificate(ctx, prepared.leafCertificate); err != nil {
+			return storeError(err, "tls_bootstrap_leaf_certificate_store_failed", "could not store the bootstrap leaf certificate")
+		}
+		if err := tx.PKI().InsertLeafCertificateRecord(ctx, prepared.leafRecord); err != nil {
+			return storeError(err, "tls_bootstrap_leaf_record_store_failed", "could not store the bootstrap leaf certificate record")
+		}
+		if err := tx.PKI().InsertSeries(ctx, prepared.series); err != nil {
+			return storeError(err, "tls_bootstrap_series_store_failed", "could not store the bootstrap TLS series")
+		}
+		if err := tx.TLS().InsertVersion(ctx, prepared.version); err != nil {
+			return storeError(err, "tls_bootstrap_version_store_failed", "could not store the bootstrap TLS version")
+		}
+
+		now := s.deps.Clock.Now()
+		facts := domain.TLSValidationFacts{
+			CandidateSource: domain.TLSSourceBootstrap, KeyMatchesCertificate: true,
+			WithinValidityPeriod: !prepared.version.IsExpiredAt(now), PurposeMatchesServerAuth: true,
+			ServiceAddressMatches: true, ChainVerified: true,
+		}
+		change, err := domain.NewCandidateTLSChange(previousVersionID, prepared.version.ID())
+		if err != nil {
+			return contract.FromDomainError(err)
+		}
+		change, err = change.ValidateCandidate(facts)
+		if err != nil {
+			return contract.FromDomainError(err)
+		}
+		committed, err := change.Commit(now)
+		if err != nil {
+			return contract.FromDomainError(err)
+		}
+		if err := tx.TLS().SaveChange(ctx, committed, 0); err != nil {
+			return storeError(err, "tls_bootstrap_change_store_failed", "could not store the bootstrap TLS change")
+		}
+		if err := tx.TLS().SetActive(ctx, installation.Version, prepared.version.ID()); err != nil {
+			return storeError(err, "tls_bootstrap_set_active_failed", "could not activate the bootstrap TLS pointer")
+		}
+		event := port.AuditEvent{
+			ID: s.deps.IDs.NewUUID(), OccurredAt: now, ActorKind: contract.AuditActorSystem,
+			Action: "tls.bootstrap.committed", TargetType: "authority", TargetID: string(prepared.authority.ID()),
+			Result: contract.AuditResultSuccess, Details: contract.AuditDetails{SchemaVersion: 1},
+		}
+		if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(prepared.authority.ID())); err != nil {
+			return storeError(err, "tls_bootstrap_audit_failed", "could not record the bootstrap audit event")
+		}
+		outcome = tlsActivationOutcome{
+			candidate: prepared.version, secret: prepared.leafSecret, change: committed,
+			previousVersionID: previousVersionID, installationVersionAfterSetActive: installation.Version.Next(),
+		}
+		return nil
+	})
+	if writeErr != nil {
+		if errors.Is(writeErr, port.ErrCommitUnknown) {
+			s.deps.RuntimeGate.FailClosed("tls_bootstrap_commit_unknown")
+		}
+		return contract.TLSStatusView{}, writeErr
+	}
+
+	preparedHandle, err := s.deps.TLSInstaller.Prepare(ctx, outcome.candidate, outcome.secret)
+	if err != nil {
+		if rollbackErr := s.rollbackActivation(ctx, meta, outcome, "tls_bootstrap_prepare_failed"); rollbackErr != nil {
+			s.deps.RuntimeGate.FailClosed("tls_bootstrap_prepare_rollback_failed")
+		}
+		return contract.TLSStatusView{}, contract.WrapAppError(contract.ErrorKindUnavailable, "tls_bootstrap_prepare_failed",
+			"could not prepare the bootstrap TLS configuration", err)
+	}
+	defer s.deps.TLSInstaller.Discard(preparedHandle)
+	if err := s.deps.TLSInstaller.Apply(ctx, preparedHandle); err != nil {
+		if rollbackErr := s.rollbackActivation(ctx, meta, outcome, "tls_bootstrap_apply_failed"); rollbackErr != nil {
+			s.deps.RuntimeGate.FailClosed("tls_bootstrap_apply_rollback_failed")
+		}
+		return contract.TLSStatusView{}, contract.WrapAppError(contract.ErrorKindUnavailable, "tls_bootstrap_apply_failed",
+			"could not apply the bootstrap TLS configuration", err)
+	}
+
+	now := s.deps.Clock.Now()
+	applied, err := outcome.change.Apply(now)
+	if err != nil {
+		s.deps.RuntimeGate.FailClosed("tls_bootstrap_applied_record_failed")
+		_ = s.markRecoveryRequired(ctx, outcome.change, "tls_bootstrap_applied_record_failed")
+		return contract.TLSStatusView{}, contract.WrapAppError(contract.ErrorKindCommitUnknown, "tls_bootstrap_applied_record_failed",
+			"the bootstrap TLS configuration was applied but its outcome could not be recorded", err)
+	}
+	recordErr := s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
+		if err := tx.TLS().SaveChange(ctx, applied, outcome.change.Version()); err != nil {
+			return storeError(err, "tls_bootstrap_change_record_failed", "could not record the applied bootstrap TLS change")
+		}
+		event := port.AuditEvent{
+			ID: s.deps.IDs.NewUUID(), OccurredAt: now, ActorKind: contract.AuditActorSystem,
+			Action: "tls.bootstrap", TargetType: "authority", TargetID: string(prepared.authority.ID()),
+			Result: contract.AuditResultSuccess, Details: contract.AuditDetails{SchemaVersion: 1},
+		}
+		return tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(prepared.authority.ID()))
+	})
+	if recordErr != nil {
+		s.deps.RuntimeGate.FailClosed("tls_bootstrap_record_failed")
+		_ = s.markRecoveryRequired(ctx, outcome.change, "tls_bootstrap_record_failed")
+		return contract.TLSStatusView{}, contract.WrapAppError(contract.ErrorKindCommitUnknown, "tls_bootstrap_record_failed",
+			"the bootstrap TLS configuration was applied but its outcome could not be recorded", recordErr)
+	}
+
+	return contract.TLSStatusView{
+		Active: ptrTLSVersionView(toTLSVersionView(outcome.candidate)),
+		Phase:  ptrPhase(domain.TLSChangePhaseApplied), CandidateID: ptrTLSVersionID(outcome.candidate.ID()),
+		Version: outcome.installationVersionAfterSetActive,
+	}, nil
 }
 
 // ---- IssueCandidate ----
@@ -1057,7 +1598,7 @@ func (s *TLSService) commitIssueCandidate(ctx context.Context, tx port.TxStores,
 		TargetID: string(tlsVersionID), ClientIP: clientIP(meta.RequestMeta), Result: contract.AuditResultSuccess,
 		Details: contract.AuditDetails{SchemaVersion: 1, Fields: map[string]string{"serial": cert.Serial().Hex()}},
 	}
-	if err := tx.Audit().Append(ctx, event, []domain.AuthorityID{authorityID}); err != nil {
+	if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(authorityID)); err != nil {
 		return storeError(err, "tls_audit_failed", "could not record the TLS issuance audit event")
 	}
 
@@ -1131,7 +1672,7 @@ func (s *TLSService) Activate(ctx context.Context, meta contract.MutationMeta, c
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTLSActivate, port.NewAuthorizationScope(tlsScope()...)); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTLSActivate, port.NewAuthorizationScope()); err != nil {
 			return err
 		}
 
@@ -1234,6 +1775,9 @@ func (s *TLSService) Activate(ctx context.Context, meta contract.MutationMeta, c
 		return nil
 	})
 	if writeErr != nil {
+		if errors.Is(writeErr, port.ErrCommitUnknown) {
+			s.deps.RuntimeGate.FailClosed("tls_activate_commit_unknown")
+		}
 		return contract.TLSStatusView{}, writeErr
 	}
 	if outcome.validationFailed {
@@ -1246,7 +1790,9 @@ func (s *TLSService) Activate(ctx context.Context, meta contract.MutationMeta, c
 	// committed, using the candidate/secret that Write already re-verified.
 	prepared, err := s.deps.TLSInstaller.Prepare(ctx, outcome.candidate, outcome.secret)
 	if err != nil {
-		s.rollbackActivation(ctx, meta, outcome, "tls_prepare_failed")
+		if rollbackErr := s.rollbackActivation(ctx, meta, outcome, "tls_prepare_failed"); rollbackErr != nil {
+			s.deps.RuntimeGate.FailClosed("tls_prepare_rollback_failed")
+		}
 		return contract.TLSStatusView{}, contract.WrapAppError(contract.ErrorKindUnavailable, "tls_prepare_failed",
 			"could not prepare the TLS candidate for activation", err)
 	}
@@ -1260,7 +1806,9 @@ func (s *TLSService) Activate(ctx context.Context, meta contract.MutationMeta, c
 		// §9 "Apply 실패는 DB/메모리 모두 원복한다": the in-memory half is
 		// TLSInstaller's own contract (a failed Apply leaves the previous
 		// listener serving); the DB half is rollbackActivation below.
-		s.rollbackActivation(ctx, meta, outcome, "tls_apply_failed")
+		if rollbackErr := s.rollbackActivation(ctx, meta, outcome, "tls_apply_failed"); rollbackErr != nil {
+			s.deps.RuntimeGate.FailClosed("tls_apply_rollback_failed")
+		}
 		return contract.TLSStatusView{}, contract.WrapAppError(contract.ErrorKindUnavailable, "tls_apply_failed",
 			"could not apply the TLS candidate", err)
 	}
@@ -1271,13 +1819,19 @@ func (s *TLSService) Activate(ctx context.Context, meta contract.MutationMeta, c
 		// Unreachable in practice (outcome.change is always committed on
 		// this path), but treated as the same ambiguous-recording case
 		// rather than a panic.
-		s.markRecoveryRequired(ctx, outcome.change, "tls_applied_transition_failed")
+		s.deps.RuntimeGate.FailClosed("tls_applied_transition_failed")
+		_ = s.markRecoveryRequired(ctx, outcome.change, "tls_applied_transition_failed")
 		return contract.TLSStatusView{}, contract.WrapAppError(contract.ErrorKindCommitUnknown, "tls_applied_record_failed",
 			"the TLS candidate was applied but its outcome could not be recorded", err)
 	}
 	recordErr := s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
 		if err := tx.TLS().SaveChange(ctx, applied, outcome.change.Version()); err != nil {
 			return storeError(err, "tls_change_store_failed", "could not record the applied TLS change")
+		}
+		if outcome.candidate.Source() != domain.TLSSourceBootstrap {
+			if err := deleteBootstrapSecrets(ctx, tx); err != nil {
+				return storeError(err, "tls_bootstrap_secret_cleanup_failed", "could not delete bootstrap TLS secrets after operational activation")
+			}
 		}
 		event := port.AuditEvent{
 			ID: s.deps.IDs.NewUUID(), OccurredAt: appliedNow, ActorKind: contract.AuditActorAccount,
@@ -1294,7 +1848,8 @@ func (s *TLSService) Activate(ctx context.Context, meta contract.MutationMeta, c
 		// Reconcile has a defined starting point -- its own failure is not
 		// this call's to surface, the same reasoning TLSInstaller.Discard's
 		// doc comment gives for never returning an error of its own.
-		s.markRecoveryRequired(ctx, outcome.change, "tls_applied_record_failed")
+		s.deps.RuntimeGate.FailClosed("tls_applied_record_failed")
+		_ = s.markRecoveryRequired(ctx, outcome.change, "tls_applied_record_failed")
 		return contract.TLSStatusView{}, contract.WrapAppError(contract.ErrorKindCommitUnknown, "tls_applied_record_failed",
 			"the TLS candidate was applied but recording it failed or is unknown", recordErr)
 	}
@@ -1308,26 +1863,48 @@ func (s *TLSService) Activate(ctx context.Context, meta contract.MutationMeta, c
 	}, nil
 }
 
+// deleteBootstrapSecrets removes private material that is no longer needed
+// once an operational TLS snapshot is live. The public key rows, certificates,
+// TLSVersion snapshots and their change history remain untouched so a later
+// audit/recovery read still has the complete public history. Deletion is
+// idempotent: ListEncrypted may contain no matching row after a retry.
+func deleteBootstrapSecrets(ctx context.Context, tx port.TxStores) error {
+	secrets, err := tx.Secrets().ListEncrypted(ctx)
+	if err != nil {
+		return err
+	}
+	for _, secret := range secrets {
+		if secret.Purpose() == domain.SecretPurposeBootstrapCA {
+			if err := tx.Secrets().Delete(ctx, secret.OwnerKeyID(), secret.Purpose()); err != nil {
+				return err
+			}
+		}
+	}
+	versions, err := tx.TLS().ListVersions(ctx)
+	if err != nil {
+		return err
+	}
+	for _, version := range versions {
+		if version.Source() == domain.TLSSourceBootstrap {
+			if err := tx.Secrets().Delete(ctx, version.KeyMaterialID(), domain.SecretPurposeInternalTLS); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // rollbackActivation is §9's "Apply 실패는 DB/메모리 모두 원복한다" DB half:
 // a best-effort separate Write that moves the just-committed TLSChange to
 // rolled_back and reverts the installation's active pointer back to
 // previousVersionID.
 //
-// When outcome.previousVersionID is empty (this was the very first
-// activation ever attempted, so there is nothing to revert to),
-// TLSRepository.SetActive cannot be used to clear the pointer back to
-// empty -- its own contract requires versionID to already exist in both the
-// version and change tables, which "no previous version" by definition does
-// not satisfy. There is no ClearActive-shaped method in port.TLSRepository
-// for this case. This developer left it unhandled and reported it rather
-// than inventing a new repository method outside the assigned files: the
-// active pointer stays on the failed candidate, though its TLSChange row
-// correctly reads rolled_back (a terminal phase), so at least a subsequent
-// Activate call is not blocked by the earlier
-// tls_activation_blocked_pending_reconcile guard.
-func (s *TLSService) rollbackActivation(ctx context.Context, meta contract.MutationMeta, outcome tlsActivationOutcome, errorCode string) {
+// A first activation uses TLSRepository.ClearActive; a late rollback is
+// guarded by both the installation version and candidate id so it cannot
+// clear a newer activation.
+func (s *TLSService) rollbackActivation(ctx context.Context, meta contract.MutationMeta, outcome tlsActivationOutcome, errorCode string) error {
 	now := s.deps.Clock.Now()
-	_ = s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
+	return s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
 		rolledBack, err := outcome.change.RollbackApply(errorCode, now)
 		if err != nil {
 			return err
@@ -1339,6 +1916,8 @@ func (s *TLSService) rollbackActivation(ctx context.Context, meta contract.Mutat
 			if err := tx.TLS().SetActive(ctx, outcome.installationVersionAfterSetActive, outcome.previousVersionID); err != nil {
 				return err
 			}
+		} else if err := tx.TLS().ClearActive(ctx, outcome.installationVersionAfterSetActive, outcome.candidate.ID()); err != nil {
+			return err
 		}
 		event := port.AuditEvent{
 			ID: s.deps.IDs.NewUUID(), OccurredAt: now, ActorKind: contract.AuditActorAccount,
@@ -1359,9 +1938,9 @@ func (s *TLSService) rollbackActivation(ctx context.Context, meta contract.Mutat
 // the change is stamped recovery_required instead of left claiming
 // "committed" (which would look, to a later Activate, like a resumable
 // normal attempt rather than the maintenance condition it actually is).
-func (s *TLSService) markRecoveryRequired(ctx context.Context, committed domain.TLSChange, errorCode string) {
+func (s *TLSService) markRecoveryRequired(ctx context.Context, committed domain.TLSChange, errorCode string) error {
 	now := s.deps.Clock.Now()
-	_ = s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
+	return s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
 		recovery, err := committed.MarkRecoveryRequired(errorCode, now)
 		if err != nil {
 			return err
@@ -1384,37 +1963,11 @@ func (s *TLSService) markRecoveryRequired(ctx context.Context, committed domain.
 // still mean an actual Apply call happened in THIS process, not just a
 // phase label change.
 //
-// This developer simplified one aspect the corresponding Activate code
-// keeps split for atomicity: reading the recovery_required change, deciding
-// the winner and persisting that decision run inside ONE Write here, with
-// TLSInstaller.Prepare/Apply called from inside that same Write's callback.
-// Ordinarily that would reopen exactly the ambiguity Activate's split
-// design exists to avoid (an Apply whose surrounding commit later turns out
-// commit_unknown). Reconcile is judged a narrower case: it only ever runs
-// on single-instance startup recovery before normal service resumes
-// (§9/§11's own framing), never concurrently with request traffic, so a
-// commit_unknown here simply means the NEXT startup's Reconcile tries
-// again against the same still-recovery_required row -- it is not, unlike
-// Activate, a live administrator request that must not silently retry
-// somebody else's action. Flagged for the lead as a design simplification
-// to confirm, not a literal reading of §9's sentence order.
-//
-// SAFETY DEPENDS ON A RUNTIME PRECONDITION THIS CODE DOES NOT ENFORCE: if
-// the write that persists this Write's outcome (SaveChange/SetActive/Audit)
-// rolls back or comes back commit_unknown AFTER Apply already swapped the
-// live listener (see TestTLSServiceReconcileDiscardIsHarmlessAfterADBRollback
-// in tls_test.go, which reproduces exactly this), the persisted TLSChange
-// can read recovery_required again while the process is actually already
-// serving the new candidate. §12 limits the blast radius of that gap by
-// requiring that a restart-recovery commit failure must not open admission
-// for downloads/issuance ("재시작 복구 commit이 실패하면 다운로드/발급
-// 요청을 열지 않는다") -- but THAT gate is a not-yet-implemented runtime
-// (B05/B06) behavior, not something this package.go file can guarantee on
-// its own. This comment exists so nobody reading only this file concludes
-// the divergence is harmless: it is bounded only if the runtime honors §12
-// and keeps admission closed until recovery is confirmed complete. Reported
-// to the lead as a planning item, not resolved by changing this method's
-// structure.
+// Apply is intentionally still performed from this recovery transaction's
+// callback because Reconcile runs during startup before normal admission. Any
+// error after the installer is touched, including a rollback or unknown
+// commit, fails the RuntimeGate; Reconcile never reports a normal success
+// while the persisted decision may still be unresolved.
 func (s *TLSService) Reconcile(ctx context.Context, meta contract.MutationMeta, cmd contract.TLSReconcileCommand) (contract.TLSStatusView, error) {
 	if err := cmd.Validate(); err != nil {
 		return contract.TLSStatusView{}, err
@@ -1431,6 +1984,7 @@ func (s *TLSService) Reconcile(ctx context.Context, meta contract.MutationMeta, 
 	defer s.mu.Unlock()
 
 	var view contract.TLSStatusView
+	failureCode := ""
 	err := s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
 		installation, err := tx.Installation().GetForUpdate(ctx)
 		if err != nil {
@@ -1440,14 +1994,25 @@ func (s *TLSService) Reconcile(ctx context.Context, meta contract.MutationMeta, 
 
 		active, err := tx.TLS().GetActiveForUpdate(ctx)
 		if errors.Is(err, port.ErrNotFound) {
-			return nil // nothing has ever been activated; nothing to reconcile
+			if installation.ActiveTLSVersionID == "" {
+				return nil // nothing has ever been activated; nothing to reconcile
+			}
+			failureCode = "tls_active_change_missing"
+			return contract.NewAppError(contract.ErrorKindUnavailable, failureCode,
+				"the installation names an active TLS version with no change record")
 		}
 		if err != nil {
 			return storeError(err, "tls_active_change_read_failed", "could not read the active TLS change")
 		}
-		if active.Phase() != domain.TLSChangePhaseRecoveryRequired {
-			// Already resolved (or never needed resolving) -- report current
-			// state, do nothing.
+		if active.Phase() == domain.TLSChangePhaseApplied {
+			if installation.ActiveTLSVersionID == "" || installation.ActiveTLSVersionID != active.CandidateVersionID() {
+				failureCode = "tls_applied_pointer_inconsistent"
+				return contract.NewAppError(contract.ErrorKindUnavailable, failureCode,
+					"the applied TLS change does not match the installation's active pointer")
+			}
+			// Already resolved -- report current state, do nothing. A terminal
+			// applied row is not an unresolved Apply window, so Reconcile must
+			// not touch the live installer merely because the process restarted.
 			version, err := tx.TLS().GetVersion(ctx, installation.ActiveTLSVersionID)
 			if err != nil {
 				return storeError(err, "tls_active_version_read_failed", "could not read the active TLS version")
@@ -1460,6 +2025,35 @@ func (s *TLSService) Reconcile(ctx context.Context, meta contract.MutationMeta, 
 			view.CandidateID = &candidateID
 			view.ErrorCode = active.ErrorCode()
 			return nil
+		}
+		if active.Phase() == domain.TLSChangePhaseRolledBack {
+			failureCode = "tls_rolled_back_pointer_inconsistent"
+			return contract.NewAppError(contract.ErrorKindUnavailable, failureCode,
+				"a rolled-back TLS change is still named by the installation's active pointer")
+		}
+		if active.Phase() == domain.TLSChangePhasePrepared {
+			failureCode = "tls_reconcile_prepared_active"
+			return contract.NewAppError(contract.ErrorKindUnavailable, failureCode,
+				"a prepared TLS change cannot be activated during reconciliation")
+		}
+		if active.Phase() == domain.TLSChangePhaseCommitted {
+			// The committed row and active pointer are the durable decision
+			// written immediately before Installer.Apply. A restart can land
+			// here before Apply or before the applied record, so move it into
+			// the explicit recovery state before evaluating the stored
+			// candidate/previous snapshots.
+			now := s.deps.Clock.Now()
+			recovery, err := active.MarkRecoveryRequired("tls_reconcile_committed", now)
+			if err != nil {
+				failureCode = "tls_reconcile_committed_marker_failed"
+				return contract.WrapAppError(contract.ErrorKindUnavailable, failureCode,
+					"the committed TLS change could not be moved into recovery", err)
+			}
+			if err := tx.TLS().SaveChange(ctx, recovery, active.Version()); err != nil {
+				failureCode = "tls_reconcile_committed_marker_failed"
+				return storeError(err, failureCode, "could not record the committed TLS change as recovery-required")
+			}
+			active = recovery
 		}
 
 		now := s.deps.Clock.Now()
@@ -1501,18 +2095,9 @@ func (s *TLSService) Reconcile(ctx context.Context, meta contract.MutationMeta, 
 
 		reconciled, recErr := active.Reconcile(facts, now)
 		if recErr != nil {
-			// Neither the candidate nor the previous version re-validated:
-			// stays recovery_required (maintenance). This is a defined,
-			// non-error outcome for Reconcile's own caller -- the same
-			// "failure is the expected result, not an exception" shape
-			// ValidateCandidate uses -- so it is reported through view, not
-			// as a returned error.
-			phase := active.Phase()
-			view.Phase = &phase
-			candidateID := active.CandidateVersionID()
-			view.CandidateID = &candidateID
-			view.ErrorCode = "tls_recovery_unresolved"
-			return nil
+			failureCode = "tls_recovery_unresolved"
+			return contract.WrapAppError(contract.ErrorKindUnavailable, failureCode,
+				"neither the candidate nor the previous TLS version could be re-validated", recErr)
 		}
 
 		var winner domain.TLSVersion
@@ -1523,29 +2108,46 @@ func (s *TLSService) Reconcile(ctx context.Context, meta contract.MutationMeta, 
 		case domain.TLSChangePhaseRolledBack:
 			winner = previousVersion
 		}
+		if winner.ID() == "" {
+			failureCode = "tls_reconcile_winner_missing"
+			return contract.NewAppError(contract.ErrorKindUnavailable, failureCode,
+				"the reconciled TLS change did not identify a usable winning version")
+		}
 		winnerSecret, err = tx.Secrets().GetEncrypted(ctx, winner.KeyMaterialID(), domain.SecretPurposeInternalTLS)
 		if err != nil {
+			failureCode = "tls_reconcile_winner_key_read_failed"
 			return storeError(err, "tls_winner_key_read_failed", "could not read the winning TLS version's stored key")
 		}
 
 		prepared, err := s.deps.TLSInstaller.Prepare(ctx, winner, winnerSecret)
 		if err != nil {
+			failureCode = "tls_reconcile_prepare_failed"
 			return contract.WrapAppError(contract.ErrorKindUnavailable, "tls_reconcile_prepare_failed",
 				"could not prepare the reconciled TLS version", err)
 		}
 		defer s.deps.TLSInstaller.Discard(prepared)
 		if err := s.deps.TLSInstaller.Apply(ctx, prepared); err != nil {
+			failureCode = "tls_reconcile_apply_failed"
 			return contract.WrapAppError(contract.ErrorKindUnavailable, "tls_reconcile_apply_failed",
 				"could not apply the reconciled TLS version", err)
 		}
 
 		if err := tx.TLS().SaveChange(ctx, reconciled, active.Version()); err != nil {
+			failureCode = "tls_reconcile_record_failed"
 			return storeError(err, "tls_change_store_failed", "could not record the reconciled TLS change")
+		}
+		if winner.Source() != domain.TLSSourceBootstrap {
+			if err := deleteBootstrapSecrets(ctx, tx); err != nil {
+				failureCode = "tls_reconcile_bootstrap_secret_cleanup_failed"
+				return storeError(err, failureCode, "could not delete bootstrap TLS secrets after operational recovery")
+			}
 		}
 		if reconciled.Phase() == domain.TLSChangePhaseRolledBack {
 			if err := tx.TLS().SetActive(ctx, installation.Version, active.PreviousVersionID()); err != nil {
+				failureCode = "tls_reconcile_pointer_failed"
 				return storeError(err, "tls_set_active_failed", "could not revert the active TLS pointer")
 			}
+			view.Version = installation.Version.Next()
 		}
 
 		event := port.AuditEvent{
@@ -1555,6 +2157,7 @@ func (s *TLSService) Reconcile(ctx context.Context, meta contract.MutationMeta, 
 			Details: contract.AuditDetails{SchemaVersion: 1, Fields: map[string]string{"phase": string(reconciled.Phase())}},
 		}
 		if err := tx.Audit().Append(ctx, event, tlsScope()); err != nil {
+			failureCode = "tls_reconcile_audit_failed"
 			return storeError(err, "tls_audit_failed", "could not record the reconcile audit event")
 		}
 
@@ -1568,6 +2171,10 @@ func (s *TLSService) Reconcile(ctx context.Context, meta contract.MutationMeta, 
 		return nil
 	})
 	if err != nil {
+		if failureCode == "" {
+			failureCode = "tls_reconcile_failed"
+		}
+		s.deps.RuntimeGate.FailClosed(failureCode)
 		return contract.TLSStatusView{}, err
 	}
 	return view, nil

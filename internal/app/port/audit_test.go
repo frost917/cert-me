@@ -19,16 +19,15 @@ func TestAuditEvent_HasNoAuthorityIDsField(t *testing.T) {
 }
 
 // fakeAuditRepository is a minimal compile-time check that AuditRepository
-// is satisfiable with the new Append(AuditEvent, []domain.AuthorityID)
-// signature.
+// is satisfiable with the typed AuditScope signature.
 type fakeAuditRepository struct {
-	gotEvent  AuditEvent
-	gotScopes []domain.AuthorityID
+	gotEvent AuditEvent
+	gotScope AuditScope
 }
 
-func (f *fakeAuditRepository) Append(_ context.Context, event AuditEvent, scopes []domain.AuthorityID) error {
+func (f *fakeAuditRepository) Append(_ context.Context, event AuditEvent, scope AuditScope) error {
 	f.gotEvent = event
-	f.gotScopes = scopes
+	f.gotScope = scope
 	return nil
 }
 
@@ -40,15 +39,34 @@ var _ AuditRepository = (*fakeAuditRepository)(nil)
 
 func TestAuditRepository_AppendUsesScopesArgumentOnly(t *testing.T) {
 	repo := &fakeAuditRepository{}
-	scopes := []domain.AuthorityID{domain.AuthorityID("11111111-1111-1111-1111-111111111111")}
+	scope := NewAuthoritiesAuditScope(domain.AuthorityID("11111111-1111-1111-1111-111111111111"))
 
-	if err := repo.Append(context.Background(), AuditEvent{ID: "evt-1"}, scopes); err != nil {
+	if err := repo.Append(context.Background(), AuditEvent{ID: "evt-1"}, scope); err != nil {
 		t.Fatalf("Append returned error: %v", err)
 	}
-	if !reflect.DeepEqual(repo.gotScopes, scopes) {
-		t.Fatalf("scopes not passed through: got %v, want %v", repo.gotScopes, scopes)
+	if !reflect.DeepEqual(repo.gotScope.AuthorityIDs(), scope.AuthorityIDs()) {
+		t.Fatalf("scope authorities not passed through: got %v, want %v", repo.gotScope.AuthorityIDs(), scope.AuthorityIDs())
+	}
+	if repo.gotScope.Kind() != AuditScopeAuthorities {
+		t.Fatalf("scope kind = %q, want authorities", repo.gotScope.Kind())
 	}
 	if repo.gotEvent.ID != "evt-1" {
 		t.Fatalf("event not passed through: got %v", repo.gotEvent)
+	}
+}
+
+func TestAuditScope_InstallationIsExplicitAndAuthorityScopeIsNonEmpty(t *testing.T) {
+	installation := NewInstallationAuditScope()
+	if err := installation.Validate(); err != nil {
+		t.Fatalf("installation scope invalid: %v", err)
+	}
+	if installation.Kind() != AuditScopeInstallation || len(installation.AuthorityIDs()) != 0 {
+		t.Fatalf("unexpected installation scope: kind=%q ids=%v", installation.Kind(), installation.AuthorityIDs())
+	}
+	if err := NewAuthoritiesAuditScope().Validate(); err == nil {
+		t.Fatal("empty authority scope accepted")
+	}
+	if err := (AuditScope{}).Validate(); err == nil {
+		t.Fatal("zero audit scope accepted")
 	}
 }

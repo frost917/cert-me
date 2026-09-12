@@ -673,13 +673,13 @@ func TestQueryServiceAuditVisibleToAdminAcrossEveryScopeShape(t *testing.T) {
 	otherAuthority := mustID(t, f.ids, domain.ParseAuthorityID)
 
 	if err := f.store.Write(ctx, func(tx port.TxStores) error {
-		if err := tx.Audit().Append(ctx, auditEvent("evt-single", "Test.Single", f.now), []domain.AuthorityID{f.authorityID}); err != nil {
+		if err := tx.Audit().Append(ctx, auditEvent("evt-single", "Test.Single", f.now), port.NewAuthoritiesAuditScope(f.authorityID)); err != nil {
 			return err
 		}
-		if err := tx.Audit().Append(ctx, auditEvent("evt-multi", "Test.Multi", f.now), []domain.AuthorityID{f.authorityID, otherAuthority}); err != nil {
+		if err := tx.Audit().Append(ctx, auditEvent("evt-multi", "Test.Multi", f.now), port.NewAuthoritiesAuditScope(f.authorityID, otherAuthority)); err != nil {
 			return err
 		}
-		return tx.Audit().Append(ctx, auditEvent("evt-none", "Test.None", f.now), nil)
+		return tx.Audit().Append(ctx, auditEvent("evt-none", "Test.None", f.now), port.NewInstallationAuditScope())
 	}); err != nil {
 		t.Fatalf("seed audit events: %v", err)
 	}
@@ -706,10 +706,10 @@ func TestQueryServiceExportAuditUsesSameFilterAsList(t *testing.T) {
 	f := newQueryFixture(t)
 	ctx := context.Background()
 	if err := f.store.Write(ctx, func(tx port.TxStores) error {
-		if err := tx.Audit().Append(ctx, auditEvent("evt-a", "Test.A", f.now), []domain.AuthorityID{f.authorityID}); err != nil {
+		if err := tx.Audit().Append(ctx, auditEvent("evt-a", "Test.A", f.now), port.NewAuthoritiesAuditScope(f.authorityID)); err != nil {
 			return err
 		}
-		return tx.Audit().Append(ctx, auditEvent("evt-b", "Test.B", f.now), []domain.AuthorityID{f.authorityID})
+		return tx.Audit().Append(ctx, auditEvent("evt-b", "Test.B", f.now), port.NewAuthoritiesAuditScope(f.authorityID))
 	}); err != nil {
 		t.Fatalf("seed audit events: %v", err)
 	}

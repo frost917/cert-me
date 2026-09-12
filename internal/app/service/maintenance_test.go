@@ -187,7 +187,7 @@ func TestMaintenanceFinalizeRestoreUsesDedicatedRunStore(t *testing.T) {
 		Principal: mustInternalPrincipal(t, contract.InternalOperationRestoreFinalize),
 	}}
 	result, err := newMaintenanceTestService(t, fx.store).FinalizeRestore(context.Background(), meta, contract.MaintenanceFinalizeRestoreCommand{
-		Options: contract.MaintenanceFinalizeRestoreOptions{RunID: runID, DeletePendingKeys: true},
+		Options: contract.MaintenanceFinalizeRestoreOptions{RunID: runID, InvalidateAllSessions: true, DeletePendingKeys: true},
 	})
 	if err != nil {
 		t.Fatalf("finalize restore: %v", err)

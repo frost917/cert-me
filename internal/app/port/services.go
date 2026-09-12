@@ -2,6 +2,7 @@ package port
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -28,35 +29,89 @@ type Clock interface {
 // an unparsed string never travels further than the call site.
 type IDGenerator = domain.IDGenerator
 
-// AuthorizationScope is the set of authorities an authorization check is
-// evaluated against. Its field is unexported and only reachable through
-// NewAuthorizationScope, mirroring how contract.Principal keeps its fields
-// unexported and only reachable through NewAdminPrincipal/
-// InternalPrincipalFactory: docs/backend-implementation.md §2's rule that
-// "권한 검사 입력의 Scope는 DB 관계에서 구성하며 사용자 제공 Root ID를
-// 신뢰하지 않는다" is a rule about *where a service gets its authority IDs
-// from*, not something the port layer's own types can fully enforce by
-// themselves -- NewAuthorizationScope cannot tell a caller-read
-// domain.Authority.ID() apart from a raw path parameter. What this type does
-// enforce is the narrower, checkable half: a scope can only be built through
-// this one constructor, so it is never satisfied by silently passing a
-// bare []domain.AuthorityID (or worse, a []string) through some other call
-// shape, and every Authorizer implementation sees the same normalized shape
-// regardless of how many authorities a multi-CA operation touches. The
-// "build it from stored relations" half is a convention services must
-// still follow by construction (read the row, take its own ID field, pass
-// that in) -- flagged for the lead as a design point this layer cannot fully
-// close by itself.
+// AuthorizationScopeKind identifies the relation an authorization check is
+// evaluated against. The explicit kind keeps an installation-wide check
+// distinct from an authority-scoped check; an empty authority list is not a
+// wildcard.
+type AuthorizationScopeKind string
+
+const (
+	AuthorizationScopeInstallation AuthorizationScopeKind = "installation"
+	AuthorizationScopeAuthorities  AuthorizationScopeKind = "authorities"
+)
+
+// AuthorizationScope is the typed set of stored authority relations an
+// authorization check is evaluated against. Its fields are private so a
+// caller cannot silently construct a different shape in an Authorize call.
+// Services still have to obtain the ids from rows they read in the current
+// transaction; the port type makes the resulting installation/authorities
+// distinction explicit and validates its invariants.
 type AuthorizationScope struct {
+	kind         AuthorizationScopeKind
 	authorityIDs []domain.AuthorityID
 }
 
-// NewAuthorizationScope builds a scope from the given authority ids. Callers
-// are expected to have just read each id off a domain object this
-// transaction loaded (an Authority, a LeafSeries' ManagementAuthorityID, a
-// Certificate's issuer chain), never off an unvalidated request field.
+// NewInstallationAuthorizationScope creates an installation-wide scope.
+func NewInstallationAuthorizationScope() AuthorizationScope {
+	return AuthorizationScope{kind: AuthorizationScopeInstallation}
+}
+
+// NewAuthoritiesAuthorizationScope creates an authority scope. Duplicate
+// ids are removed while preserving their first-seen order; an empty input is
+// still invalid and is rejected by Validate/Authorizer implementations.
+func NewAuthoritiesAuthorizationScope(ids ...domain.AuthorityID) AuthorizationScope {
+	seen := make(map[domain.AuthorityID]struct{}, len(ids))
+	unique := make([]domain.AuthorityID, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	return AuthorizationScope{kind: AuthorizationScopeAuthorities, authorityIDs: unique}
+}
+
+// NewAuthorizationScope is kept as a compatibility helper for existing
+// service call sites: no ids means installation, one or more ids means
+// authorities. New code may use the explicit constructors when the scope
+// kind itself is part of the intent.
 func NewAuthorizationScope(authorityIDs ...domain.AuthorityID) AuthorizationScope {
-	return AuthorizationScope{authorityIDs: append([]domain.AuthorityID(nil), authorityIDs...)}
+	if len(authorityIDs) == 0 {
+		return NewInstallationAuthorizationScope()
+	}
+	return NewAuthoritiesAuthorizationScope(authorityIDs...)
+}
+
+// Kind returns the scope relation.
+func (s AuthorizationScope) Kind() AuthorizationScopeKind { return s.kind }
+
+// Validate checks the authorization-scope invariants.
+func (s AuthorizationScope) Validate() error {
+	switch s.kind {
+	case AuthorizationScopeInstallation:
+		if len(s.authorityIDs) != 0 {
+			return errors.New("installation authorization scope must not contain authority ids")
+		}
+		return nil
+	case AuthorizationScopeAuthorities:
+		if len(s.authorityIDs) == 0 {
+			return errors.New("authority authorization scope must contain at least one authority id")
+		}
+		seen := make(map[domain.AuthorityID]struct{}, len(s.authorityIDs))
+		for _, id := range s.authorityIDs {
+			if id == "" {
+				return errors.New("authority authorization scope must not contain an empty authority id")
+			}
+			if _, ok := seen[id]; ok {
+				return errors.New("authority authorization scope must not contain duplicate authority ids")
+			}
+			seen[id] = struct{}{}
+		}
+		return nil
+	default:
+		return fmt.Errorf("port: invalid authorization scope kind %q", string(s.kind))
+	}
 }
 
 // AuthorityIDs returns a copy so a caller cannot widen a scope in place
@@ -599,6 +654,29 @@ type PKIParser interface {
 // (docs/backend-implementation.md §5 "TLS: ... ChainValidator ...").
 type ChainValidator interface {
 	Validate(ctx context.Context, leafDER []byte, chainDER [][]byte, now domain.Instant) error
+}
+
+// TLSFileSourceInput is the configured, application-owned source material for
+// TLSService.Reload. The source resolves a configured file location inside
+// runtime/config; requests never carry a path and no path is read from
+// context. Passphrase is owned by the caller after Load succeeds and must be
+// closed after the key parser returns. The source must not modify its original
+// files while producing this snapshot.
+type TLSFileSourceInput struct {
+	Certificate []byte
+	Chain       []byte
+	Key         []byte
+	Passphrase  *secret.Input
+}
+
+// TLSFileSource loads the configured TLS certificate, chain and key for an
+// explicit Reload command. It is deliberately narrow: it has no arbitrary
+// path argument, directory traversal, watcher callback or activation method.
+// Implementations return a point-in-time copy/snapshot of the source bytes;
+// Reload validates and stores that snapshot through the same path as an
+// uploaded candidate.
+type TLSFileSource interface {
+	Load(ctx context.Context) (TLSFileSourceInput, error)
 }
 
 // CRLVerifier verifies a signed CRL against the DER of the CA certificate

@@ -308,6 +308,7 @@ func (s *ImportService) prepareImportKeys(ctx context.Context, files []parsedImp
 					continue
 				}
 				if selected.PrivateKey != nil {
+					_ = selected.PrivateKey.Close()
 					_ = validated.PrivateKey.Close()
 					return contract.NewAppError(contract.ErrorKindConflict, "import_ca_key_target_ambiguous",
 						"the CA key matches more than one certificate").WithField("file_name", file.FileName)
@@ -645,7 +646,7 @@ func (s *ImportService) resolveImportAuxiliaryItems(ctx context.Context, tx port
 			r.KeyTargetBatchFileName = key.TargetBatchFileName
 			r.IssuerExistingCertificateID = key.ExistingCertificateID
 		case contract.ImportFileKindCRL:
-			candidate, batchFileName, err := s.resolveCRLIssuer(ctx, tx, file, files, storedCACerts)
+			candidate, batchFileName, err := s.resolveCRLIssuer(ctx, tx, file, files, out, storedCACerts)
 			if err != nil {
 				return err
 			}
@@ -667,7 +668,7 @@ func (s *ImportService) resolveImportAuxiliaryItems(ctx context.Context, tx port
 	return nil
 }
 
-func (s *ImportService) resolveCRLIssuer(ctx context.Context, tx port.TxStores, file parsedImportFile, files []parsedImportFile, stored []domain.Certificate) (importedKeyCandidate, string, error) {
+func (s *ImportService) resolveCRLIssuer(ctx context.Context, tx port.TxStores, file parsedImportFile, files []parsedImportFile, resolved []importResolution, stored []domain.Certificate) (importedKeyCandidate, string, error) {
 	if file.IssuerCertificateID != "" {
 		certificate, err := tx.PKI().GetCertificate(ctx, file.IssuerCertificateID)
 		if errors.Is(err, port.ErrNotFound) {
@@ -694,14 +695,59 @@ func (s *ImportService) resolveCRLIssuer(ctx context.Context, tx port.TxStores, 
 
 	batchMatches := make([]importedKeyCandidate, 0)
 	batchNames := make([]string, 0)
-	for _, candidate := range files {
+	seenBatchMatches := make(map[string]struct{})
+	fileIndexByName := make(map[string]int, len(files))
+	for i, candidate := range files {
+		fileIndexByName[candidate.FileName] = i
 		if candidate.Kind != contract.ImportFileKindCertificate || candidate.Cert.Kind != domain.CertificateKindCA {
 			continue
 		}
-		if sameSubject(file.CRL.IssuerSubject, candidate.Cert.Subject) && authorityKeyIDMatches(file.CRL.AuthorityKeyID, candidate.Cert.SubjectKeyID) {
-			batchMatches = append(batchMatches, importedKeyCandidate{FileName: candidate.FileName, Certificate: candidate.Cert})
-			batchNames = append(batchNames, candidate.FileName)
+		if !sameSubject(file.CRL.IssuerSubject, candidate.Cert.Subject) || !authorityKeyIDMatches(file.CRL.AuthorityKeyID, candidate.Cert.SubjectKeyID) {
+			continue
 		}
+		if i >= len(resolved) || resolved[i].Status == contract.ImportItemStatusConflict {
+			continue
+		}
+
+		matched := importedKeyCandidate{FileName: candidate.FileName, Certificate: candidate.Cert}
+		batchName := candidate.FileName
+		switch resolved[i].Status {
+		case contract.ImportItemStatusDuplicate:
+			if resolved[i].ExistingCertificateID != "" {
+				storedCertificate, err := tx.PKI().GetCertificate(ctx, resolved[i].ExistingCertificateID)
+				if err != nil {
+					return importedKeyCandidate{}, "", storeError(err, "import_crl_issuer_read_failed", "could not read the duplicate CRL issuer certificate")
+				}
+				facts, err := parsedFactsFromStoredCertificate(ctx, tx, storedCertificate)
+				if err != nil {
+					return importedKeyCandidate{}, "", err
+				}
+				matched = importedKeyCandidate{CertificateID: storedCertificate.ID(), Certificate: facts}
+				batchName = ""
+			} else {
+				canonicalName, ok := canonicalNewImportFileName(candidate.FileName, files, resolved, fileIndexByName)
+				if !ok {
+					continue
+				}
+				canonicalIndex := fileIndexByName[canonicalName]
+				matched = importedKeyCandidate{FileName: canonicalName, Certificate: files[canonicalIndex].Cert}
+				batchName = canonicalName
+			}
+		case contract.ImportItemStatusNew:
+		default:
+			continue
+		}
+
+		matchKey := string(matched.CertificateID)
+		if matchKey == "" {
+			matchKey = matched.FileName
+		}
+		if _, seen := seenBatchMatches[matchKey]; seen {
+			continue
+		}
+		seenBatchMatches[matchKey] = struct{}{}
+		batchMatches = append(batchMatches, matched)
+		batchNames = append(batchNames, batchName)
 	}
 	if len(batchMatches) == 1 {
 		return batchMatches[0], batchNames[0], nil
@@ -730,6 +776,33 @@ func (s *ImportService) resolveCRLIssuer(ctx context.Context, tx port.TxStores, 
 	}
 	return importedKeyCandidate{}, "", contract.NewAppError(contract.ErrorKindConflict, "import_crl_issuer_unresolved",
 		"the CRL issuer could not be resolved from bundled or stored CA certificates").WithField("file_name", file.FileName)
+}
+
+// canonicalNewImportFileName follows an exact-DER duplicate in the same
+// batch to the first logical certificate item that will actually be stored.
+// A duplicate that points at an existing certificate is handled separately by
+// resolveCRLIssuer; this helper only returns a New batch item.
+func canonicalNewImportFileName(name string, files []parsedImportFile, resolved []importResolution, byName map[string]int) (string, bool) {
+	seen := make(map[string]struct{}, len(files))
+	for name != "" {
+		if _, ok := seen[name]; ok {
+			return "", false
+		}
+		seen[name] = struct{}{}
+		index, ok := byName[name]
+		if !ok || index >= len(resolved) {
+			return "", false
+		}
+		item := resolved[index]
+		if item.Status == contract.ImportItemStatusNew {
+			return name, true
+		}
+		if item.Status != contract.ImportItemStatusDuplicate || item.DuplicateOfFileName == "" {
+			return "", false
+		}
+		name = item.DuplicateOfFileName
+	}
+	return "", false
 }
 
 func authorityKeyIDMatches(crlAKI, subjectSKI []byte) bool {
@@ -1639,7 +1712,7 @@ func (s *ImportService) commitImport(ctx context.Context, tx port.TxStores, meta
 		Result:     contract.AuditResultSuccess,
 		Details:    contract.AuditDetails{SchemaVersion: 1, Fields: map[string]string{"certificate_count": fmt.Sprint(len(certificateIDs))}},
 	}
-	if err := tx.Audit().Append(ctx, event, authorityIDs); err != nil {
+	if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(authorityIDs...)); err != nil {
 		return storeError(err, "import_audit_failed", "could not record the import audit event")
 	}
 
@@ -1699,6 +1772,9 @@ func (s *ImportService) AttachSigningKey(ctx context.Context, meta contract.Muta
 		}
 		if !generation.KeyDestroyedAt.IsZero() {
 			return contract.NewAppError(contract.ErrorKindConflict, "import_ca_key_destroyed", "a destroyed CA key cannot be restored")
+		}
+		if err := verifyImportedCAKeyTarget(ctx, tx, authority, generation); err != nil {
+			return err
 		}
 		material, err := tx.PKI().GetKeyMaterial(ctx, generation.KeyMaterialID)
 		if err != nil {
@@ -1782,6 +1858,9 @@ func (s *ImportService) AttachSigningKey(ctx context.Context, meta contract.Muta
 		if generation.KeyMaterialID != keyMaterialID || !generation.KeyDestroyedAt.IsZero() {
 			return contract.NewAppError(contract.ErrorKindConflict, "import_ca_key_generation_invalid", "the authority's CA key generation changed during preparation")
 		}
+		if err := verifyImportedCAKeyTarget(ctx, tx, authority, generation); err != nil {
+			return err
+		}
 		material, err := tx.PKI().GetKeyMaterial(ctx, keyMaterialID)
 		if err != nil {
 			return storeError(err, "import_ca_key_material_read_failed", "could not re-read the authority's public key")
@@ -1817,7 +1896,7 @@ func (s *ImportService) AttachSigningKey(ctx context.Context, meta contract.Muta
 			Result:     contract.AuditResultSuccess,
 			Details:    contract.AuditDetails{SchemaVersion: 1, Fields: map[string]string{"key_generation_id": string(generationID)}},
 		}
-		if err := tx.Audit().Append(ctx, event, []domain.AuthorityID{scope}); err != nil {
+		if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(scope)); err != nil {
 			return storeError(err, "import_ca_key_audit_failed", "could not record the CA key attachment audit event")
 		}
 		result = toAuthorityView(attached, domain.Instant{})
@@ -1827,6 +1906,52 @@ func (s *ImportService) AttachSigningKey(ctx context.Context, meta contract.Muta
 		return contract.AuthorityView{}, err
 	}
 	return result, nil
+}
+
+// verifyImportedCAKeyTarget proves that an imported key is being attached to
+// the authority's existing CA certificate and generation. The public-key
+// parser checks the uploaded key against KeyMaterial; this second relation
+// check prevents a stale authority certificate pointer or a mismatched CA
+// subtype row from turning AttachSigningKey into an issuer/certificate swap.
+func verifyImportedCAKeyTarget(ctx context.Context, tx port.TxStores, authority domain.Authority, generation port.CAKeyGeneration) error {
+	if generation.AuthorityID != authority.ID() {
+		return contract.NewAppError(contract.ErrorKindConflict, "import_ca_key_generation_mismatch",
+			"the CA key generation does not belong to the authority")
+	}
+	certificateID := authority.IssuanceCertificateID()
+	if certificateID == "" {
+		return contract.NewAppError(contract.ErrorKindUnavailable, "import_ca_certificate_missing",
+			"the authority has no existing CA certificate to attach the key to")
+	}
+	certificate, err := tx.PKI().GetCertificate(ctx, certificateID)
+	if errors.Is(err, port.ErrNotFound) {
+		return contract.NewAppError(contract.ErrorKindUnavailable, "import_ca_certificate_missing",
+			"the authority's existing CA certificate could not be found")
+	}
+	if err != nil {
+		return storeError(err, "import_ca_key_certificate_read_failed", "could not read the authority's existing CA certificate")
+	}
+	if certificate.Kind() != domain.CertificateKindCA {
+		return contract.NewAppError(contract.ErrorKindConflict, "import_ca_certificate_invalid",
+			"the authority's issuance certificate is not a CA certificate")
+	}
+	if certificate.KeyMaterialID() != generation.KeyMaterialID {
+		return contract.NewAppError(contract.ErrorKindConflict, "import_ca_key_certificate_key_mismatch",
+			"the authority's CA certificate does not use the generation's key material")
+	}
+	record, err := tx.PKI().GetCACertificateRecord(ctx, certificate.ID())
+	if errors.Is(err, port.ErrNotFound) {
+		return contract.NewAppError(contract.ErrorKindUnavailable, "import_ca_certificate_record_missing",
+			"the authority's CA certificate record could not be found")
+	}
+	if err != nil {
+		return storeError(err, "import_ca_certificate_record_read_failed", "could not read the authority's CA certificate record")
+	}
+	if record.CertificateID != certificate.ID() || record.CAKeyGenerationID != generation.ID {
+		return contract.NewAppError(contract.ErrorKindConflict, "import_ca_key_generation_mismatch",
+			"the authority's CA certificate is not attached to its current key generation")
+	}
+	return nil
 }
 
 func caSecretPurpose(authority domain.Authority) domain.SecretPurpose {
@@ -2163,6 +2288,9 @@ func (s *ImportService) attachImportedExistingKey(ctx context.Context, tx port.T
 		return contract.NewAppError(contract.ErrorKindConflict, "import_ca_key_authority_mismatch",
 			"the existing CA certificate is not the authority's current signing certificate")
 	}
+	if err := verifyImportedCAKeyTarget(ctx, tx, authority, generation); err != nil {
+		return err
+	}
 	if generation.KeyMaterialID != prepared.KeyMaterialID || !generation.KeyDestroyedAt.IsZero() {
 		return contract.NewAppError(contract.ErrorKindConflict, "import_ca_key_generation_invalid",
 			"the existing CA key generation cannot be attached")
@@ -2208,7 +2336,7 @@ func (s *ImportService) attachImportedExistingKey(ctx context.Context, tx port.T
 		Result:     contract.AuditResultSuccess,
 		Details:    contract.AuditDetails{SchemaVersion: 1, Fields: map[string]string{"key_generation_id": string(generationID)}},
 	}
-	if err := tx.Audit().Append(ctx, event, []domain.AuthorityID{scope}); err != nil {
+	if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(scope)); err != nil {
 		return storeError(err, "import_ca_key_audit_failed", "could not record the CA key attachment audit event")
 	}
 	return nil
@@ -2513,17 +2641,13 @@ func parseRFC3339Instant(raw string) (domain.Instant, error) {
 }
 
 // ConfirmTakeover records an administrator's confirmed takeover evidence for
-// a pending import takeover, flipping the ca_takeovers row from pending to
-// confirmed (docs/backend-implementation.md §3 "ConfirmTakeover: TakeoverInput
-// → Takeover"). It does not mutate the imported Authority itself: pki-import
-// exposes this transition solely through the ca_takeovers row's own state,
-// which is what CanIssue's TakeoverConfirmed context field is meant to be
-// checked against (see this file's own top comment for the AttachSigningKey
-// gap, a genuinely different, still-blocked transition). §3 requires the
-// Authority's version regardless, as a defensive optimistic-lock guard
-// against the authority having changed since the caller last reviewed it --
-// it is checked but never itself saved with a bumped version here, since
-// nothing on domain.Authority changes in this method.
+// a pending import takeover, flipping both the ca_takeovers row and the
+// Authority's pending gate in the same Write (docs/backend-implementation.md
+// §3 "ConfirmTakeover: TakeoverInput → Takeover"). The transition does not
+// enable issuance or attach a key; it only records the explicit evidence that
+// clears the pending-takeover admission check. §3 requires the Authority's
+// version as a defensive optimistic-lock guard against the authority having
+// changed since the caller last reviewed it.
 func (s *ImportService) ConfirmTakeover(ctx context.Context, meta contract.MutationMeta, cmd contract.ImportConfirmTakeoverCommand) (contract.TakeoverView, error) {
 	if err := cmd.Validate(); err != nil {
 		return contract.TakeoverView{}, err
@@ -2592,6 +2716,13 @@ func (s *ImportService) ConfirmTakeover(ctx context.Context, meta contract.Mutat
 		if err := tx.Imports().SaveTakeover(ctx, confirmed, pending.Version); err != nil {
 			return storeError(err, "takeover_save_failed", "could not save the confirmed takeover")
 		}
+		confirmedAuthority, err := authority.ConfirmTakeover()
+		if err != nil {
+			return contract.FromDomainError(err)
+		}
+		if err := tx.PKI().SaveAuthority(ctx, confirmedAuthority, expectedVersion); err != nil {
+			return storeError(err, "takeover_authority_save_failed", "could not clear the authority's pending takeover gate")
+		}
 
 		event := port.AuditEvent{
 			ID:         s.deps.IDs.NewUUID(),
@@ -2605,7 +2736,7 @@ func (s *ImportService) ConfirmTakeover(ctx context.Context, meta contract.Mutat
 			Result:     contract.AuditResultSuccess,
 			Details:    contract.AuditDetails{SchemaVersion: 1},
 		}
-		if err := tx.Audit().Append(ctx, event, []domain.AuthorityID{scope}); err != nil {
+		if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(scope)); err != nil {
 			return storeError(err, "takeover_audit_failed", "could not record the takeover confirmation audit event")
 		}
 

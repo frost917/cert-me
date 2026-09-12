@@ -686,18 +686,6 @@ func (s *AuthorityService) commitCreate(ctx context.Context, tx port.TxStores, m
 	}
 
 	commitNow := s.deps.Clock.Now()
-	// A new Intermediate's creation is genuinely a two-CA fact -- both the
-	// new authority's own trail and its parent's should show it -- unlike a
-	// plain leaf event's single management scope (§14.6 forbids replicating
-	// an ancestor there). This mirrors the existing multi-scope rule for a
-	// transition ("전환으로 여러 CA가 관련된 작업은 기존 복수 scope 감사
-	// 규칙을 적용한다") rather than the single-scope leaf rule; flagged for
-	// the lead as this developer's reading rather than a literal doc
-	// instruction for this exact event.
-	auditScope := []domain.AuthorityID{prep.authorityID}
-	if prep.kind == domain.AuthorityKindIntermediate {
-		auditScope = []domain.AuthorityID{prep.authorityID, prep.parentAuthorityID}
-	}
 	event := port.AuditEvent{
 		ID:         s.deps.IDs.NewUUID(),
 		OccurredAt: commitNow,
@@ -710,7 +698,7 @@ func (s *AuthorityService) commitCreate(ctx context.Context, tx port.TxStores, m
 		Result:     contract.AuditResultSuccess,
 		Details:    contract.AuditDetails{SchemaVersion: 1, Fields: map[string]string{"kind": string(prep.kind)}},
 	}
-	if err := tx.Audit().Append(ctx, event, auditScope); err != nil {
+	if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(prep.authorityID)); err != nil {
 		return storeError(err, "authority_audit_failed", "could not record the authority audit event")
 	}
 
@@ -786,7 +774,7 @@ func (s *AuthorityService) Rename(ctx context.Context, meta contract.MutationMet
 			Result:     contract.AuditResultSuccess,
 			Details:    contract.AuditDetails{SchemaVersion: 1},
 		}
-		if err := tx.Audit().Append(ctx, event, []domain.AuthorityID{scope}); err != nil {
+		if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(scope)); err != nil {
 			return storeError(err, "authority_audit_failed", "could not record the rename audit event")
 		}
 
@@ -885,7 +873,7 @@ func (s *AuthorityService) SetIssuanceState(ctx context.Context, meta contract.M
 			Result:     contract.AuditResultSuccess,
 			Details:    contract.AuditDetails{SchemaVersion: 1, Fields: map[string]string{"state": string(targetState)}},
 		}
-		if err := tx.Audit().Append(ctx, event, []domain.AuthorityID{scope}); err != nil {
+		if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(scope)); err != nil {
 			return storeError(err, "authority_audit_failed", "could not record the issuance-state audit event")
 		}
 
@@ -907,13 +895,33 @@ func authorityClosureFacts(ctx context.Context, tx port.TxStores, authority doma
 		return domain.ClosureFacts{}, storeError(err, "authority_closure_certificates_read_failed", "could not read certificates signed by the authority")
 	}
 	facts := domain.ClosureFacts{AllDependentCertificatesExpired: true}
+	dependentCount := 0
 	for _, certificate := range certificates {
+		// A self-signed Root's own CA certificate uses its generation as
+		// issuer, but it is not a dependent certificate whose revocation
+		// needs a final CRL from that same authority.
+		if certificate.ID() == authority.IssuanceCertificateID() {
+			continue
+		}
+		dependentCount++
 		if !certificate.IsExpiredAt(now) {
 			facts.AllDependentCertificatesExpired = false
 			break
 		}
 	}
-	if len(certificates) == 0 {
+	// A certificate-only import is retained as history and was never an
+	// operational CRL signer. Do not manufacture a final CRL obligation for
+	// its self-signed certificate (or for imported descendants); the public
+	// certificate and revocation history remain stored and queryable.
+	historyOnly, err := isHistoryOnlyCA(ctx, tx, authority)
+	if err != nil {
+		return domain.ClosureFacts{}, storeError(err, "authority_closure_key_material_read_failed", "could not determine the authority's key custody")
+	}
+	if historyOnly {
+		facts.RequiredCRLsPublished = true
+		return facts, nil
+	}
+	if dependentCount == 0 {
 		// A never-used inventory authority has no certificate interval that
 		// requires a final CRL. This is the explicit inventory exception in
 		// backend-implementation.md §15.1.
@@ -931,6 +939,30 @@ func authorityClosureFacts(ctx context.Context, tx port.TxStores, authority doma
 	facts.RequiredCRLsPublished = state.PublishedDocumentID() != "" &&
 		state.PublishedGeneration() >= state.RevocationGeneration()
 	return facts, nil
+}
+
+// isHistoryOnlyCA identifies the certificate-only import path. Imported CA
+// material with no available key and no destruction marker was never an
+// operational signer, so restore/closure must not block on a CRL that this
+// authority cannot and was never expected to publish. A destroyed operational
+// key is deliberately not classified this way: its outstanding CRL obligation
+// still has to block until the required publication evidence exists.
+func isHistoryOnlyCA(ctx context.Context, tx port.TxStores, authority domain.Authority) (bool, error) {
+	if authority.KeyAvailable() {
+		return false, nil
+	}
+	generation, err := tx.PKI().GetCAKeyGeneration(ctx, authority.KeyGenerationID())
+	if err != nil {
+		return false, err
+	}
+	if !generation.KeyDestroyedAt.IsZero() {
+		return false, nil
+	}
+	material, err := tx.PKI().GetKeyMaterial(ctx, generation.KeyMaterialID)
+	if err != nil {
+		return false, err
+	}
+	return material.Origin == "imported", nil
 }
 
 // DestroyKey permanently removes the CA signing secret while preserving the
@@ -991,6 +1023,10 @@ func (s *AuthorityService) DestroyKey(ctx context.Context, meta contract.Mutatio
 			return contract.NewAppError(contract.ErrorKindConflict, "authority_key_generation_mismatch",
 				"the requested key generation belongs to another authority")
 		}
+		if !generation.KeyDestroyedAt.IsZero() {
+			return contract.NewAppError(contract.ErrorKindConflict, "authority_key_generation_destroyed",
+				"the requested CA key generation has already been destroyed")
+		}
 		now := s.deps.Clock.Now()
 		closure, err := authorityClosureFacts(ctx, tx, authority, now)
 		if err != nil {
@@ -1030,7 +1066,7 @@ func (s *AuthorityService) DestroyKey(ctx context.Context, meta contract.Mutatio
 				"justification":     cmd.Justification,
 			}},
 		}
-		if err := tx.Audit().Append(ctx, event, []domain.AuthorityID{scope}); err != nil {
+		if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(scope)); err != nil {
 			return storeError(err, "authority_audit_failed", "could not record the key destruction audit event")
 		}
 		result = toAuthorityView(destroyed, domain.Instant{})
@@ -1107,7 +1143,7 @@ func (s *AuthorityService) Archive(ctx context.Context, meta contract.MutationMe
 			Result:     contract.AuditResultSuccess,
 			Details:    contract.AuditDetails{SchemaVersion: 1},
 		}
-		if err := tx.Audit().Append(ctx, event, []domain.AuthorityID{scope}); err != nil {
+		if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(scope)); err != nil {
 			return storeError(err, "authority_audit_failed", "could not record the authority archive audit event")
 		}
 		result = toAuthorityView(archived, domain.Instant{})

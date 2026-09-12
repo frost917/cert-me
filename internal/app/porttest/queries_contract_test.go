@@ -173,15 +173,15 @@ func TestQueryAuditRequiresEveryScope(t *testing.T) {
 		}
 	}
 	err := store.Write(ctx, func(tx port.TxStores) error {
-		if err := tx.Audit().Append(ctx, event("evt-1"), []domain.AuthorityID{domain.AuthorityID(authAID)}); err != nil {
+		if err := tx.Audit().Append(ctx, event("evt-1"), port.NewAuthoritiesAuditScope(domain.AuthorityID(authAID))); err != nil {
 			return err
 		}
-		if err := tx.Audit().Append(ctx, event("evt-2"), []domain.AuthorityID{
+		if err := tx.Audit().Append(ctx, event("evt-2"), port.NewAuthoritiesAuditScope(
 			domain.AuthorityID(authAID), domain.AuthorityID(authBID),
-		}); err != nil {
+		)); err != nil {
 			return err
 		}
-		return tx.Audit().Append(ctx, event("evt-3"), nil)
+		return tx.Audit().Append(ctx, event("evt-3"), port.NewInstallationAuditScope())
 	})
 	if err != nil {
 		t.Fatalf("seed audit: %v", err)

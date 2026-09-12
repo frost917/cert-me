@@ -27,10 +27,23 @@ type TLSRepository interface {
 	// (docs/backend-implementation.md §9 "DB의 검증된 snapshot만 사용한다").
 	GetVersion(ctx context.Context, id domain.TLSVersionID) (domain.TLSVersion, error)
 
+	// ListVersions returns the immutable TLS snapshots used by bootstrap
+	// cleanup. Once an operational version is applied, every retained
+	// bootstrap snapshot may remain public history while its private secret is
+	// removed (docs/data-model.md "공개 스냅샷·교체 기록 보존" and
+	// backend-implementation.md §15.3).
+	ListVersions(ctx context.Context) ([]domain.TLSVersion, error)
+
 	// SaveChange persists change under the standard optimistic-lock contract
 	// (see AccountRepository.SaveAccount). It also serves as the insert path
 	// for a freshly prepared candidate's first tls_changes row.
 	SaveChange(ctx context.Context, change domain.TLSChange, expectedVersion domain.Version) error
+
+	// ClearActive removes the installation's active TLS pointer only when the
+	// pointer still names versionID. It is the first-activation rollback path;
+	// expectedVersion guards the installation row and the version id prevents
+	// a late rollback from clearing a newer activation.
+	ClearActive(ctx context.Context, expectedVersion domain.Version, versionID domain.TLSVersionID) error
 
 	// SetActive moves the installation's active_tls_version_id pointer to
 	// versionID. expectedVersion guards the installation row's own version,

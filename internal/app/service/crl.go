@@ -164,7 +164,7 @@ func (s *CRLService) RequestPublication(ctx context.Context, meta contract.Mutat
 			Result:     contract.AuditResultSuccess,
 			Details:    contract.AuditDetails{SchemaVersion: 1},
 		}
-		if err := tx.Audit().Append(ctx, event, []domain.AuthorityID{scope}); err != nil {
+		if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(scope)); err != nil {
 			return storeError(err, "crl_audit_failed", "could not record the CRL request audit event")
 		}
 
@@ -490,7 +490,7 @@ func (s *CRLService) finalizePublish(ctx context.Context, meta contract.Mutation
 				"published":          fmt.Sprintf("%t", published),
 			}},
 		}
-		if err := tx.Audit().Append(ctx, event, []domain.AuthorityID{generation.AuthorityID}); err != nil {
+		if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(generation.AuthorityID)); err != nil {
 			return storeError(err, "crl_audit_failed", "could not record the CRL publish audit event")
 		}
 

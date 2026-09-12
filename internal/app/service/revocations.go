@@ -324,11 +324,23 @@ func appendRevocationAudit(ctx context.Context, tx port.TxStores, revocation dom
 			},
 		},
 	}
-	var scopes []domain.AuthorityID
-	if change.AuthorityID != "" {
-		scopes = []domain.AuthorityID{change.AuthorityID}
+	authorityID := change.AuthorityID
+	if authorityID == "" {
+		generation, err := tx.PKI().GetCAKeyGeneration(ctx, revocation.IssuerID())
+		if errors.Is(err, port.ErrNotFound) {
+			return contract.NewAppError(contract.ErrorKindUnavailable, "revocation_audit_scope_missing",
+				"could not resolve the issuer authority for the revocation audit event")
+		}
+		if err != nil {
+			return storeError(err, "revocation_audit_scope_read_failed", "could not read the issuer authority for the revocation audit event")
+		}
+		authorityID = generation.AuthorityID
 	}
-	if err := tx.Audit().Append(ctx, event, scopes); err != nil {
+	if authorityID == "" {
+		return contract.NewAppError(contract.ErrorKindUnavailable, "revocation_audit_scope_missing",
+			"could not resolve an authority scope for the revocation audit event")
+	}
+	if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(authorityID)); err != nil {
 		return storeError(err, "revocation_audit_failed", "could not record the revocation audit event")
 	}
 	return nil

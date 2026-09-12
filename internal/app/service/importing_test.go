@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -991,7 +992,7 @@ func commitRootWithPendingTakeover(t *testing.T, f *importFixture, fileName stri
 
 func TestImportServiceConfirmTakeoverFlipsPendingToConfirmed(t *testing.T) {
 	f := newImportFixture(t)
-	keyGenID, _, version := commitRootWithPendingTakeover(t, f, "takeover-root.pem", []byte("root-der-takeover-1"), "takeover-1", "30")
+	keyGenID, authorityID, version := commitRootWithPendingTakeover(t, f, "takeover-root.pem", []byte("root-der-takeover-1"), "takeover-1", "30")
 
 	cmd := contract.ImportConfirmTakeoverCommand{TakeoverInput: contract.TakeoverInput{
 		CAKeyGenerationID:       keyGenID,
@@ -1011,6 +1012,24 @@ func TestImportServiceConfirmTakeoverFlipsPendingToConfirmed(t *testing.T) {
 	}
 	if view.ConfirmedAt == nil {
 		t.Fatal("want confirmed_at set")
+	}
+	if err := f.store.Read(context.Background(), func(tx port.TxStores) error {
+		authority, err := tx.PKI().GetIssuerForUpdate(context.Background(), authorityID)
+		if err != nil {
+			return err
+		}
+		if authority.PendingTakeover() {
+			return fmt.Errorf("authority still has pending takeover")
+		}
+		if authority.IssuanceState() != domain.IssuanceStateStopped {
+			return fmt.Errorf("issuance state = %s, want stopped", authority.IssuanceState())
+		}
+		if authority.Version() != version+1 {
+			return fmt.Errorf("authority version = %d, want %d", authority.Version(), version+1)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read authority after confirm: %v", err)
 	}
 
 	// A second confirmation attempt against the now-stale version is

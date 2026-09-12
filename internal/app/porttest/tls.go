@@ -2,6 +2,7 @@ package porttest
 
 import (
 	"context"
+	"sort"
 
 	"cert-me/internal/app/port"
 	"cert-me/internal/domain"
@@ -47,6 +48,15 @@ func (r tlsRepo) GetVersion(_ context.Context, id domain.TLSVersionID) (domain.T
 	return v, nil
 }
 
+func (r tlsRepo) ListVersions(_ context.Context) ([]domain.TLSVersion, error) {
+	out := make([]domain.TLSVersion, 0, len(r.s.tlsVersions))
+	for _, version := range r.s.tlsVersions {
+		out = append(out, version)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID() < out[j].ID() })
+	return out, nil
+}
+
 // SaveChange upserts the change row keyed by its candidate version id. The
 // first Save for a candidate creates the row (expectedVersion 0); later ones
 // take the optimistic lock, so two concurrent activations of the same
@@ -65,6 +75,26 @@ func (r tlsRepo) SaveChange(_ context.Context, change domain.TLSChange, expected
 		return ErrVersionConflict
 	}
 	r.s.tlsChanges[key] = change
+	return nil
+}
+
+// ClearActive is the guarded first-activation rollback path. It advances the
+// installation version just like SetActive, but only clears the pointer when
+// it still names the caller's candidate.
+func (r tlsRepo) ClearActive(_ context.Context, expectedVersion domain.Version, versionID domain.TLSVersionID) error {
+	if !r.s.installationSet {
+		return port.ErrNotFound
+	}
+	if r.s.installation.Version != expectedVersion {
+		return ErrVersionConflict
+	}
+	if r.s.installation.ActiveTLSVersionID != versionID {
+		return port.ErrVersionConflict
+	}
+	installation := r.s.installation
+	installation.ActiveTLSVersionID = ""
+	installation.Version = installation.Version.Next()
+	r.s.installation = installation
 	return nil
 }
 

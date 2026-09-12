@@ -710,20 +710,18 @@ func withOperationalLogger(deps DistributionDeps, logger port.OperationalLogger)
 	return deps
 }
 
-// auditScopeCapture records every scope slice passed to tx.Audit().Append
-// across a store's lifetime, letting a test assert §14.6 without porttest
-// exposing scopes on its own (porttest is out of this developer's assigned
-// files, so this wraps port.TxStores/UnitOfWork/ReadStore instead of adding
-// a method there).
+// auditScopeCapture records every typed scope passed to tx.Audit().Append
+// across a store's lifetime, letting a test assert §14.6 at the service
+// boundary without coupling the assertion to a concrete persistence adapter.
 type auditScopeCapture struct {
 	mu     sync.Mutex
 	scopes [][]domain.AuthorityID
 }
 
-func (c *auditScopeCapture) record(scope []domain.AuthorityID) {
+func (c *auditScopeCapture) record(scope port.AuditScope) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.scopes = append(c.scopes, append([]domain.AuthorityID(nil), scope...))
+	c.scopes = append(c.scopes, append([]domain.AuthorityID(nil), scope.AuthorityIDs()...))
 }
 
 func (c *auditScopeCapture) all() [][]domain.AuthorityID {
@@ -763,9 +761,9 @@ type scopeCapturingAudit struct {
 	capture *auditScopeCapture
 }
 
-func (a scopeCapturingAudit) Append(ctx context.Context, event port.AuditEvent, scopes []domain.AuthorityID) error {
-	a.capture.record(scopes)
-	return a.AuditRepository.Append(ctx, event, scopes)
+func (a scopeCapturingAudit) Append(ctx context.Context, event port.AuditEvent, scope port.AuditScope) error {
+	a.capture.record(scope)
+	return a.AuditRepository.Append(ctx, event, scope)
 }
 
 type alwaysAllow struct{}

@@ -14,10 +14,14 @@ var _ port.AuditRepository = auditRepo{}
 // Append stores the event and its scopes as two separate values, mirroring
 // the port contract: the event itself deliberately carries no AuthorityIDs
 // field, so scopes is the single source of the visibility rows.
-func (r auditRepo) Append(_ context.Context, event port.AuditEvent, scopes []domain.AuthorityID) error {
+func (r auditRepo) Append(_ context.Context, event port.AuditEvent, scope port.AuditScope) error {
+	if err := scope.Validate(); err != nil {
+		return err
+	}
 	r.s.auditEvents = append(r.s.auditEvents, auditRow{
-		event:  cloneAuditEvent(event),
-		scopes: cloneAuthorityIDs(scopes),
+		event:     cloneAuditEvent(event),
+		scopeKind: scope.Kind(),
+		scopes:    cloneAuthorityIDs(scope.AuthorityIDs()),
 	})
 	return nil
 }
@@ -51,6 +55,21 @@ func (s *Store) AuditEvents() []port.AuditEvent {
 	out := make([]port.AuditEvent, 0, len(snapshot.auditEvents))
 	for _, row := range snapshot.auditEvents {
 		out = append(out, cloneAuditEvent(row.event))
+	}
+	return out
+}
+
+// AuditScopes exposes the stored typed scopes to service tests. It returns
+// fresh values so callers cannot mutate the repository's snapshot.
+func (s *Store) AuditScopes() []port.AuditScope {
+	snapshot := s.root.Load()
+	out := make([]port.AuditScope, 0, len(snapshot.auditEvents))
+	for _, row := range snapshot.auditEvents {
+		if row.scopeKind == port.AuditScopeInstallation {
+			out = append(out, port.NewInstallationAuditScope())
+			continue
+		}
+		out = append(out, port.NewAuthoritiesAuditScope(row.scopes...))
 	}
 	return out
 }

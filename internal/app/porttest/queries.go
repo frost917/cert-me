@@ -432,12 +432,26 @@ func auditMatches(filter contract.AuditFilter, row auditRow) bool {
 	return true
 }
 
+// auditVisible applies the typed audit scope rule. Installation events are
+// visible only to the installation-wide query scope; authority events require
+// every stored authority relation to be within the reader's scope.
+func (r queryRepo) auditVisible(scope port.QueryScope, row auditRow) bool {
+	switch row.scopeKind {
+	case port.AuditScopeInstallation:
+		return scope.All
+	case port.AuditScopeAuthorities:
+		return r.visibleAll(scope, row.scopes)
+	default:
+		return false
+	}
+}
+
 // auditViews returns every stored event matching filter and visible under
 // scope, ordered by id.
 func (r queryRepo) auditViews(filter contract.AuditFilter, scope port.QueryScope) []contract.AuditEventView {
 	var items []contract.AuditEventView
 	for _, row := range r.s.auditEvents {
-		if !r.visibleAll(scope, row.scopes) || !auditMatches(filter, row) {
+		if !r.auditVisible(scope, row) || !auditMatches(filter, row) {
 			continue
 		}
 		items = append(items, auditEventView(row))

@@ -337,7 +337,7 @@ func appendDistributionAudit(ctx context.Context, tx port.TxStores, ids port.IDG
 		Result:     result,
 		Details:    contract.AuditDetails{SchemaVersion: 1},
 	}
-	if err := tx.Audit().Append(ctx, event, []domain.AuthorityID{scope}); err != nil {
+	if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(scope)); err != nil {
 		return storeError(err, "distribution_audit_failed", "could not record the download audit event")
 	}
 	return nil

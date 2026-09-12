@@ -402,6 +402,21 @@ func (a Authority) AttachSigningKey() (Authority, error) {
 	return next, nil
 }
 
+// ConfirmTakeover records the domain-side completion of an explicitly
+// confirmed imported-authority takeover. The evidence itself belongs to the
+// application/storage layer; this transition only clears the pending gate.
+// It deliberately leaves issuance_state unchanged: confirmation does not
+// implicitly enable issuance, attach a key, or publish a CRL.
+func (a Authority) ConfirmTakeover() (Authority, error) {
+	if !a.pendingTakeover {
+		return Authority{}, fmt.Errorf("%w: authority takeover is not pending", ErrInvalidTransition)
+	}
+	next := a
+	next.pendingTakeover = false
+	next.version = a.version.Next()
+	return next, nil
+}
+
 // AuthorityPolicy is the subset of authority configuration an operator can
 // change directly (currently just its display name; issuance state and key
 // custody go through their own dedicated transitions).

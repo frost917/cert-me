@@ -59,28 +59,10 @@ func NewSettingsService(deps SettingsDeps) (*SettingsService, error) {
 // (docs/data-model.md "고정 PK=1").
 const settingsAuditTargetID = "1"
 
-// settingsScope is UNRESOLVED, not decided. §14.6 states, in general terms,
-// "현재 MVP도 scope를 비워 저장하지 않는다" -- no stored audit event should
-// carry an empty scope. Settings has no authority relation at all
-// (service_settings is the fixed PK=1 installation-wide row,
-// docs/data-model.md; there is no CA-scoped administrator in the current
-// MVP role model to derive one from either, data-model.md "미래 역할
-// 테이블을 미리 빈 상태로 구현하지 않는다"), so there is no stored relation
-// this function could read to produce a non-empty scope without inventing
-// one (e.g. enumerating every Root authority would be a guess, not a read of
-// an actual relation Settings has to that event).
-//
-// This developer is not resolving that tension by picking an answer here:
-// §14.6's own text is about leaf download/delivery events, which always
-// have a real management authority, and nothing in the docs says what a
-// non-authority-scoped admin action's stored scope should be. Update below
-// still calls Audit().Append (dropping the audit row entirely to dodge the
-// question would itself be an undocumented product decision, and a worse
-// one), but with this function's empty result -- which is why this is
-// flagged as a **blocking open question for the planning team**, not a
-// settled design choice, in this round's report. Do not read the empty
-// return as this developer's answer to what the correct scope is.
-func settingsScope() []domain.AuthorityID { return nil }
+// Settings is installation-wide: service_settings has a fixed PK=1 and no
+// authority relation. Keep that fact explicit in the audit port instead of
+// encoding installation scope as an empty authority list.
+func settingsScope() port.AuditScope { return port.NewInstallationAuditScope() }
 
 // Get returns the current settings snapshot. It is a plain authorized read:
 // no idempotency, no version requirement (docs/backend-implementation.md §3
@@ -99,7 +81,7 @@ func (s *SettingsService) Get(ctx context.Context, meta contract.RequestMeta, cm
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionSettingsGet, port.NewAuthorizationScope(settingsScope()...)); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionSettingsGet, port.NewAuthorizationScope()); err != nil {
 			return err
 		}
 		settings, err := tx.Installation().GetSettings(ctx)
@@ -168,7 +150,7 @@ func (s *SettingsService) Update(ctx context.Context, meta contract.MutationMeta
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionSettingsUpdate, port.NewAuthorizationScope(settingsScope()...)); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionSettingsUpdate, port.NewAuthorizationScope()); err != nil {
 			return err
 		}
 

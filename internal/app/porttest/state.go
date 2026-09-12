@@ -128,8 +128,9 @@ type state struct {
 	revocations         map[revocationKey]domain.Revocation
 	revocationRevisions map[revisionKey]port.RevocationRevision
 
-	crlStates    map[domain.CAKeyGenerationID]domain.CRLState
-	crlDocuments map[domain.CRLDocumentID]port.CRLDocument
+	crlStates         map[domain.CAKeyGenerationID]domain.CRLState
+	crlDocuments      map[domain.CRLDocumentID]port.CRLDocument
+	crlDocumentsByDER map[string]domain.CRLDocumentID
 
 	transitions             map[domain.TransitionID]domain.Transition
 	impacts                 map[impactKey]domain.TransitionImpact
@@ -168,13 +169,13 @@ type state struct {
 	pendingTakeover map[domain.CAKeyGenerationID]domain.TakeoverID
 }
 
-// auditRow bundles one stored audit event with the scopes it was appended
-// under, since AuditRepository.Append takes them as two separate arguments
-// (see port.AuditEvent's doc comment on why they are never merged into one
-// stored value).
+// auditRow bundles one stored audit event with its explicit typed scope. The
+// kind is kept separately from the authority relation rows because an
+// installation scope is intentionally represented by zero authority rows.
 type auditRow struct {
-	event  port.AuditEvent
-	scopes []domain.AuthorityID
+	event     port.AuditEvent
+	scopeKind port.AuditScopeKind
+	scopes    []domain.AuthorityID
 }
 
 type maintenanceRequirementKey struct {
@@ -207,6 +208,7 @@ func newState() *state {
 		revocationRevisions:        map[revisionKey]port.RevocationRevision{},
 		crlStates:                  map[domain.CAKeyGenerationID]domain.CRLState{},
 		crlDocuments:               map[domain.CRLDocumentID]port.CRLDocument{},
+		crlDocumentsByDER:          map[string]domain.CRLDocumentID{},
 		transitions:                map[domain.TransitionID]domain.Transition{},
 		impacts:                    map[impactKey]domain.TransitionImpact{},
 		tlsVersions:                map[domain.TLSVersionID]domain.TLSVersion{},
@@ -260,6 +262,7 @@ func (s *state) clone() *state {
 		revocationRevisions:        make(map[revisionKey]port.RevocationRevision, len(s.revocationRevisions)),
 		crlStates:                  make(map[domain.CAKeyGenerationID]domain.CRLState, len(s.crlStates)),
 		crlDocuments:               make(map[domain.CRLDocumentID]port.CRLDocument, len(s.crlDocuments)),
+		crlDocumentsByDER:          make(map[string]domain.CRLDocumentID, len(s.crlDocumentsByDER)),
 		transitions:                make(map[domain.TransitionID]domain.Transition, len(s.transitions)),
 		impacts:                    make(map[impactKey]domain.TransitionImpact, len(s.impacts)),
 		deploymentConfirmations:    append([]domain.DeploymentConfirmation(nil), s.deploymentConfirmations...),
@@ -273,7 +276,7 @@ func (s *state) clone() *state {
 		jobByDedup:                 make(map[string]domain.JobID, len(s.jobByDedup)),
 		maintenanceRuns:            make(map[domain.JobID]port.MaintenanceRun, len(s.maintenanceRuns)),
 		maintenanceCRLRequirements: make(map[maintenanceRequirementKey]port.MaintenanceCRLRequirement, len(s.maintenanceCRLRequirements)),
-		auditEvents:                append([]auditRow(nil), s.auditEvents...),
+		auditEvents:                cloneAuditRows(s.auditEvents),
 		importBatches:              make(map[domain.ImportBatchID]port.ImportBatch, len(s.importBatches)),
 		takeovers:                  make(map[domain.TakeoverID]port.Takeover, len(s.takeovers)),
 		pendingTakeover:            make(map[domain.CAKeyGenerationID]domain.TakeoverID, len(s.pendingTakeover)),
@@ -346,6 +349,9 @@ func (s *state) clone() *state {
 	}
 	for k, v := range s.crlDocuments {
 		n.crlDocuments[k] = v
+	}
+	for k, v := range s.crlDocumentsByDER {
+		n.crlDocumentsByDER[k] = v
 	}
 	for k, v := range s.transitions {
 		n.transitions[k] = v

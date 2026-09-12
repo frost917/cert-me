@@ -317,7 +317,7 @@ func (s *TransitionService) Create(ctx context.Context, meta contract.MutationMe
 				"mode": string(mode),
 			}},
 		}
-		if err := tx.Audit().Append(ctx, event, dedupAuthorityIDs(touchedAuthorities)); err != nil {
+		if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(dedupAuthorityIDs(touchedAuthorities)...)); err != nil {
 			return storeError(err, "transition_audit_failed", "could not record the transition audit event")
 		}
 
@@ -620,7 +620,7 @@ func (s *TransitionService) SetTarget(ctx context.Context, meta contract.Mutatio
 			Result:     contract.AuditResultSuccess,
 			Details:    contract.AuditDetails{SchemaVersion: 1},
 		}
-		if err := tx.Audit().Append(ctx, event, dedupAuthorityIDs(transitionScope(next))); err != nil {
+		if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(dedupAuthorityIDs(transitionScope(next))...)); err != nil {
 			return storeError(err, "transition_audit_failed", "could not record the set-target audit event")
 		}
 
@@ -724,7 +724,7 @@ func (s *TransitionService) ConfirmDeployment(ctx context.Context, meta contract
 				"action": string(action),
 			}},
 		}
-		if err := tx.Audit().Append(ctx, event, dedupAuthorityIDs(scope)); err != nil {
+		if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(dedupAuthorityIDs(scope)...)); err != nil {
 			return storeError(err, "transition_audit_failed", "could not record the confirm-deployment audit event")
 		}
 
@@ -865,7 +865,7 @@ func (s *TransitionService) Complete(ctx context.Context, meta contract.Mutation
 			Result:     contract.AuditResultSuccess,
 			Details:    contract.AuditDetails{SchemaVersion: 1},
 		}
-		if err := tx.Audit().Append(ctx, event, dedupAuthorityIDs(scope)); err != nil {
+		if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(dedupAuthorityIDs(scope)...)); err != nil {
 			return storeError(err, "transition_audit_failed", "could not record the complete audit event")
 		}
 
@@ -971,7 +971,7 @@ func (s *TransitionService) Close(ctx context.Context, meta contract.MutationMet
 			Result:     contract.AuditResultSuccess,
 			Details:    contract.AuditDetails{SchemaVersion: 1},
 		}
-		if err := tx.Audit().Append(ctx, event, dedupAuthorityIDs(append(scope, source.ID()))); err != nil {
+		if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(dedupAuthorityIDs(append(scope, source.ID()))...)); err != nil {
 			return storeError(err, "transition_audit_failed", "could not record the close audit event")
 		}
 

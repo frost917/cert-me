@@ -190,6 +190,39 @@ func TestAuthority_CanSignCRL_RequiresKeyAvailable(t *testing.T) {
 	}
 }
 
+func TestAuthority_ConfirmTakeoverClearsOnlyPendingGate(t *testing.T) {
+	facts := baseAuthorityFacts()
+	facts.PendingTakeover = true
+	facts.IssuanceState = IssuanceStateStopped
+	authority, err := NewAuthority(facts)
+	if err != nil {
+		t.Fatalf("NewAuthority: %v", err)
+	}
+
+	confirmed, err := authority.ConfirmTakeover()
+	if err != nil {
+		t.Fatalf("ConfirmTakeover: %v", err)
+	}
+	if confirmed.PendingTakeover() {
+		t.Fatal("confirmed authority still has a pending takeover")
+	}
+	if confirmed.IssuanceState() != IssuanceStateStopped {
+		t.Fatalf("issuance state = %s, want stopped", confirmed.IssuanceState())
+	}
+	if confirmed.KeyAvailable() != authority.KeyAvailable() {
+		t.Fatal("ConfirmTakeover changed key availability")
+	}
+	if confirmed.Version() != authority.Version().Next() {
+		t.Fatalf("version = %d, want %d", confirmed.Version(), authority.Version().Next())
+	}
+	if !authority.PendingTakeover() {
+		t.Fatal("ConfirmTakeover mutated the receiver")
+	}
+	if _, err := confirmed.ConfirmTakeover(); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("second ConfirmTakeover = %v, want ErrInvalidTransition", err)
+	}
+}
+
 // TestAuthority_CanIssue_FullValidityWindow covers P1 finding #2: CanIssue
 // must reject issuance both before the CA's own notBefore and at/after its
 // notAfter, and must reject a missing (zero) certificate window outright.

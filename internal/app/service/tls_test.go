@@ -122,6 +122,22 @@ func (p *tlsFakePKIParser) ParseInternalTLSKey(_ context.Context, input port.TLS
 
 var _ port.PKIParser = (*tlsFakePKIParser)(nil)
 
+type fakeTLSFileSource struct {
+	input port.TLSFileSourceInput
+	err   error
+	calls int
+}
+
+func (s *fakeTLSFileSource) Load(context.Context) (port.TLSFileSourceInput, error) {
+	s.calls++
+	if s.err != nil {
+		return port.TLSFileSourceInput{}, s.err
+	}
+	return s.input, nil
+}
+
+var _ port.TLSFileSource = (*fakeTLSFileSource)(nil)
+
 // tlsImportingKeyEngine wraps a *fakeKeyEngine (whose own ImportTLS is
 // permanently unsupported) to give UploadCandidate's tests a working
 // ImportTLS, without modifying issuance_test.go. Generate/ImportCA/Reencrypt
@@ -268,6 +284,8 @@ type tlsFixture struct {
 	chain       *fakeChainValidator
 	installer   *fakeTLSInstaller
 	parser      *tlsFakePKIParser
+	source      *fakeTLSFileSource
+	gate        *fakeRuntimeGate
 	authorizer  *toggleAuthorizer
 	svc         *TLSService
 	authorityID domain.AuthorityID
@@ -298,6 +316,8 @@ func newTLSFixture(t *testing.T) *tlsFixture {
 	chain := &fakeChainValidator{}
 	installer := newFakeTLSInstaller()
 	parser := newTLSFakePKIParser()
+	source := &fakeTLSFileSource{}
+	gate := &fakeRuntimeGate{}
 	authorizer := &toggleAuthorizer{allow: true}
 
 	svc, err := NewTLSService(TLSDeps{
@@ -314,13 +334,15 @@ func newTLSFixture(t *testing.T) *tlsFixture {
 		ChainValidator:    chain,
 		TLSInstaller:      installer,
 		PKIParser:         parser,
+		FileSource:        source,
+		RuntimeGate:       gate,
 	})
 	if err != nil {
 		t.Fatalf("new tls service: %v", err)
 	}
 	return &tlsFixture{
 		store: store, ids: ids, keyEngine: keyEngine, importer: importer, signer: signer, serials: serials,
-		chain: chain, installer: installer, parser: parser, authorizer: authorizer, svc: svc, authorityID: authorityID,
+		chain: chain, installer: installer, parser: parser, source: source, gate: gate, authorizer: authorizer, svc: svc, authorityID: authorityID,
 	}
 }
 
@@ -513,6 +535,51 @@ func seedRecoveryRequiredChange(t *testing.T, store *porttest.Store, candidateID
 	}
 }
 
+// seedCommittedChange models a restart immediately after the durable
+// committed/pointer write and before Installer.Apply. Reconcile must turn this
+// phase into recovery_required and then resolve it from the stored snapshots;
+// treating it as an already-resolved terminal row would leave the listener
+// unapplied after a restart.
+func seedCommittedChange(t *testing.T, store *porttest.Store, candidateID, previousID domain.TLSVersionID) {
+	t.Helper()
+	ctx := context.Background()
+	if previousID != "" {
+		previousChange, err := domain.NewTLSChange(domain.TLSChangeFacts{
+			CandidateVersionID: previousID, Phase: domain.TLSChangePhaseApplied, Validated: true,
+		})
+		if err != nil {
+			t.Fatalf("new previous committed-test change: %v", err)
+		}
+		if err := store.Write(ctx, func(tx port.TxStores) error {
+			return tx.TLS().SaveChange(ctx, previousChange, 0)
+		}); err != nil {
+			t.Fatalf("seed previous committed-test change: %v", err)
+		}
+	}
+	change, err := domain.NewTLSChange(domain.TLSChangeFacts{
+		PreviousVersionID: previousID, CandidateVersionID: candidateID,
+		Phase: domain.TLSChangePhaseCommitted, Validated: true,
+	})
+	if err != nil {
+		t.Fatalf("new committed tls change: %v", err)
+	}
+	if err := store.Write(ctx, func(tx port.TxStores) error {
+		if err := tx.TLS().SaveChange(ctx, change, 0); err != nil {
+			return err
+		}
+		installation, err := tx.Installation().GetForUpdate(ctx)
+		if err != nil {
+			return err
+		}
+		original := installation.Version
+		installation.ActiveTLSVersionID = candidateID
+		installation.Version = installation.Version.Next()
+		return tx.Installation().Save(ctx, installation, original)
+	}); err != nil {
+		t.Fatalf("seed committed tls change: %v", err)
+	}
+}
+
 // ---- Status ------------------------------------------------------------
 
 func TestTLSServiceStatusRequiresAdmin(t *testing.T) {
@@ -526,6 +593,308 @@ func TestTLSServiceStatusReportsFreshInstallationAsEmpty(t *testing.T) {
 	view := f.status(t)
 	if view.Active != nil || view.Phase != nil || view.CandidateID != nil {
 		t.Fatalf("fresh installation status = %+v, want no active version", view)
+	}
+}
+
+type tlsBootstrapGraph struct {
+	authority       domain.Authority
+	rootGeneration  port.CAKeyGeneration
+	rootCertificate domain.Certificate
+	rootRecord      port.CACertificateRecord
+	leafCertificate domain.Certificate
+	leafRecord      port.LeafCertificateRecord
+	series          domain.LeafSeries
+	crlState        domain.CRLState
+	versions        []domain.TLSVersion
+	secrets         []domain.EncryptedSecret
+}
+
+func readTLSBootstrapGraph(t *testing.T, f *tlsFixture) tlsBootstrapGraph {
+	t.Helper()
+	ctx := context.Background()
+	var graph tlsBootstrapGraph
+	if err := f.store.Read(ctx, func(tx port.TxStores) error {
+		page, err := tx.Queries().ListAuthorities(ctx, contract.AuthorityListQuery{Page: contract.PageRequest{Limit: 200}}, port.QueryScope{All: true})
+		if err != nil {
+			return err
+		}
+		for _, authority := range page.Items {
+			if authority.Kind() == domain.AuthorityKindBootstrap {
+				if graph.authority.ID() != "" {
+					return fmt.Errorf("more than one bootstrap authority")
+				}
+				graph.authority = authority
+			}
+		}
+		if graph.authority.ID() == "" {
+			return fmt.Errorf("bootstrap authority not found")
+		}
+		graph.rootGeneration, err = tx.PKI().GetCAKeyGeneration(ctx, graph.authority.KeyGenerationID())
+		if err != nil {
+			return err
+		}
+		graph.rootCertificate, err = tx.PKI().GetCertificate(ctx, graph.authority.IssuanceCertificateID())
+		if err != nil {
+			return err
+		}
+		graph.rootRecord, err = tx.PKI().GetCACertificateRecord(ctx, graph.rootCertificate.ID())
+		if err != nil {
+			return err
+		}
+		installation, err := tx.Installation().GetForUpdate(ctx)
+		if err != nil {
+			return err
+		}
+		var activeVersion domain.TLSVersion
+		if installation.ActiveTLSVersionID != "" {
+			activeVersion, err = tx.TLS().GetVersion(ctx, installation.ActiveTLSVersionID)
+			if err != nil {
+				return err
+			}
+		}
+		seriesPage, err := tx.Queries().ListSeries(ctx, contract.SeriesListQuery{
+			AuthorityID: ptrAuthorityID(graph.authority.ID()), Page: contract.PageRequest{Limit: 200},
+		}, port.QueryScope{All: true})
+		if err != nil {
+			return err
+		}
+		for _, snapshot := range seriesPage.Items {
+			certificate, err := tx.PKI().GetCertificate(ctx, snapshot.Series.CurrentCertificateID())
+			if err != nil {
+				return err
+			}
+			if activeVersion.ID() == "" || string(certificate.DER()) == string(activeVersion.LeafDER()) || certificate.IssuerCAKeyGenerationID() == graph.rootGeneration.ID {
+				if graph.series.ID() != "" {
+					return fmt.Errorf("more than one current bootstrap series")
+				}
+				graph.series = snapshot.Series
+			}
+		}
+		if graph.series.ID() == "" {
+			return fmt.Errorf("current bootstrap series not found among %d history rows", len(seriesPage.Items))
+		}
+		graph.leafCertificate, err = tx.PKI().GetCertificate(ctx, graph.series.CurrentCertificateID())
+		if err != nil {
+			return err
+		}
+		graph.leafRecord, err = tx.PKI().GetLeafCertificateRecord(ctx, graph.leafCertificate.ID())
+		if err != nil {
+			return err
+		}
+		graph.crlState, err = tx.CRLs().GetStateForUpdate(ctx, graph.rootGeneration.ID)
+		if err != nil {
+			return err
+		}
+		graph.versions, err = tx.TLS().ListVersions(ctx)
+		if err != nil {
+			return err
+		}
+		graph.secrets, err = tx.Secrets().ListEncrypted(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("read bootstrap graph: %v", err)
+	}
+	return graph
+}
+
+func ptrAuthorityID(id domain.AuthorityID) *domain.AuthorityID { return &id }
+
+func TestTLSServiceBootstrapCreatesFixedGraphAndApplies(t *testing.T) {
+	f := newTLSFixture(t)
+	view, err := f.svc.Bootstrap(context.Background(), tlsReconcileMeta(mustInternalPrincipal(t, contract.InternalOperationTLSBootstrap)), contract.TLSBootstrapCommand{})
+	if err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	if view.Active == nil || view.Active.Source != domain.TLSSourceBootstrap || view.Active.ValidatedServiceURL != "" {
+		t.Fatalf("bootstrap active view = %+v, want a bootstrap snapshot without service URL", view.Active)
+	}
+	if view.Phase == nil || *view.Phase != domain.TLSChangePhaseApplied || view.Version != 1 {
+		t.Fatalf("bootstrap status = %+v, want applied at installation version 1", view)
+	}
+	if f.keyEngine.generateCalls != 2 || len(f.signer.requests) != 2 {
+		t.Fatalf("bootstrap generated keys=%d signer requests=%d, want two of each", f.keyEngine.generateCalls, len(f.signer.requests))
+	}
+	rootRequest, leafRequest := f.signer.requests[0], f.signer.requests[1]
+	if rootRequest.Plan.Subject.CommonName() != "cert-me" || rootRequest.Plan.Profile != "" || len(rootRequest.Plan.SANs) != 0 || rootRequest.Plan.KeyAlgorithm != domain.KeyAlgorithmECDSAP256 {
+		t.Fatalf("root signing request = %+v, want fixed CN/no SAN/CA profile/P-256", rootRequest.Plan)
+	}
+	if leafRequest.Plan.Subject.CommonName() != "cert-me" || leafRequest.Plan.Profile != domain.CertificateProfileServerTLS || len(leafRequest.Plan.SANs) != 1 || leafRequest.Plan.SANs[0].Value() != "cert-me" || leafRequest.Plan.KeyAlgorithm != domain.KeyAlgorithmECDSAP256 {
+		t.Fatalf("leaf signing request = %+v, want fixed serverAuth cert-me SAN/P-256", leafRequest.Plan)
+	}
+	if !sameWindow(rootRequest.Plan.Window, leafRequest.Plan.Window) || rootRequest.Plan.Window.Duration() != domain.NewDuration(30*24*time.Hour) {
+		t.Fatalf("bootstrap validity root=%v leaf=%v, want the same 30-day window", rootRequest.Plan.Window, leafRequest.Plan.Window)
+	}
+	if f.installer.prepareCount != 1 || f.installer.applyCount != 1 || f.installer.prepared() != 0 {
+		t.Fatalf("bootstrap installer prepare=%d apply=%d prepared=%d, want 1/1/0", f.installer.prepareCount, f.installer.applyCount, f.installer.prepared())
+	}
+
+	graph := readTLSBootstrapGraph(t, f)
+	if graph.authority.Name() != "cert-me" || graph.authority.IssuanceState() != domain.IssuanceStateEnabled || graph.authority.KeyGenerationID() != graph.rootGeneration.ID {
+		t.Fatalf("bootstrap authority = %+v, want enabled and linked to its root generation", graph.authority)
+	}
+	if graph.rootGeneration.GenerationNo != 1 || graph.rootGeneration.AuthorityID != graph.authority.ID() || graph.rootGeneration.KeyMaterialID != rootRequest.KeyMaterialID {
+		t.Fatalf("root generation = %+v, want generation 1 linked to bootstrap authority/root key", graph.rootGeneration)
+	}
+	if graph.rootCertificate.Kind() != domain.CertificateKindCA || graph.rootCertificate.Profile() != "" || len(graph.rootCertificate.SANs()) != 0 || graph.rootCertificate.Subject().CommonName() != "cert-me" || !sameWindow(graph.rootCertificate.Validity(), graph.leafCertificate.Validity()) {
+		t.Fatalf("root certificate = %+v, want fixed CA snapshot matching leaf window", graph.rootCertificate)
+	}
+	if graph.rootRecord.CAKeyGenerationID != graph.rootGeneration.ID || graph.rootRecord.IssuerCACertificateID != "" {
+		t.Fatalf("root CA record = %+v, want self-signed record for its generation", graph.rootRecord)
+	}
+	if graph.leafCertificate.Kind() != domain.CertificateKindLeaf || graph.leafCertificate.Profile() != domain.CertificateProfileServerTLS || len(graph.leafCertificate.SANs()) != 1 || graph.leafCertificate.SANs()[0].Value() != "cert-me" {
+		t.Fatalf("leaf certificate = %+v, want serverAuth cert-me leaf", graph.leafCertificate)
+	}
+	if graph.leafRecord.IssuerCACertificateID != graph.rootCertificate.ID() || graph.leafRecord.Operation != port.CertificateOperationInitial || graph.series.Purpose() != domain.SeriesPurposeBootstrapTLS || graph.series.CurrentCertificateID() != graph.leafCertificate.ID() {
+		t.Fatalf("bootstrap leaf graph is inconsistent: record=%+v series=%+v", graph.leafRecord, graph.series)
+	}
+	if graph.crlState.CAKeyGenerationID() != graph.rootGeneration.ID || graph.crlState.PublicationState() != domain.PublicationStateInactive || graph.crlState.SigningCACertificateID() != graph.rootCertificate.ID() {
+		t.Fatalf("bootstrap CRL state = %+v, want inactive state signed by root", graph.crlState)
+	}
+	bootstrapCASecrets, bootstrapTLSSecrets := 0, 0
+	for _, stored := range graph.secrets {
+		switch stored.Purpose() {
+		case domain.SecretPurposeBootstrapCA:
+			bootstrapCASecrets++
+		case domain.SecretPurposeInternalTLS:
+			for _, version := range graph.versions {
+				if version.Source() == domain.TLSSourceBootstrap && version.KeyMaterialID() == stored.OwnerKeyID() {
+					bootstrapTLSSecrets++
+				}
+			}
+		}
+	}
+	if bootstrapCASecrets != 1 || bootstrapTLSSecrets != 1 {
+		t.Fatalf("bootstrap secrets: bootstrap_ca=%d bootstrap_tls=%d, want 1/1", bootstrapCASecrets, bootstrapTLSSecrets)
+	}
+}
+
+func TestTLSServiceBootstrapRegeneratesOneAuthorityAndPreservesHistory(t *testing.T) {
+	f := newTLSFixture(t)
+	internal := tlsReconcileMeta(mustInternalPrincipal(t, contract.InternalOperationTLSBootstrap))
+	first, err := f.svc.Bootstrap(context.Background(), internal, contract.TLSBootstrapCommand{})
+	if err != nil {
+		t.Fatalf("first Bootstrap: %v", err)
+	}
+	firstGraph := readTLSBootstrapGraph(t, f)
+	firstRootID := firstGraph.rootCertificate.ID()
+	firstSeriesID := firstGraph.series.ID()
+
+	second, err := f.svc.Bootstrap(context.Background(), internal, contract.TLSBootstrapCommand{})
+	if err != nil {
+		t.Fatalf("regeneration Bootstrap: %v", err)
+	}
+	if second.Active == nil || second.Active.ID == first.Active.ID || second.Version != 2 {
+		t.Fatalf("regenerated status = %+v, want a new active snapshot at version 2", second)
+	}
+	graph := readTLSBootstrapGraph(t, f)
+	if graph.authority.ID() != firstGraph.authority.ID() || graph.authority.Version() != 1 {
+		t.Fatalf("bootstrap authority after regeneration = %+v, want the same row at version 1", graph.authority)
+	}
+	if graph.rootGeneration.GenerationNo != 2 || graph.rootCertificate.ID() == firstRootID || graph.series.ID() == firstSeriesID {
+		t.Fatalf("regenerated graph generation=%d root=%s series=%s, want generation 2 and fresh public snapshots", graph.rootGeneration.GenerationNo, graph.rootCertificate.ID(), graph.series.ID())
+	}
+	if len(graph.versions) != 2 {
+		t.Fatalf("TLS version history length = %d, want both bootstrap snapshots retained", len(graph.versions))
+	}
+	if _, err := func() (domain.Certificate, error) {
+		var old domain.Certificate
+		err := f.store.Read(context.Background(), func(tx port.TxStores) error {
+			var err error
+			old, err = tx.PKI().GetCertificate(context.Background(), firstRootID)
+			return err
+		})
+		return old, err
+	}(); err != nil {
+		t.Fatalf("old root public history was not retained: %v", err)
+	}
+	if f.keyEngine.generateCalls != 4 || f.installer.applyCount != 2 {
+		t.Fatalf("regeneration key/apply counts = %d/%d, want 4/2", f.keyEngine.generateCalls, f.installer.applyCount)
+	}
+}
+
+func TestTLSServiceBootstrapRejectsOperationalActiveVersion(t *testing.T) {
+	f := newTLSFixture(t)
+	candidate := f.issueCandidate(t, tlsIdemKeyA, "tls-operational")
+	f.mustActivate(t, candidate.ID, 0)
+
+	_, err := f.svc.Bootstrap(context.Background(), tlsReconcileMeta(mustInternalPrincipal(t, contract.InternalOperationTLSBootstrap)), contract.TLSBootstrapCommand{})
+	requireErr(t, err, contract.ErrorKindConflict, "tls_bootstrap_operational_active")
+	status := f.status(t)
+	if status.Active == nil || status.Active.ID != candidate.ID {
+		t.Fatalf("active version after blocked bootstrap = %+v, want operational candidate %s", status.Active, candidate.ID)
+	}
+}
+
+func TestTLSServiceOperationalActivationDeletesBootstrapSecretsAndKeepsHistory(t *testing.T) {
+	f := newTLSFixture(t)
+	internal := tlsReconcileMeta(mustInternalPrincipal(t, contract.InternalOperationTLSBootstrap))
+	bootstrap, err := f.svc.Bootstrap(context.Background(), internal, contract.TLSBootstrapCommand{})
+	if err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	candidate := f.issueCandidate(t, tlsIdemKeyA, "tls-operational")
+	f.mustActivate(t, candidate.ID, bootstrap.Version)
+
+	graph := readTLSBootstrapGraph(t, f)
+	var managed domain.TLSVersion
+	if err := f.store.Read(context.Background(), func(tx port.TxStores) error {
+		var err error
+		managed, err = tx.TLS().GetVersion(context.Background(), candidate.ID)
+		return err
+	}); err != nil {
+		t.Fatalf("read managed version: %v", err)
+	}
+	bootstrapSecrets := 0
+	for _, stored := range graph.secrets {
+		if stored.Purpose() == domain.SecretPurposeBootstrapCA {
+			bootstrapSecrets++
+		}
+	}
+	if bootstrapSecrets != 0 {
+		t.Fatalf("bootstrap_ca secrets after operational activation = %d, want 0", bootstrapSecrets)
+	}
+	if err := f.store.Read(context.Background(), func(tx port.TxStores) error {
+		for _, version := range graph.versions {
+			if version.Source() != domain.TLSSourceBootstrap {
+				continue
+			}
+			if _, err := tx.Secrets().GetEncrypted(context.Background(), version.KeyMaterialID(), domain.SecretPurposeInternalTLS); !errors.Is(err, port.ErrNotFound) {
+				return fmt.Errorf("bootstrap leaf secret for version %s = %v, want ErrNotFound", version.ID(), err)
+			}
+		}
+		if _, err := tx.Secrets().GetEncrypted(context.Background(), managed.KeyMaterialID(), domain.SecretPurposeInternalTLS); err != nil {
+			return fmt.Errorf("managed TLS secret: %w", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTLSServiceReloadStoresConfiguredCandidateWithoutActivation(t *testing.T) {
+	f := newTLSFixture(t)
+	registerTLSUploadFixture(t, f)
+	passphrase := secret.New([]byte("reload-passphrase"))
+	f.source.input = port.TLSFileSourceInput{
+		Certificate: []byte(tlsUploadCertBytes), Key: []byte(tlsUploadKeyBytes), Passphrase: passphrase,
+	}
+
+	view, err := f.svc.Reload(context.Background(), tlsIssueMeta(tlsIdemKeyA), contract.TLSReloadCommand{})
+	if err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if view.Source != domain.TLSSourceExternal || f.source.calls != 1 || f.installer.prepareCount != 0 || f.installer.applyCount != 0 {
+		t.Fatalf("reload result/source/calls = %+v/%d/%d/%d, want external, one source read and no installer call", view, f.source.calls, f.installer.prepareCount, f.installer.applyCount)
+	}
+	if err := passphrase.Use(func([]byte) error { return nil }); !errors.Is(err, secret.ErrClosed) {
+		t.Fatalf("source passphrase after Reload = %v, want secret.ErrClosed", err)
+	}
+	if err := f.parser.lastMintedKey.Use(func([]byte) error { return nil }); !errors.Is(err, secret.ErrClosed) {
+		t.Fatalf("parsed key after Reload = %v, want secret.ErrClosed", err)
+	}
+	status := f.status(t)
+	if status.Active != nil {
+		t.Fatalf("Reload activated candidate unexpectedly: %+v", status.Active)
 	}
 }
 
@@ -596,6 +965,8 @@ func TestTLSServiceIssueCandidateNeverCreatesALeafDeliveryOrGrant(t *testing.T) 
 		},
 		KeyEngine: f.importer, CertificateSigner: f.signer, SerialGenerator: f.serials,
 		ChainValidator: f.chain, TLSInstaller: f.installer, PKIParser: f.parser,
+		FileSource:  f.source,
+		RuntimeGate: f.gate,
 	})
 	if err != nil {
 		t.Fatalf("new tls service: %v", err)
@@ -813,6 +1184,25 @@ func TestTLSServiceActivateApplyFailureRollsBackDBAndMemory(t *testing.T) {
 	}
 }
 
+func TestTLSServiceActivateFirstCandidateApplyFailureClearsActivePointer(t *testing.T) {
+	f := newTLSFixture(t)
+	candidate := f.issueCandidate(t, tlsIdemKeyA, "tls-first-failure")
+	f.installer.applyErr = errors.New("listener swap failed")
+
+	_, err := f.activate(t, candidate.ID, 0)
+	requireErr(t, err, contract.ErrorKindUnavailable, "tls_apply_failed")
+	status := f.status(t)
+	if status.Active != nil || status.Phase != nil {
+		t.Fatalf("first activation failure left active status = %+v, want no active pointer", status)
+	}
+	if status.Version != 2 {
+		t.Fatalf("installation version after first activation rollback = %v, want 2 (set then clear)", status.Version)
+	}
+	if f.gate.callCount() != 0 {
+		t.Fatalf("runtime gate calls after a clean first-activation rollback = %v, want none", f.gate.codes)
+	}
+}
+
 // ---- Activate: happy path, version conflict, blocked-pending-reconcile --
 
 func TestTLSServiceActivateAppliesFirstCandidate(t *testing.T) {
@@ -976,6 +1366,49 @@ func TestTLSServiceReconcileAppliesReValidatedCandidate(t *testing.T) {
 	}
 }
 
+func TestTLSServiceReconcileRecoversCommittedChange(t *testing.T) {
+	f := newTLSFixture(t)
+	candidate := seedTLSVersionWithSecret(t, f.store, f.ids, testNow().Add(domain.NewDuration(48*time.Hour)), "committed")
+	seedCommittedChange(t, f.store, candidate, "")
+
+	view, err := f.svc.Reconcile(context.Background(), tlsReconcileMeta(mustInternalPrincipal(t, contract.InternalOperationTLSReconcile)), contract.TLSReconcileCommand{})
+	if err != nil {
+		t.Fatalf("Reconcile committed change: %v", err)
+	}
+	if view.Active == nil || view.Active.ID != candidate || view.Phase == nil || *view.Phase != domain.TLSChangePhaseApplied {
+		t.Fatalf("reconciled committed status = %+v, want applied candidate", view)
+	}
+	if f.installer.applyCount != 1 || f.installer.lastAppliedCandidateID != candidate {
+		t.Fatalf("installer after committed recovery = prepare=%d apply=%d candidate=%s, want one apply of %s", f.installer.prepareCount, f.installer.applyCount, f.installer.lastAppliedCandidateID, candidate)
+	}
+	if f.gate.callCount() != 0 {
+		t.Fatalf("runtime gate calls after successful committed recovery = %v, want none", f.gate.codes)
+	}
+}
+
+func TestTLSServiceReconcileFailsClosedWhenActiveChangeIsMissing(t *testing.T) {
+	f := newTLSFixture(t)
+	candidate := seedTLSVersionWithSecret(t, f.store, f.ids, testNow().Add(domain.NewDuration(48*time.Hour)), "missing-change")
+	if err := f.store.Write(context.Background(), func(tx port.TxStores) error {
+		installation, err := tx.Installation().GetForUpdate(context.Background())
+		if err != nil {
+			return err
+		}
+		original := installation.Version
+		installation.ActiveTLSVersionID = candidate
+		installation.Version = installation.Version.Next()
+		return tx.Installation().Save(context.Background(), installation, original)
+	}); err != nil {
+		t.Fatalf("seed missing active change: %v", err)
+	}
+
+	_, err := f.svc.Reconcile(context.Background(), tlsReconcileMeta(mustInternalPrincipal(t, contract.InternalOperationTLSReconcile)), contract.TLSReconcileCommand{})
+	requireErr(t, err, contract.ErrorKindUnavailable, "tls_active_change_missing")
+	if f.gate.callCount() != 1 || f.gate.lastCode() != "tls_active_change_missing" {
+		t.Fatalf("runtime gate calls = %v, want one tls_active_change_missing call", f.gate.codes)
+	}
+}
+
 func TestTLSServiceReconcileRollsBackToPreviousWhenCandidateInvalid(t *testing.T) {
 	f := newTLSFixture(t)
 	previous := seedTLSVersionWithSecret(t, f.store, f.ids, testNow().Add(domain.NewDuration(24*time.Hour)), "previous")
@@ -1011,15 +1444,10 @@ func TestTLSServiceReconcileStaysRecoveryRequiredWhenNeitherRevalidates(t *testi
 	candidate := seedTLSVersionWithSecret(t, f.store, f.ids, testNow().Add(domain.NewDuration(-time.Hour)), "candidate")
 	seedRecoveryRequiredChange(t, f.store, candidate, previous)
 
-	view, err := f.svc.Reconcile(context.Background(), tlsReconcileMeta(mustInternalPrincipal(t, contract.InternalOperationTLSReconcile)), contract.TLSReconcileCommand{})
-	if err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-	if view.Phase == nil || *view.Phase != domain.TLSChangePhaseRecoveryRequired {
-		t.Fatalf("phase = %v, want recovery_required (maintenance)", view.Phase)
-	}
-	if view.ErrorCode != "tls_recovery_unresolved" {
-		t.Fatalf("error code = %q, want tls_recovery_unresolved", view.ErrorCode)
+	_, err := f.svc.Reconcile(context.Background(), tlsReconcileMeta(mustInternalPrincipal(t, contract.InternalOperationTLSReconcile)), contract.TLSReconcileCommand{})
+	requireErr(t, err, contract.ErrorKindUnavailable, "tls_recovery_unresolved")
+	if f.gate.callCount() != 1 || f.gate.lastCode() != "tls_recovery_unresolved" {
+		t.Fatalf("runtime gate calls = %v, want one tls_recovery_unresolved call", f.gate.codes)
 	}
 	if f.installer.applyCount != 0 || f.installer.prepareCount != 0 {
 		t.Fatalf("installer was touched even though neither version could re-validate: prepareCount=%d applyCount=%d", f.installer.prepareCount, f.installer.applyCount)
@@ -1065,17 +1493,11 @@ func TestTLSServiceReconcileIsANoOpWhenAlreadyResolved(t *testing.T) {
 // error and porttest.Store discards the entire working copy, rolling the
 // TLSChange back to recovery_required even though Apply already ran.
 //
-// This does NOT prove Discard prevents a registry leak on this path --
-// Apply's own success path already removed the entry before the audit
-// append ever runs, so Discard is a harmless no-op here regardless of
-// whether the defer is present. What it does prove is that the defer
-// executes cleanly on a real DB-rollback return path without a double-free
-// or a panic, and it documents a real, already-flagged consequence of
-// Reconcile's one-Write shape: the live listener stays swapped to the
-// candidate even though the persisted TLSChange reports recovery_required
-// again. That divergence is called out in tls.go's own Reconcile doc
-// comment as an accepted simplification for the lead to confirm, not
-// something this test asserts is correct.
+// This does NOT attempt to make a database rollback undo an already-applied
+// listener change. It verifies the required fail-closed behavior: when the
+// post-Apply audit write fails, the persisted change is recoverable but the
+// runtime gate refuses normal operation until reconciliation repairs the
+// divergence.
 func TestTLSServiceReconcileDiscardIsHarmlessAfterADBRollback(t *testing.T) {
 	f := newTLSFixture(t)
 	previous := seedTLSVersionWithSecret(t, f.store, f.ids, testNow().Add(domain.NewDuration(24*time.Hour)), "previous")
@@ -1090,6 +1512,8 @@ func TestTLSServiceReconcileDiscardIsHarmlessAfterADBRollback(t *testing.T) {
 		},
 		KeyEngine: f.importer, CertificateSigner: f.signer, SerialGenerator: f.serials,
 		ChainValidator: f.chain, TLSInstaller: f.installer, PKIParser: f.parser,
+		FileSource:  f.source,
+		RuntimeGate: f.gate,
 	})
 	if err != nil {
 		t.Fatalf("new tls service: %v", err)
@@ -1110,6 +1534,9 @@ func TestTLSServiceReconcileDiscardIsHarmlessAfterADBRollback(t *testing.T) {
 	if status.Phase == nil || *status.Phase != domain.TLSChangePhaseRecoveryRequired {
 		t.Fatalf("persisted phase after the rolled-back write = %v, want recovery_required", status.Phase)
 	}
+	if f.gate.callCount() != 1 || f.gate.lastCode() != "tls_reconcile_audit_failed" {
+		t.Fatalf("runtime gate calls after post-Apply audit failure = %v, want one tls_reconcile_audit_failed call", f.gate.codes)
+	}
 }
 
 // failingAuditUoW wraps a real UnitOfWork/ReadStore so every AuditRepository
@@ -1118,7 +1545,7 @@ func TestTLSServiceReconcileDiscardIsHarmlessAfterADBRollback(t *testing.T) {
 // store implementation.
 type failingAuditRepo struct{ port.AuditRepository }
 
-func (failingAuditRepo) Append(context.Context, port.AuditEvent, []domain.AuthorityID) error {
+func (failingAuditRepo) Append(context.Context, port.AuditEvent, port.AuditScope) error {
 	return errors.New("injected: audit append failed")
 }
 
@@ -1208,10 +1635,11 @@ func registerTLSUploadFixture(t *testing.T, f *tlsFixture) {
 	if err != nil {
 		t.Fatalf("subject: %v", err)
 	}
+	leafPublicKey := tlsUploadLeafPublicKey(t)
 	f.parser.registerLeaf([]byte(tlsUploadCertBytes), port.ParsedCertificateFacts{
-		PublicKey: tlsUploadLeafPublicKey(t), KeyAlgorithm: domain.KeyAlgorithmECDSAP256,
+		PublicKey: leafPublicKey, SPKIFingerprint: leafPublicKey.Fingerprint(), KeyAlgorithm: domain.KeyAlgorithmECDSAP256,
 		Serial: serial(t, "beef"), Validity: window, Subject: subject, SANs: []domain.SAN{san},
-		Kind: domain.CertificateKindLeaf,
+		Kind: domain.CertificateKindLeaf, Profile: domain.CertificateProfileServerTLS,
 	})
 	f.parser.registerKey([]byte(tlsUploadKeyBytes), tlsFakeKeyRecipe{
 		plaintext: []byte("plaintext-private-key-material"), publicKey: tlsUploadLeafPublicKey(t), algorithm: domain.KeyAlgorithmECDSAP256,
@@ -1261,8 +1689,12 @@ func TestTLSServiceUploadCandidateStoresChainBundle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("subject: %v", err)
 	}
+	chainPublicKey, err := domain.NewPublicKey(domain.KeyAlgorithmECDSAP256, []byte("upload-chain-public-key"))
+	if err != nil {
+		t.Fatalf("chain public key: %v", err)
+	}
 	f.parser.registerChain([]byte(tlsUploadChainByte), port.ParsedCertificateFacts{
-		DER: []byte("intermediate-der"), KeyAlgorithm: domain.KeyAlgorithmECDSAP256,
+		DER: []byte("intermediate-der"), PublicKey: chainPublicKey, SPKIFingerprint: chainPublicKey.Fingerprint(), KeyAlgorithm: domain.KeyAlgorithmECDSAP256,
 		Serial: serial(t, "cafe"), Validity: window, Subject: subject, Kind: domain.CertificateKindCA,
 	})
 
@@ -1346,6 +1778,8 @@ func TestTLSServiceUploadCandidateNeverCreatesALeafDeliveryOrGrant(t *testing.T)
 		},
 		KeyEngine: f.importer, CertificateSigner: f.signer, SerialGenerator: f.serials,
 		ChainValidator: f.chain, TLSInstaller: f.installer, PKIParser: f.parser,
+		FileSource:  f.source,
+		RuntimeGate: f.gate,
 	})
 	if err != nil {
 		t.Fatalf("new tls service: %v", err)

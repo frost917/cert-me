@@ -70,8 +70,10 @@ func (c MaintenanceRotateCommand) Validate() error {
 	return nil
 }
 
-// MaintenanceFinalizeRestoreOptions carries the operator's restore choices
-// that FinalizeRestore needs before it can run
+// MaintenanceFinalizeRestoreOptions carries the operator's explicit restore
+// confirmations that FinalizeRestore requires before it can run. Both cleanup
+// flags must be true; the service does not permit a run to complete while
+// either safety cleanup is skipped.
 // (§9 "FinalizeRestore는 세션/토큰 무효화·대기 키 삭제/폐기와 필요한 CRL
 // 작업을 먼저 커밋하고 영속 복구 단계로 추적한다").
 type MaintenanceFinalizeRestoreOptions struct {

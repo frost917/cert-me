@@ -129,6 +129,15 @@ func NewSAN(kind SANType, value string) (SAN, error) {
 	return SAN{kind: kind, value: v}, nil
 }
 
+// NewBootstrapDNSNameSAN returns the fixed DNS SAN used by the temporary
+// cert-me HTTPS certificate. It is intentionally separate from NewSAN:
+// ordinary DNS SANs require a dotted DNS name, while the documented local
+// bootstrap identity is the single label "cert-me" and must not become a
+// generally accepted production SAN.
+func NewBootstrapDNSNameSAN() (SAN, error) {
+	return SAN{kind: SANTypeDNS, value: "cert-me"}, nil
+}
+
 // maxDNSSANLength matches the RFC 1035/1123 whole-name limit.
 const maxDNSSANLength = 253
 

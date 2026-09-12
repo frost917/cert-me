@@ -124,22 +124,10 @@ func requireMaintenanceOperation(principal contract.Principal, op contract.Inter
 	return nil
 }
 
-// maintenanceScope is UNRESOLVED, not a considered answer -- matching
-// tlsScope (tls.go) and settingsScope (settings_service.go)'s own,
-// already-reported open question. §14.6 requires a non-empty stored audit
-// scope ("현재 MVP도 scope를 비워 저장하지 않는다"), but Rotate's own
-// summary event, FinalizeRestore's own summary event and PruneAudit's own
-// event describe a store-wide action with no single authority relation to
-// read: a key rotation touches every stored secret across every CA at once,
-// an audit prune touches the whole log, and a restore run's own outcome
-// covers however many CAs ended up in BlockingCAIDs, not one. (The
-// PER-REVOCATION events RecoverTransfers/ExpireDeliveries/FinalizeRestore's
-// pending-key sweep record are NOT this case -- those go through
-// applyRevocations, which scopes each one to the certificate's own stored
-// management authority via leafManagementAuthority, exactly like
-// recovery.go.) See tlsScope's doc comment for the identical tension; this
-// file does not resolve it any differently.
-func maintenanceScope() []domain.AuthorityID { return nil }
+// Maintenance summaries describe installation-wide operations: rotation,
+// restore and audit pruning span the store rather than one authority. Use a
+// typed installation scope so that this is distinct from a missing scope.
+func maintenanceScope() port.AuditScope { return port.NewInstallationAuditScope() }
 
 // ---- Rotate ----
 
@@ -677,22 +665,23 @@ func (s *MaintenanceService) FinalizeRestore(ctx context.Context, meta contract.
 	if err := requireMaintenanceOperation(meta.Principal, contract.InternalOperationRestoreFinalize); err != nil {
 		return contract.MaintenanceResult{}, err
 	}
+	if !cmd.Options.InvalidateAllSessions || !cmd.Options.DeletePendingKeys {
+		return contract.MaintenanceResult{}, contract.NewAppError(contract.ErrorKindValidation,
+			"maintenance_restore_cleanup_confirmation_required",
+			"restore finalization requires administrator-session/reset-token and pending-delivery cleanup")
+	}
 	runID := cmd.Options.RunID
 
 	if err := s.startRestoreRun(ctx, runID); err != nil {
 		return contract.MaintenanceResult{}, err
 	}
 
-	if cmd.Options.InvalidateAllSessions {
-		if err := s.invalidateAllAdminSessions(ctx); err != nil {
-			return contract.MaintenanceResult{}, err
-		}
+	if err := s.invalidateAllAdminSessions(ctx); err != nil {
+		return contract.MaintenanceResult{}, err
 	}
 
-	if cmd.Options.DeletePendingKeys {
-		if err := s.deleteRestorePendingKeys(ctx); err != nil {
-			return contract.MaintenanceResult{}, err
-		}
+	if err := s.deleteRestorePendingKeys(ctx); err != nil {
+		return contract.MaintenanceResult{}, err
 	}
 
 	plan, err := s.restoreCRLPlan(ctx, runID)
@@ -1012,6 +1001,16 @@ func (s *MaintenanceService) restoreCRLPlan(ctx context.Context, runID domain.Jo
 			}
 			for _, authority := range page.Items {
 				if authority.IsArchived() || authority.KeyGenerationID() == "" {
+					continue
+				}
+				historyOnly, err := isHistoryOnlyCA(ctx, tx, authority)
+				if err != nil {
+					return storeError(err, "maintenance_restore_key_material_read_failed", "could not determine the authority's key custody")
+				}
+				if historyOnly {
+					// Certificate-only imported CAs retain public history but
+					// were never operational CRL signers. They are not a
+					// reason to block restore or create a fictitious demand.
 					continue
 				}
 				state, err := tx.Queries().GetCRLStatus(ctx, authority.KeyGenerationID(), port.QueryScope{All: true})
