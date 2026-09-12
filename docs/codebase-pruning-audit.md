@@ -1,0 +1,169 @@
+# cert-me 특별 감시팀: 코드 제거·단순화 보고서
+
+- 작성일: 2026-09-12
+- 검토 기준: `b3e7a850eb2a3cbe3903b92e6c4c4a604b40c8e3` (`feat/b04-remaining-services`)
+- 보고서 브랜치: `codex/codebase-pruning-audit`
+
+## 판정
+
+**먼저 걷어낼 것은 미사용 의존성, 중복 조회, 같은 업무 규칙의 복사본이다.** 실제로 호출되지 않는 내부 함수도 있지만, 이것만 지워서는 유지보수 비용이 크게 줄지 않는다. 특히 `ProfileValidator`는 업무 중 한 번도 호출하지 않으면서 두 서비스의 생성에 필수로 요구한다. 전송 복구는 같은 변경 절차를 두 서비스가 따로 유지한다. 이 두 항목을 우선 정리할 가치가 크다.
+
+이번 브랜치의 산출물은 보고서와 문서 목록 갱신이다. 아래 삭제·통합 제안은 제품 코드에 적용하지 않았다. 즉시 삭제 후보 일부는 임시 복사본에서 실제 제거해 검증했다. 원래 작업 디렉터리의 미추적 `.claude/`, `scratchpad/`는 검토·변경 대상에서 제외했다.
+
+## 범위와 근거의 한계
+
+- Git 추적 파일 216개 중 Go 파일은 161개, 56,808줄이다. 테스트 파일은 26,848줄, 나머지 Go 파일은 29,960줄이다. 줄 수에는 주석과 빈 줄이 포함된다.
+- 서비스의 테스트 외 코드는 15,589줄이다. `importing.go` 2,757줄, `tls.go` 2,181줄, `issuance.go` 1,694줄에 구현이 집중되어 있다. 파일 길이 자체를 삭제 근거로 삼지는 않았다.
+- 테스트 외 Go 파일에는 테스트 저장소인 `porttest` 3,052줄도 포함된다. 따라서 29,960줄을 모두 운영 코드라고 해석하면 안 된다.
+- 추적 Go 파일 전체의 AST 식별자 사용을 확인하고, 후보의 호출부·포트·테스트·설계 문서를 대조했다. 식별자 횟수는 후보 탐색 수단이며 타입 기반 호출 그래프나 운영 실행 분석을 대신하지 않는다.
+- 현재 트리는 B04 서비스 구현 단계다. 실행 진입점, 실제 저장소·암호화·TLS 어댑터와 HTTP/worker 연결은 [구현 설계](./backend-implementation.md)의 B05/B06 범위다. 아직 외부 호출자가 없다는 이유로 서비스 API 전체를 죽은 코드로 분류하지 않았다.
+- 아래 파일·행 번호는 검토 기준 커밋의 위치다. 우선순위는 정리 순서이며 보안 취약점 등급이 아니다.
+
+## 제거·단순화 목록
+
+| 번호 | 우선순위 | 대상 | 권고 | 근거 확실성 / 변경 위험 |
+| --- | --- | --- | --- | --- |
+| D01 | 1 | 미사용 내부 함수·더미 참조 | 바로 삭제 | 높음 / 낮음 |
+| D02 | 1 | `ProfileValidator` | 포트·필수 주입·대역을 함께 삭제 | 높음 / 낮음, 설계 표 수정 필요 |
+| D03 | 1 | Query의 불필요한 공통 의존성 | 실제 사용하는 세 의존성으로 축소 | 높음 / 낮음 |
+| D04 | 1 | 전환 상세의 중복 조회 | 이미 조회한 impacts로 변환 | 높음 / 낮음 |
+| D05 | 2 | 전송 복구의 행 처리 복사본 | 트랜잭션 내부 변경 절차만 통합 | 높음 / 중간 |
+| D06 | 2 | 암묵적 권한 범위 호환 함수 | 명시적 생성자로 치환 후 삭제 | 높음 / 중간 |
+| D07 | 2 | 저장된 CA 체인 순회 중복 | 공통 순회로 통합 | 높음 / 중간 |
+| D08 | 3 | 사용하지 않는 시간 인자 | 실제 미사용 메서드부터 제거 | 높음 / 낮음, 호출·설계 동기화 필요 |
+| D09 | 1 | 낡은 개발 경위 주석 | 삭제하고 현재 계약만 유지 | 높음 / 낮음 |
+
+### D01. 사용되지 않는 내부 함수와 더미 참조
+
+근거: [values.go](../internal/domain/values.go) 660–668행, [jobs.go](../internal/app/porttest/jobs.go) 169–181행, [distribution_test.go](../internal/app/service/distribution_test.go) 1380행.
+
+- `cloneStrings`: 선언을 제외한 Go 식별자 참조가 없다. 본문 8줄과 주석을 삭제한다. 실제 호출되는 `cloneBytes`는 별개다.
+- `itoa`: 선언을 제외한 참조가 없는 수제 정수 변환 함수다. 본문 13줄을 삭제한다. 사용처가 없으므로 `strconv.Itoa`로 대체할 필요조차 없다.
+- `var _ = bytes.MinRead`: 미래 편집을 위해 import를 유지한다는 더미 참조다. 같은 파일의 `bytes.Equal`·`bytes.Contains`가 이미 import를 사용하므로 이 한 줄만 삭제한다.
+
+이 세 항목은 즉시 제거해도 될 확실한 잔재다. 작지만 검토해야 할 표면적을 줄인다. 공개 파서·접근자는 후속 어댑터에서 사용할 수 있으므로 같은 기준으로 일괄 삭제하지 않는다.
+
+### D02. 호출하지 않는 `ProfileValidator`를 필수로 받는다
+
+근거: [services.go](../internal/app/port/services.go) 481–496행, [authority.go](../internal/app/service/authority.go) 19–45행, [issuance.go](../internal/app/service/issuance.go) 30–53행, [issuance_test.go](../internal/app/service/issuance_test.go) 166–176행.
+
+두 서비스는 생성자에서 `ProfileValidator != nil`을 요구하지만, 이후 `ProfileValidator.Validate`를 호출하는 제품 코드가 없다. 대역도 항상 `nil`을 반환한다. 포트의 주석은 이 인터페이스가 검사할 운영자 정책 자체가 아직 정의되지 않았다고 명시한다.
+
+**포트 선언, 두 의존성 필드, 두 nil 검사, `noopProfileValidator`, 테스트 주입값을 함께 삭제한다.** [구현 설계](./backend-implementation.md) 175행의 의존성 표도 같은 변경에서 맞춘다. 지금 존재하지 않는 정책을 위한 무동작 어댑터를 B05에서 만들지 않는다.
+
+이는 실제 인증서 검증을 없애자는 제안이 아니다. [certificate.go](../internal/domain/certificate.go)의 `ValidateSANsForProfile`, `IssuanceRequest.ValidateFor`, 발급 계획 검증과 서명 결과 대조는 이미 별도로 동작하므로 유지한다. 향후 SAN 허용 목록 등의 구체적 요구가 생기면 그때 소비 코드와 함께 정책을 도입한다.
+
+완료 기준: `ProfileValidator` 식별자가 구현·테스트에서 없어지고 기존 발급·CA 생성의 허용/거부 테스트가 통과한다.
+
+### D03. 조회 서비스가 쓰기 트랜잭션과 ID 생성기를 강제한다
+
+근거: [query.go](../internal/app/service/query.go) 35–45행과 각 조회 메서드, [deps.go](../internal/app/service/deps.go) 26–43행.
+
+`QueryService`는 `CommonDeps.Validate()`를 호출한다. 이 때문에 사용하지 않는 `UnitOfWork`와 `IDs`도 없으면 생성할 수 없다. 실제 Query 구현이 사용하는 의존성은 `ReadStore`, `Authorizer`, `Clock`뿐이다.
+
+`QueryDeps`를 이 세 필드로 정의하고 생성자·테스트 조립을 바꾼다. 단순히 nil 검사를 생략해 불필요한 필드를 남기지 말고 타입에서 제거한다. 변경 효과는 줄 수보다 명확한 읽기 경계와 불필요한 대역 제거에 있다. 모든 서비스의 의존성을 새 계층으로 재구성하는 일까지 확대할 필요는 없다.
+
+완료 기준: 쓰기 저장소와 ID 생성기 없이 Query를 생성할 수 있고, 인증·권한·만료 시각 검증은 기존대로 통과한다.
+
+### D04. 전환 상세 조회가 이미 받은 impacts를 버리고 재조회한다
+
+근거: [query.go](../internal/app/service/query.go) 573–586행, [transition.go](../internal/app/service/transition.go) 142행의 `toTransitionView`, [queries.go](../internal/app/porttest/queries.go) 322–338행.
+
+`QueryRepository.GetTransition`은 `QueriedTransition{Transition, Impacts}`를 반환한다. 그런데 `QueryService.GetTransition`은 `Impacts`를 사용하지 않고, 내부에서 `ListImpacts`를 다시 부르는 `toTransitionView`를 호출한다. 주석도 이중 조회임을 인정한다. 현재 대역에서도 impacts 전체 탐색과 정렬을 한 번 더 수행한다.
+
+도메인 전환과 impacts를 받아 DTO만 만드는 순수 변환 함수를 두고 상세 조회에서는 이미 받은 결과를 전달한다. 변경 서비스에서 조회가 필요하면 그 호출자가 명시적으로 조회한 뒤 변환한다. 상세 요청당 불필요한 저장소 호출 한 번을 없앨 수 있다.
+
+같은 파일의 `ListTransitions` 532–546행도 항목마다 impacts를 조회한다. 이 부분은 단순 삭제하면 응답 정보가 사라진다. B05 조회 구현 시 목록도 `QueriedTransition` 묶음이나 일괄 조회로 반환하도록 조정할 후보다. 실제 SQL 어댑터가 없으므로 현재 SQL 성능 저하량은 측정하지 않았다.
+
+완료 기준: 상세 조회의 응답 내용·권한 필터는 같고, impacts에 대한 추가 저장소 호출은 0회다.
+
+### D05. 동일한 전송 복구 변경 절차가 두 서비스에 복사되어 있다
+
+근거: [recovery.go](../internal/app/service/recovery.go) 99–161행의 `failInterruptedTransfer`, [maintenance.go](../internal/app/service/maintenance.go) 528–597행의 `recoverOneTransfer`; 같은 파일 460–470행의 복사 이유 주석.
+
+두 경로 모두 delivery를 잠그고, transferring 상태를 확인하고, 인증서와 관리 범위를 읽고, 실패 저장·개인키 링크 무효화·폐기·CRL 요구·감사를 반영한다. 복사의 근거 중 하나가 당시 개발자별 파일 수정 범위였다. 이는 최종 코드에서 같은 업무 규칙을 두 벌 유지할 이유가 되지 않는다.
+
+`TxStores`를 받는 비공개 함수로 **행 하나의 변경 절차만** 합친다. 서비스끼리 주입하거나 공개 서비스 메서드를 중첩 호출하지 않는다. 서비스는 계속 자신의 `Write`와 바깥 반복문을 소유한다.
+
+다음 차이는 실제 동작이므로 통합 과정에서 없애면 안 된다.
+
+- 시작 복구는 첫 실패를 반환하지만 Maintenance는 실패 ID를 모아 계속 처리한다.
+- 현재 시각의 취득 위치가 다르다. 시작 복구는 루프 전에, Maintenance는 행 잠금 뒤에 읽는다. 시간 정책을 바꾸려면 단순 중복 제거와 구분해 검증한다.
+- 감사 action과 오류 code가 다르다.
+- Maintenance는 commit 결과 불명확 시 `RuntimeGate.FailClosed`를 호출한다.
+
+완료 기준: 성공·이미 종료됨·중간 저장 실패·commit 불명확·재실행에서 기존 원자성과 각 진입점의 실패 정책을 유지한다. 실패 처리·폐기·CRL 변경의 구현 본문은 한 곳에 남긴다.
+
+### D06. 권한 범위의 암묵적 호환 생성자를 끝낸다
+
+근거: [services.go](../internal/app/port/services.go) 75–84행. 테스트 외 서비스 파일에 `port.NewAuthorizationScope(...)` 호출이 57곳 있다.
+
+이미 `NewInstallationAuthorizationScope`와 `NewAuthoritiesAuthorizationScope`가 존재하지만 호환 함수는 여전히 “인자가 비면 installation”으로 해석한다. 명시적 두 종류를 도입한 뒤에도 호출부의 의도를 숨기는 이전 경로가 남았다.
+
+인자 없는 전역 작업은 installation 생성자로, 저장 관계에서 구한 CA ID를 넘기는 작업은 authorities 생성자로 바꾼 뒤 호환 함수를 삭제한다. 특히 `scope...` 호출은 실제로 비어도 되는지 하나씩 확인한다. CA 범위를 의도한 빈 결과가 전역 범위로 변환되는 경로를 없애는 것이 핵심이다. 이 사실만으로 현재 권한 우회가 재현됐다고 주장하지는 않는다.
+
+범위 종류, ID 검증, 중복 제거, 복사 accessor와 Authorizer는 유지한다. 완료 기준은 installation·단일 CA·복수 CA·빈 CA 범위의 기대 결과 검증이다.
+
+### D07. 저장된 CA 체인을 따라가는 순회가 두 벌이다
+
+근거: [chain.go](../internal/app/service/chain.go) 39–104행, [importing.go](../internal/app/service/importing.go) 1081–1105행.
+
+`buildChainDER`와 `existingIssuerChainDER`는 저장된 CA 인증서 링크를 따라가며 DER를 수집하고 순환·최대 깊이·누락을 처리한다. 앞 함수에는 발급 키 세대 일치 검사도 있다. 한쪽만 수정하면 검증 기준이 갈라질 수 있다.
+
+공통 CA 순회를 `chain.go`로 모으고 Leaf 진입점과 import 진입점은 시작 인증서·대상 포함 여부를 결정하는 얇은 함수로 남긴다. 기존 오류 코드에 의존하는 호출·테스트도 확인한다. 단순히 짧은 import 순회로 치환하면 키 세대 검사가 사라지므로 금지한다.
+
+같은 업로드 묶음의 아직 저장되지 않은 인증서를 해석하는 `buildVerificationChain` 전체까지 이 함수에 끼워 넣지는 않는다. 완료 기준은 과거 발급 체인 보존, Root 포함 여부, 순환·누락·키 세대 불일치에 대한 동일한 거부다.
+
+### D08. 미래 기능을 위해 받기만 하는 시간 인자
+
+근거: [authority.go](../internal/domain/authority.go) 331–349행의 `CanDestroyKey`; [tls.go](../internal/domain/tls.go) 291–338행의 `Commit`, `Apply`, `RollbackApply`; [transition.go](../internal/domain/transition.go) 163–179행의 `SetTarget`.
+
+이 메서드들은 `now Instant`를 받지만 `_ = now`로 버린다. 특히 `CanDestroyKey`는 미래 유예기간 검사를 위해 예약했다고 명시한다. 실제로 시간 검증을 하지 않는 함수가 시각을 받으면 호출자는 검사가 있다고 오해할 수 있다.
+
+실제 미사용 메서드부터 인자를 제거하고 호출·테스트·설계 선언을 맞춘다. 시간에 따라 이미 계산된 `ClosureFacts`를 받는 경우에는 그 계산이 서비스의 어느 시각에 이루어지는지 명시한다. 인자 제거를 위해 새로운 옵션 객체나 미래용 정책 인터페이스를 추가하지 않는다.
+
+시각을 받는 도메인 메서드 전체를 일괄 편집하면 안 된다. 메서드 전체 사용과 실제 저장 시각을 확인하고, 만료 판정·감사·완료 시각에 사용되는 인자는 유지한다. `TLSChange.Reconcile`처럼 여러 성공 분기에서 각각 `_ = now`로 버리는 경우도 메서드 단위로 확인한다.
+
+### D09. 개발 당시 경위가 현재 계약보다 길고 일부는 틀렸다
+
+근거: [transition.go](../internal/app/service/transition.go) 1–80행 및 106–108행, [maintenance.go](../internal/app/service/maintenance.go) 1–17행과 460–482행, [services.go](../internal/app/port/services.go) 15–19행의 Clock 설명.
+
+추적된 테스트 외 Go 파일에서 AST 주석 범위는 7,211줄, 전체 29,960줄의 약 24.1%다. 이것을 삭제 목표량으로 삼지는 않는다. 다만 현재 코드에는 개발자 배정, 리드에게 보고한 경위, 수정하지 못했던 파일 목록까지 남아 있다.
+
+구체적으로 `TransitionService` 주석은 Complete가 없다고 안내하지만 808행에 `Complete`가 구현되어 있다. Clock 주석은 호출당 한 번 읽는다고 설명하지만 현재 인증·commit 재검사 경로는 잠금 이후 시각을 다시 취득한다. 주석이 오히려 다음 수정을 잘못 유도할 수 있다.
+
+배정·협의 과정·이미 해결된 공백 설명은 삭제한다. 미해결 제품 결정은 [구현 설계](./backend-implementation.md)에 한 번만 기록하고 코드에는 링크와 현재 동작만 남긴다. 현재 보안 불변식, 소유권, 실패 원자성, 역사적 issuer 관계를 사용하는 이유는 유지한다. 주석을 줄이겠다고 모든 설명을 삭제하지 않는다.
+
+## 이번 정리에서 보존할 것
+
+| 대상 | 삭제를 권하지 않는 이유 |
+| --- | --- |
+| 준비 후 commit 안의 인증·버전·시각 재검사 | 준비 중 reset·만료·설정 변경을 막는 실제 경합 방어다. 반복 모양만 보고 합치면 안 된다. |
+| `secret.Input`, `EncodedBundle`, TLS 준비 핸들의 redaction·소유권·Discard | 비밀 수명과 TLS 적용 실패를 제어한다. 단순 문자열·바이트 슬라이스로 되돌릴 근거가 없다. |
+| 복원 실행 기록과 CRL 게시 요구 | 기준 커밋에서 복원 후 서비스 재개를 막는 영속 근거다. job 상태만으로 대체하지 않는다. |
+| `porttest` 전체 및 보안·경합 회귀 테스트 | 실제 어댑터가 없는 B04의 검증 기반이다. 대역이 크거나 테스트 줄 수가 많다는 사실은 삭제 근거가 아니다. |
+| 네 DB의 생성 SQL, OpenAPI, 의존성 | 설계에 명시된 지원 범위와 재현성 검증 대상이다. 생성된 중복 파일을 손으로 제거하거나 DB 지원을 축소하는 것은 제품 범위 변경이다. |
+| 아직 외부 호출이 없는 공개 메서드 | `MaintenanceService.Rotate`, `RecoverTransfers`, `PruneAudit`와 저장 형식 파서 등은 B05/B06 연결 가능성을 확인해야 한다. 미사용 검색만으로 서비스 기능을 삭제하지 않는다. |
+
+## 실행 순서
+
+1. **잔재 제거:** D01, D02, D09를 작은 변경으로 묶는다. 설계의 `ProfileValidator` 의존성 표도 함께 고친다.
+2. **조회 단순화:** D03, D04를 적용한다. 조회 결과와 인증 검증을 유지하고 불필요한 주입·저장소 호출 제거를 확인한다.
+3. **권한 호출 명시화:** D06을 독립 변경으로 진행한다. 비어 있는 CA 범위를 전역 권한으로 해석하는 호출이 남지 않게 한다.
+4. **중복 업무 규칙 통합:** D05와 D07은 각각 별도 변경으로 처리한다. 복구 실패 정책과 체인 검증을 섞어 바꾸지 않는다.
+5. **시그니처 정리:** D08을 실제 미사용 메서드 단위로 마무리한다.
+
+파일 분할만으로 정리 완료를 선언하지 않는다. 제거한 무용 의존성, 줄어든 조회 횟수, 하나로 모인 규칙을 기준으로 평가한다. 광범위한 generic CRUD, 서비스 기반 클래스, DI 프레임워크를 새로 만들 필요는 없다.
+
+## 검증 기록
+
+| 검사 | 결과 및 범위 |
+| --- | --- |
+| `go version` | `go1.27.1 linux/amd64` |
+| `go test -count=1 ./...` | 기준 코드의 9개 패키지 통과. 캐시된 성공 결과만으로 판정하지 않음. |
+| `go vet ./...` | 기준 코드 통과. |
+| `python3 tools/check_artifacts.py` | SQL 32개 체크섬, 생성 재현성, 문서 링크 통과. |
+| `go test ./internal/storage/migrations -run '^TestSchema$' -v -count=1` | SQLite 통과. PostgreSQL·MySQL·MariaDB는 전용 DB DSN이 없어 건너뜀. |
+| D01·D02 제거 실험 | 기준 커밋을 `git archive`로 임시 디렉터리에 복사해 D01 세 항목, D02 포트·필드·nil 검사·대역·주입값을 제거한 뒤 `go test -count=1 ./...`, `go vet ./...` 모두 통과. 원래 코드에는 미적용. |
+
+테스트 통과는 운영 어댑터나 실환경 동작까지 검증했다는 뜻이 아니다. D03–D08의 구조 변경은 이 보고서에서 구현하지 않았으므로 위 완료 기준을 후속 변경에서 검증해야 한다.
