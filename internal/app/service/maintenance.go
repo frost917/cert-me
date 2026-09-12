@@ -688,13 +688,12 @@ func (s *MaintenanceService) FinalizeRestore(ctx context.Context, meta contract.
 	if err != nil {
 		return contract.MaintenanceResult{}, err
 	}
-	blocking, err := s.finalizeRestoreRun(ctx, meta, runID, plan)
+	outcome, err := s.finalizeRestoreRun(ctx, meta, runID, plan)
 	if err != nil {
 		return contract.MaintenanceResult{}, err
 	}
-	completed := len(blocking) == 0
 	phase := contract.MaintenancePhaseFinished
-	if !completed {
+	if !outcome.Completed {
 		phase = contract.MaintenancePhaseBlocked
 	}
 
@@ -702,8 +701,8 @@ func (s *MaintenanceService) FinalizeRestore(ctx context.Context, meta contract.
 		RunID:         runID,
 		Kind:          contract.MaintenanceKindRestoreFinalize,
 		Phase:         phase,
-		Completed:     completed,
-		BlockingCAIDs: blocking,
+		Completed:     outcome.Completed,
+		BlockingCAIDs: outcome.BlockingCAIDs,
 	}, nil
 }
 
@@ -964,6 +963,11 @@ type restoreCRLPlan struct {
 	Requirements  []port.MaintenanceCRLRequirement
 }
 
+type restoreFinalizeOutcome struct {
+	BlockingCAIDs []domain.AuthorityID
+	Completed     bool
+}
+
 // restoreRunDetails is deliberately public-fact-only JSON. It is persisted in
 // maintenance_runs.details_json so a restart can explain why admission stayed
 // closed without consulting a jobs payload or retaining any secret input.
@@ -1077,8 +1081,8 @@ func crlRequirementSatisfied(state domain.CRLState, requirement port.Maintenance
 // CRL worker demand when a usable key exists, and updates the dedicated run in
 // one transaction. Jobs are used only for the publication work; they never
 // carry the restore execution state.
-func (s *MaintenanceService) finalizeRestoreRun(ctx context.Context, meta contract.MutationMeta, runID domain.JobID, plan restoreCRLPlan) ([]domain.AuthorityID, error) {
-	var blocking []domain.AuthorityID
+func (s *MaintenanceService) finalizeRestoreRun(ctx context.Context, meta contract.MutationMeta, runID domain.JobID, plan restoreCRLPlan) (restoreFinalizeOutcome, error) {
+	var outcome restoreFinalizeOutcome
 	err := s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
 		run, err := tx.Maintenance().GetRunForUpdate(ctx, runID)
 		if err != nil {
@@ -1089,6 +1093,8 @@ func (s *MaintenanceService) finalizeRestoreRun(ctx context.Context, meta contra
 				"the run id belongs to a different maintenance operation")
 		}
 
+		allRequirementsSatisfied := true
+		missingKey := false
 		for _, prepared := range plan.Requirements {
 			requirement := prepared
 			state, err := tx.CRLs().GetStateForUpdate(ctx, requirement.CAKeyGenerationID)
@@ -1122,17 +1128,23 @@ func (s *MaintenanceService) finalizeRestoreRun(ctx context.Context, meta contra
 				return storeError(err, "maintenance_restore_authority_lock_failed", "could not read the restore authority")
 			}
 			if requirement.SatisfiedCRLID == "" {
+				// A queued demand is not completion evidence. The worker must
+				// publish a CRL and a later restore-finalize attempt must record
+				// its document id before this run may finish or reopen service.
+				allRequirementsSatisfied = false
+				outcome.BlockingCAIDs = append(outcome.BlockingCAIDs, authority.ID())
 				if authority.KeyAvailable() {
 					if err := recordCRLDemand(ctx, tx, requirement.CAKeyGenerationID, requirement.MinimumGeneration); err != nil {
 						return storeError(err, "maintenance_restore_crl_demand_failed", "could not record the CRL resumption demand")
 					}
-				} else if !authority.IsArchived() {
-					blocking = append(blocking, authority.ID())
+				} else {
+					missingKey = true
 				}
 			}
 		}
 
-		completed := len(blocking) == 0
+		completed := allRequirementsSatisfied
+		outcome.Completed = completed
 		now := s.deps.Clock.Now()
 		run.UpdatedAt = now
 		run.Phase = contract.MaintenancePhaseFinished
@@ -1141,11 +1153,14 @@ func (s *MaintenanceService) finalizeRestoreRun(ctx context.Context, meta contra
 		if !completed {
 			run.Phase = contract.MaintenancePhaseBlocked
 			run.CompletedAt = domain.Instant{}
-			run.ErrorCode = "maintenance_restore_blocked_ca_key_missing"
+			run.ErrorCode = "maintenance_restore_crl_pending"
+			if missingKey {
+				run.ErrorCode = "maintenance_restore_blocked_ca_key_missing"
+			}
 		}
 		runDetails, err := json.Marshal(restoreRunDetails{
 			SchemaVersion:        1,
-			BlockingAuthorityIDs: append([]domain.AuthorityID(nil), blocking...),
+			BlockingAuthorityIDs: append([]domain.AuthorityID(nil), outcome.BlockingCAIDs...),
 			CRLRequirementCount:  len(plan.Requirements),
 		})
 		if err != nil {
@@ -1168,7 +1183,7 @@ func (s *MaintenanceService) finalizeRestoreRun(ctx context.Context, meta contra
 			Result:     contract.AuditResultSuccess,
 			Details: contract.AuditDetails{SchemaVersion: 1, Fields: map[string]string{
 				"completed":         fmt.Sprintf("%t", completed),
-				"blocking_count":    fmt.Sprintf("%d", len(blocking)),
+				"blocking_count":    fmt.Sprintf("%d", len(outcome.BlockingCAIDs)),
 				"requirement_count": fmt.Sprintf("%d", len(plan.Requirements)),
 			}},
 		}
@@ -1181,7 +1196,7 @@ func (s *MaintenanceService) finalizeRestoreRun(ctx context.Context, meta contra
 		s.deps.RuntimeGate.FailClosed("maintenance_restore_run_commit_unknown")
 	}
 	if err != nil {
-		return nil, err
+		return restoreFinalizeOutcome{}, err
 	}
-	return blocking, nil
+	return outcome, nil
 }

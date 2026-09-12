@@ -176,8 +176,9 @@ func TestMaintenanceRestoreCleansUnexpiredPendingDeliveryAndAllPublicGrants(t *t
 	}
 }
 
-func TestMaintenanceFinalizeRestoreUsesDedicatedRunStore(t *testing.T) {
+func TestMaintenanceFinalizeRestoreKeepsPendingCRLInDedicatedRunStore(t *testing.T) {
 	fx := seedPrivateFixture(t, distTestNow().Add(domain.NewDuration(time.Hour)), domain.DeliveryStatePending)
+	seedRestoreOperationalAuthority(t, fx)
 	seedCRLStateFor(t, fx.store, fx.issuerID)
 	runID, err := domain.ParseJobID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 	if err != nil {
@@ -192,8 +193,11 @@ func TestMaintenanceFinalizeRestoreUsesDedicatedRunStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("finalize restore: %v", err)
 	}
-	if !result.Completed || result.Phase != contract.MaintenancePhaseFinished {
-		t.Fatalf("result = %+v, want completed maintenance run", result)
+	if result.Completed || result.Phase != contract.MaintenancePhaseBlocked {
+		t.Fatalf("result = %+v, want blocked run pending CRL publication", result)
+	}
+	if len(result.BlockingCAIDs) != 1 || result.BlockingCAIDs[0] != fx.managementAuthorityID {
+		t.Fatalf("blocking CA ids = %v, want [%s]", result.BlockingCAIDs, fx.managementAuthorityID)
 	}
 	if n := jobCount(t, fx.store); n != 1 {
 		t.Fatalf("jobs = %d, want only the CRL publication demand, not restore state", n)
@@ -203,14 +207,118 @@ func TestMaintenanceFinalizeRestoreUsesDedicatedRunStore(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if run.Kind != contract.MaintenanceKindRestoreFinalize || run.Phase != contract.MaintenancePhaseFinished {
+		if run.Kind != contract.MaintenanceKindRestoreFinalize || run.Phase != contract.MaintenancePhaseBlocked {
 			return fmt.Errorf("stored run = %+v", run)
 		}
-		if run.CompletedAt.IsZero() {
-			return fmt.Errorf("completed_at is empty")
+		if !run.CompletedAt.IsZero() {
+			return fmt.Errorf("completed_at = %v, want zero while CRL is pending", run.CompletedAt)
+		}
+		if run.ErrorCode != "maintenance_restore_crl_pending" {
+			return fmt.Errorf("error_code = %q, want maintenance_restore_crl_pending", run.ErrorCode)
+		}
+		requirements, err := tx.Maintenance().ListCRLRequirements(context.Background(), runID)
+		if err != nil {
+			return err
+		}
+		if len(requirements) != 1 || requirements[0].SatisfiedCRLID != "" {
+			return fmt.Errorf("crl requirements = %+v, want one unsatisfied requirement", requirements)
 		}
 		return nil
 	}); err != nil {
 		t.Fatalf("verify maintenance run: %v", err)
+	}
+}
+
+func TestMaintenanceFinalizeRestoreFinishesAfterRequiredCRLIsPublished(t *testing.T) {
+	fx := seedPrivateFixture(t, distTestNow().Add(domain.NewDuration(time.Hour)), domain.DeliveryStatePending)
+	seedRestoreOperationalAuthority(t, fx)
+	seedCRLStateFor(t, fx.store, fx.issuerID)
+	runID, err := domain.ParseJobID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+	if err != nil {
+		t.Fatalf("run id: %v", err)
+	}
+	meta := contract.MutationMeta{RequestMeta: contract.RequestMeta{
+		Principal: mustInternalPrincipal(t, contract.InternalOperationRestoreFinalize),
+	}}
+	svc := newMaintenanceTestService(t, fx.store)
+	first, err := svc.FinalizeRestore(context.Background(), meta, contract.MaintenanceFinalizeRestoreCommand{
+		Options: contract.MaintenanceFinalizeRestoreOptions{RunID: runID, InvalidateAllSessions: true, DeletePendingKeys: true},
+	})
+	if err != nil {
+		t.Fatalf("first restore finalize: %v", err)
+	}
+	if first.Completed || first.Phase != contract.MaintenancePhaseBlocked {
+		t.Fatalf("first result = %+v, want blocked while CRL demand is pending", first)
+	}
+
+	publishCRLDocument(t, fx.store, &seqIDs{}, fx.issuerID, 1,
+		testNow(), testNow().Add(domain.NewDuration(24*time.Hour)), testNow().Add(domain.NewDuration(12*time.Hour)))
+
+	second, err := svc.FinalizeRestore(context.Background(), meta, contract.MaintenanceFinalizeRestoreCommand{
+		Options: contract.MaintenanceFinalizeRestoreOptions{RunID: runID, InvalidateAllSessions: true, DeletePendingKeys: true},
+	})
+	if err != nil {
+		t.Fatalf("second restore finalize: %v", err)
+	}
+	if !second.Completed || second.Phase != contract.MaintenancePhaseFinished {
+		t.Fatalf("second result = %+v, want completed maintenance run", second)
+	}
+	if len(second.BlockingCAIDs) != 0 {
+		t.Fatalf("blocking CA ids = %v, want none after CRL publication", second.BlockingCAIDs)
+	}
+
+	if err := fx.store.Read(context.Background(), func(tx port.TxStores) error {
+		run, err := tx.Maintenance().GetRunForUpdate(context.Background(), runID)
+		if err != nil {
+			return err
+		}
+		if run.Phase != contract.MaintenancePhaseFinished || run.CompletedAt.IsZero() {
+			return fmt.Errorf("stored run = %+v, want finished with completion time", run)
+		}
+		requirements, err := tx.Maintenance().ListCRLRequirements(context.Background(), runID)
+		if err != nil {
+			return err
+		}
+		if len(requirements) != 1 || requirements[0].SatisfiedCRLID == "" {
+			return fmt.Errorf("crl requirements = %+v, want satisfied evidence", requirements)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify completed restore run: %v", err)
+	}
+}
+
+func seedRestoreOperationalAuthority(t *testing.T, fx distFixture) {
+	t.Helper()
+	ctx := context.Background()
+	keyMaterialID := distKeyMaterialID(t, 901)
+	publicKey, err := domain.NewPublicKey(domain.KeyAlgorithmECDSAP256, []byte("restore-operational-ca-public-key"))
+	if err != nil {
+		t.Fatalf("restore public key: %v", err)
+	}
+	authority, err := domain.NewAuthority(domain.AuthorityFacts{
+		ID:                fx.managementAuthorityID,
+		Kind:              domain.AuthorityKindRoot,
+		Name:              "Restore operational root",
+		IssuanceState:     domain.IssuanceStateStopped,
+		KeyGenerationID:   fx.issuerID,
+		KeyAvailable:      true,
+		CertificateWindow: distValidity(t),
+	})
+	if err != nil {
+		t.Fatalf("restore authority: %v", err)
+	}
+	if err := fx.store.Write(ctx, func(tx port.TxStores) error {
+		if err := tx.PKI().InsertKeyMaterial(ctx, port.KeyMaterial{ID: keyMaterialID, PublicKey: publicKey, Origin: "generated"}); err != nil {
+			return err
+		}
+		if err := tx.PKI().InsertKeyGeneration(ctx, port.CAKeyGeneration{
+			ID: fx.issuerID, AuthorityID: fx.managementAuthorityID, KeyMaterialID: keyMaterialID, GenerationNo: 1,
+		}); err != nil {
+			return err
+		}
+		return tx.PKI().InsertAuthority(ctx, authority)
+	}); err != nil {
+		t.Fatalf("seed restore operational authority: %v", err)
 	}
 }
