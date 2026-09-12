@@ -54,6 +54,11 @@ func cloneJob(j port.Job) port.Job {
 	return j
 }
 
+func cloneMaintenanceRun(r port.MaintenanceRun) port.MaintenanceRun {
+	r.DetailsJSON = cloneBytes(r.DetailsJSON)
+	return r
+}
+
 // cloneRevision copies revision's two JSON snapshots.
 func cloneRevision(r port.RevocationRevision) port.RevocationRevision {
 	r.PreviousValuesJSON = cloneBytes(r.PreviousValuesJSON)

@@ -175,3 +175,42 @@ func TestMaintenanceRestoreCleansUnexpiredPendingDeliveryAndAllPublicGrants(t *t
 		t.Fatalf("revocations = %d, want 1", n)
 	}
 }
+
+func TestMaintenanceFinalizeRestoreUsesDedicatedRunStore(t *testing.T) {
+	fx := seedPrivateFixture(t, distTestNow().Add(domain.NewDuration(time.Hour)), domain.DeliveryStatePending)
+	seedCRLStateFor(t, fx.store, fx.issuerID)
+	runID, err := domain.ParseJobID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+	if err != nil {
+		t.Fatalf("run id: %v", err)
+	}
+	meta := contract.MutationMeta{RequestMeta: contract.RequestMeta{
+		Principal: mustInternalPrincipal(t, contract.InternalOperationRestoreFinalize),
+	}}
+	result, err := newMaintenanceTestService(t, fx.store).FinalizeRestore(context.Background(), meta, contract.MaintenanceFinalizeRestoreCommand{
+		Options: contract.MaintenanceFinalizeRestoreOptions{RunID: runID, DeletePendingKeys: true},
+	})
+	if err != nil {
+		t.Fatalf("finalize restore: %v", err)
+	}
+	if !result.Completed || result.Phase != contract.MaintenancePhaseFinished {
+		t.Fatalf("result = %+v, want completed maintenance run", result)
+	}
+	if n := jobCount(t, fx.store); n != 1 {
+		t.Fatalf("jobs = %d, want only the CRL publication demand, not restore state", n)
+	}
+	if err := fx.store.Read(context.Background(), func(tx port.TxStores) error {
+		run, err := tx.Maintenance().GetRunForUpdate(context.Background(), runID)
+		if err != nil {
+			return err
+		}
+		if run.Kind != contract.MaintenanceKindRestoreFinalize || run.Phase != contract.MaintenancePhaseFinished {
+			return fmt.Errorf("stored run = %+v", run)
+		}
+		if run.CompletedAt.IsZero() {
+			return fmt.Errorf("completed_at is empty")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify maintenance run: %v", err)
+	}
+}

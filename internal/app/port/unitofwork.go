@@ -54,6 +54,7 @@ type TxStores interface {
 	Requests() RequestRepository
 	Secrets() SecretRepository
 	Jobs() JobRepository
+	Maintenance() MaintenanceRepository
 	Audit() AuditRepository
 	// Imports is not in §4's original table -- it was added by §13's closing
 	// paragraph, which named import batch/takeover storage as a contract

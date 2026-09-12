@@ -23,11 +23,12 @@ type MaintenanceKind string
 const (
 	MaintenanceKindKeyRotation     MaintenanceKind = "key_rotation"
 	MaintenanceKindRestoreFinalize MaintenanceKind = "restore_finalize"
+	MaintenanceKindTLSBootstrap    MaintenanceKind = "tls_bootstrap"
 )
 
 func (k MaintenanceKind) Validate() error {
 	switch k {
-	case MaintenanceKindKeyRotation, MaintenanceKindRestoreFinalize:
+	case MaintenanceKindKeyRotation, MaintenanceKindRestoreFinalize, MaintenanceKindTLSBootstrap:
 		return nil
 	default:
 		return NewAppError(ErrorKindValidation, "maintenance_kind_invalid", "unsupported maintenance kind")

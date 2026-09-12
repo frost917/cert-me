@@ -151,6 +151,9 @@ type state struct {
 	jobs       map[domain.JobID]port.Job
 	jobByDedup map[string]domain.JobID
 
+	maintenanceRuns            map[domain.JobID]port.MaintenanceRun
+	maintenanceCRLRequirements map[maintenanceRequirementKey]port.MaintenanceCRLRequirement
+
 	auditEvents []auditRow
 
 	// importBatches/takeovers back port.ImportRepository (added for the B02
@@ -174,42 +177,49 @@ type auditRow struct {
 	scopes []domain.AuthorityID
 }
 
+type maintenanceRequirementKey struct {
+	runID  domain.JobID
+	issuer domain.CAKeyGenerationID
+}
+
 func newState() *state {
 	return &state{
-		accounts:            map[domain.AccountID]domain.Account{},
-		sessions:            map[domain.SessionID]domain.SessionState{},
-		sessionsByHash:      map[string]domain.SessionID{},
-		resetTokens:         map[domain.ResetTokenID]domain.AdminResetToken{},
-		resetTokensByHash:   map[string]domain.ResetTokenID{},
-		rateLimits:          map[rateLimitKey]port.RateLimitRecord{},
-		keyMaterials:        map[domain.KeyMaterialID]port.KeyMaterial{},
-		keyMaterialsBySPKI:  map[string]domain.KeyMaterialID{},
-		caKeyGenerations:    map[domain.CAKeyGenerationID]port.CAKeyGeneration{},
-		leafCertRecords:     map[domain.CertificateID]port.LeafCertificateRecord{},
-		caCertRecords:       map[domain.CertificateID]port.CACertificateRecord{},
-		authorities:         map[domain.AuthorityID]domain.Authority{},
-		certificates:        map[domain.CertificateID]domain.Certificate{},
-		certificatesByDER:   map[string]domain.CertificateID{},
-		series:              map[domain.SeriesID]domain.LeafSeries{},
-		leafKeyGenerations:  map[domain.LeafKeyGenerationID]domain.LeafKeyGeneration{},
-		deliveries:          map[domain.DeliveryID]domain.Delivery{},
-		grants:              map[domain.GrantID]domain.DownloadGrant{},
-		grantsByHash:        map[string]domain.GrantID{},
-		revocations:         map[revocationKey]domain.Revocation{},
-		revocationRevisions: map[revisionKey]port.RevocationRevision{},
-		crlStates:           map[domain.CAKeyGenerationID]domain.CRLState{},
-		crlDocuments:        map[domain.CRLDocumentID]port.CRLDocument{},
-		transitions:         map[domain.TransitionID]domain.Transition{},
-		impacts:             map[impactKey]domain.TransitionImpact{},
-		tlsVersions:         map[domain.TLSVersionID]domain.TLSVersion{},
-		tlsChanges:          map[domain.TLSVersionID]domain.TLSChange{},
-		requestResults:      map[port.OperationRequestKey]port.OperationRequestResult{},
-		secrets:             map[secretKey]domain.EncryptedSecret{},
-		jobs:                map[domain.JobID]port.Job{},
-		jobByDedup:          map[string]domain.JobID{},
-		importBatches:       map[domain.ImportBatchID]port.ImportBatch{},
-		takeovers:           map[domain.TakeoverID]port.Takeover{},
-		pendingTakeover:     map[domain.CAKeyGenerationID]domain.TakeoverID{},
+		accounts:                   map[domain.AccountID]domain.Account{},
+		sessions:                   map[domain.SessionID]domain.SessionState{},
+		sessionsByHash:             map[string]domain.SessionID{},
+		resetTokens:                map[domain.ResetTokenID]domain.AdminResetToken{},
+		resetTokensByHash:          map[string]domain.ResetTokenID{},
+		rateLimits:                 map[rateLimitKey]port.RateLimitRecord{},
+		keyMaterials:               map[domain.KeyMaterialID]port.KeyMaterial{},
+		keyMaterialsBySPKI:         map[string]domain.KeyMaterialID{},
+		caKeyGenerations:           map[domain.CAKeyGenerationID]port.CAKeyGeneration{},
+		leafCertRecords:            map[domain.CertificateID]port.LeafCertificateRecord{},
+		caCertRecords:              map[domain.CertificateID]port.CACertificateRecord{},
+		authorities:                map[domain.AuthorityID]domain.Authority{},
+		certificates:               map[domain.CertificateID]domain.Certificate{},
+		certificatesByDER:          map[string]domain.CertificateID{},
+		series:                     map[domain.SeriesID]domain.LeafSeries{},
+		leafKeyGenerations:         map[domain.LeafKeyGenerationID]domain.LeafKeyGeneration{},
+		deliveries:                 map[domain.DeliveryID]domain.Delivery{},
+		grants:                     map[domain.GrantID]domain.DownloadGrant{},
+		grantsByHash:               map[string]domain.GrantID{},
+		revocations:                map[revocationKey]domain.Revocation{},
+		revocationRevisions:        map[revisionKey]port.RevocationRevision{},
+		crlStates:                  map[domain.CAKeyGenerationID]domain.CRLState{},
+		crlDocuments:               map[domain.CRLDocumentID]port.CRLDocument{},
+		transitions:                map[domain.TransitionID]domain.Transition{},
+		impacts:                    map[impactKey]domain.TransitionImpact{},
+		tlsVersions:                map[domain.TLSVersionID]domain.TLSVersion{},
+		tlsChanges:                 map[domain.TLSVersionID]domain.TLSChange{},
+		requestResults:             map[port.OperationRequestKey]port.OperationRequestResult{},
+		secrets:                    map[secretKey]domain.EncryptedSecret{},
+		jobs:                       map[domain.JobID]port.Job{},
+		jobByDedup:                 map[string]domain.JobID{},
+		maintenanceRuns:            map[domain.JobID]port.MaintenanceRun{},
+		maintenanceCRLRequirements: map[maintenanceRequirementKey]port.MaintenanceCRLRequirement{},
+		importBatches:              map[domain.ImportBatchID]port.ImportBatch{},
+		takeovers:                  map[domain.TakeoverID]port.Takeover{},
+		pendingTakeover:            map[domain.CAKeyGenerationID]domain.TakeoverID{},
 	}
 }
 
@@ -223,48 +233,50 @@ func newState() *state {
 // a deep walk here.
 func (s *state) clone() *state {
 	n := &state{
-		accounts:                make(map[domain.AccountID]domain.Account, len(s.accounts)),
-		sessions:                make(map[domain.SessionID]domain.SessionState, len(s.sessions)),
-		sessionsByHash:          make(map[string]domain.SessionID, len(s.sessionsByHash)),
-		resetTokens:             make(map[domain.ResetTokenID]domain.AdminResetToken, len(s.resetTokens)),
-		resetTokensByHash:       make(map[string]domain.ResetTokenID, len(s.resetTokensByHash)),
-		rateLimits:              make(map[rateLimitKey]port.RateLimitRecord, len(s.rateLimits)),
-		installationSet:         s.installationSet,
-		installation:            s.installation,
-		settingsSet:             s.settingsSet,
-		settings:                s.settings,
-		keyMaterials:            make(map[domain.KeyMaterialID]port.KeyMaterial, len(s.keyMaterials)),
-		keyMaterialsBySPKI:      make(map[string]domain.KeyMaterialID, len(s.keyMaterialsBySPKI)),
-		caKeyGenerations:        make(map[domain.CAKeyGenerationID]port.CAKeyGeneration, len(s.caKeyGenerations)),
-		leafCertRecords:         make(map[domain.CertificateID]port.LeafCertificateRecord, len(s.leafCertRecords)),
-		caCertRecords:           make(map[domain.CertificateID]port.CACertificateRecord, len(s.caCertRecords)),
-		authorities:             make(map[domain.AuthorityID]domain.Authority, len(s.authorities)),
-		certificates:            make(map[domain.CertificateID]domain.Certificate, len(s.certificates)),
-		certificatesByDER:       make(map[string]domain.CertificateID, len(s.certificatesByDER)),
-		series:                  make(map[domain.SeriesID]domain.LeafSeries, len(s.series)),
-		leafKeyGenerations:      make(map[domain.LeafKeyGenerationID]domain.LeafKeyGeneration, len(s.leafKeyGenerations)),
-		deliveries:              make(map[domain.DeliveryID]domain.Delivery, len(s.deliveries)),
-		grants:                  make(map[domain.GrantID]domain.DownloadGrant, len(s.grants)),
-		grantsByHash:            make(map[string]domain.GrantID, len(s.grantsByHash)),
-		revocations:             make(map[revocationKey]domain.Revocation, len(s.revocations)),
-		revocationRevisions:     make(map[revisionKey]port.RevocationRevision, len(s.revocationRevisions)),
-		crlStates:               make(map[domain.CAKeyGenerationID]domain.CRLState, len(s.crlStates)),
-		crlDocuments:            make(map[domain.CRLDocumentID]port.CRLDocument, len(s.crlDocuments)),
-		transitions:             make(map[domain.TransitionID]domain.Transition, len(s.transitions)),
-		impacts:                 make(map[impactKey]domain.TransitionImpact, len(s.impacts)),
-		deploymentConfirmations: append([]domain.DeploymentConfirmation(nil), s.deploymentConfirmations...),
-		tlsVersions:             make(map[domain.TLSVersionID]domain.TLSVersion, len(s.tlsVersions)),
-		tlsChanges:              make(map[domain.TLSVersionID]domain.TLSChange, len(s.tlsChanges)),
-		requestResults:          make(map[port.OperationRequestKey]port.OperationRequestResult, len(s.requestResults)),
-		secrets:                 make(map[secretKey]domain.EncryptedSecret, len(s.secrets)),
-		verifierSet:             s.verifierSet,
-		verifier:                s.verifier,
-		jobs:                    make(map[domain.JobID]port.Job, len(s.jobs)),
-		jobByDedup:              make(map[string]domain.JobID, len(s.jobByDedup)),
-		auditEvents:             append([]auditRow(nil), s.auditEvents...),
-		importBatches:           make(map[domain.ImportBatchID]port.ImportBatch, len(s.importBatches)),
-		takeovers:               make(map[domain.TakeoverID]port.Takeover, len(s.takeovers)),
-		pendingTakeover:         make(map[domain.CAKeyGenerationID]domain.TakeoverID, len(s.pendingTakeover)),
+		accounts:                   make(map[domain.AccountID]domain.Account, len(s.accounts)),
+		sessions:                   make(map[domain.SessionID]domain.SessionState, len(s.sessions)),
+		sessionsByHash:             make(map[string]domain.SessionID, len(s.sessionsByHash)),
+		resetTokens:                make(map[domain.ResetTokenID]domain.AdminResetToken, len(s.resetTokens)),
+		resetTokensByHash:          make(map[string]domain.ResetTokenID, len(s.resetTokensByHash)),
+		rateLimits:                 make(map[rateLimitKey]port.RateLimitRecord, len(s.rateLimits)),
+		installationSet:            s.installationSet,
+		installation:               s.installation,
+		settingsSet:                s.settingsSet,
+		settings:                   s.settings,
+		keyMaterials:               make(map[domain.KeyMaterialID]port.KeyMaterial, len(s.keyMaterials)),
+		keyMaterialsBySPKI:         make(map[string]domain.KeyMaterialID, len(s.keyMaterialsBySPKI)),
+		caKeyGenerations:           make(map[domain.CAKeyGenerationID]port.CAKeyGeneration, len(s.caKeyGenerations)),
+		leafCertRecords:            make(map[domain.CertificateID]port.LeafCertificateRecord, len(s.leafCertRecords)),
+		caCertRecords:              make(map[domain.CertificateID]port.CACertificateRecord, len(s.caCertRecords)),
+		authorities:                make(map[domain.AuthorityID]domain.Authority, len(s.authorities)),
+		certificates:               make(map[domain.CertificateID]domain.Certificate, len(s.certificates)),
+		certificatesByDER:          make(map[string]domain.CertificateID, len(s.certificatesByDER)),
+		series:                     make(map[domain.SeriesID]domain.LeafSeries, len(s.series)),
+		leafKeyGenerations:         make(map[domain.LeafKeyGenerationID]domain.LeafKeyGeneration, len(s.leafKeyGenerations)),
+		deliveries:                 make(map[domain.DeliveryID]domain.Delivery, len(s.deliveries)),
+		grants:                     make(map[domain.GrantID]domain.DownloadGrant, len(s.grants)),
+		grantsByHash:               make(map[string]domain.GrantID, len(s.grantsByHash)),
+		revocations:                make(map[revocationKey]domain.Revocation, len(s.revocations)),
+		revocationRevisions:        make(map[revisionKey]port.RevocationRevision, len(s.revocationRevisions)),
+		crlStates:                  make(map[domain.CAKeyGenerationID]domain.CRLState, len(s.crlStates)),
+		crlDocuments:               make(map[domain.CRLDocumentID]port.CRLDocument, len(s.crlDocuments)),
+		transitions:                make(map[domain.TransitionID]domain.Transition, len(s.transitions)),
+		impacts:                    make(map[impactKey]domain.TransitionImpact, len(s.impacts)),
+		deploymentConfirmations:    append([]domain.DeploymentConfirmation(nil), s.deploymentConfirmations...),
+		tlsVersions:                make(map[domain.TLSVersionID]domain.TLSVersion, len(s.tlsVersions)),
+		tlsChanges:                 make(map[domain.TLSVersionID]domain.TLSChange, len(s.tlsChanges)),
+		requestResults:             make(map[port.OperationRequestKey]port.OperationRequestResult, len(s.requestResults)),
+		secrets:                    make(map[secretKey]domain.EncryptedSecret, len(s.secrets)),
+		verifierSet:                s.verifierSet,
+		verifier:                   s.verifier,
+		jobs:                       make(map[domain.JobID]port.Job, len(s.jobs)),
+		jobByDedup:                 make(map[string]domain.JobID, len(s.jobByDedup)),
+		maintenanceRuns:            make(map[domain.JobID]port.MaintenanceRun, len(s.maintenanceRuns)),
+		maintenanceCRLRequirements: make(map[maintenanceRequirementKey]port.MaintenanceCRLRequirement, len(s.maintenanceCRLRequirements)),
+		auditEvents:                append([]auditRow(nil), s.auditEvents...),
+		importBatches:              make(map[domain.ImportBatchID]port.ImportBatch, len(s.importBatches)),
+		takeovers:                  make(map[domain.TakeoverID]port.Takeover, len(s.takeovers)),
+		pendingTakeover:            make(map[domain.CAKeyGenerationID]domain.TakeoverID, len(s.pendingTakeover)),
 	}
 	for k, v := range s.accounts {
 		n.accounts[k] = v
@@ -358,6 +370,12 @@ func (s *state) clone() *state {
 	}
 	for k, v := range s.jobByDedup {
 		n.jobByDedup[k] = v
+	}
+	for k, v := range s.maintenanceRuns {
+		n.maintenanceRuns[k] = cloneMaintenanceRun(v)
+	}
+	for k, v := range s.maintenanceCRLRequirements {
+		n.maintenanceCRLRequirements[k] = v
 	}
 	for k, v := range s.importBatches {
 		n.importBatches[k] = v

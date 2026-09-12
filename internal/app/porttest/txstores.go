@@ -23,6 +23,7 @@ func (t *txStores) TLS() port.TLSRepository                   { return tlsRepo{t
 func (t *txStores) Requests() port.RequestRepository          { return requestRepo{t.s} }
 func (t *txStores) Secrets() port.SecretRepository            { return secretRepo{t.s} }
 func (t *txStores) Jobs() port.JobRepository                  { return jobRepo{t.s} }
+func (t *txStores) Maintenance() port.MaintenanceRepository   { return maintenanceRepo{t.s} }
 func (t *txStores) Audit() port.AuditRepository               { return auditRepo{t.s} }
 func (t *txStores) Imports() port.ImportRepository            { return importRepo{t.s} }
 func (t *txStores) Queries() port.QueryRepository             { return queryRepo{t.s} }

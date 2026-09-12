@@ -28,6 +28,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -661,23 +662,14 @@ func (s *MaintenanceService) PruneAudit(ctx context.Context, meta contract.Mutat
 //
 // Transaction boundary: UNLIKE Rotate, this is deliberately NOT one single
 // transaction. §9's own wording is "세션/토큰 무효화·대기 키 삭제/폐기와
-// 필요한 CRL 작업을 먼저 커밋하고 영속 복구 단계로 추적한다" -- "commit...
-// FIRST, then track [an ongoing] recovery phase" -- which already reads as
-// multiple commits over time, not one. Concretely this method is: a
-// preparation existence check for the run (no lock needed -- nothing else
-// ever deletes a job row), one small Write for session invalidation, a
-// batched per-row sweep of independent Writes for pending-key deletion
-// (mirroring ExpireDeliveries/RecoverTransfers above -- and reusing their
-// exact per-row helpers -- for the same §9 "각 수령 실패 변경은 독립
-// 트랜잭션으로 처리한다" reason: one unresolvable delivery must not strand
-// the rest), a read-only pass to determine BlockingCAIDs, and a final Write
-// that records the run's outcome on its job row. Every step here is safe to
-// repeat: DeliveryRepository.Delete/Fail/Invalidate are idempotent or
-// state-checked, DeleteAllSessions on an already-empty session set is a
-// no-op, and BlockingCAIDs is recomputed fresh from current state every
-// call rather than cached -- so calling this twice with the same RunID
-// (a lease retry, an operator re-running the CLI after fixing a missing CA
-// key) is safe and converges rather than double-applying anything (U15).
+// 필요한 CRL 작업을 먼저 커밋하고 영속 복구 단계로 추적한다" -- the
+// cleanup commits first and the durable maintenance run is updated after each
+// resumable stage. The run itself is stored in maintenance_runs, never jobs:
+// jobs remain the worker queue, while this row preserves the restore phase and
+// its per-CA CRL evidence. Every cleanup step is safe to repeat: delivery
+// transitions are state-checked, secret/grant deletion is idempotent, session
+// invalidation on an empty set is a no-op, and the CRL plan is recomputed from
+// current state before its final locked write (U15).
 func (s *MaintenanceService) FinalizeRestore(ctx context.Context, meta contract.MutationMeta, cmd contract.MaintenanceFinalizeRestoreCommand) (contract.MaintenanceResult, error) {
 	if err := cmd.Validate(); err != nil {
 		return contract.MaintenanceResult{}, err
@@ -687,25 +679,8 @@ func (s *MaintenanceService) FinalizeRestore(ctx context.Context, meta contract.
 	}
 	runID := cmd.Options.RunID
 
-	// The run must already be tracked as a job row. JobRepository's only
-	// row-creating method is UpsertDemand (internal/app/port/jobs.go),
-	// which mints its OWN id from a dedup key and cannot be handed a
-	// caller-chosen RunID -- so FinalizeRestore cannot be the thing that
-	// first creates this row. Whatever starts restore mode (outside the
-	// app layer entirely, per §3 "runtime이 오프라인 허가 또는 제한된 복구
-	// 실행 경로로 호출") must have already recorded RunID before calling
-	// this. No lock is taken for this existence check: nothing in this
-	// package ever deletes a job row, so there is nothing a concurrent
-	// writer could remove between this check and the writes below.
-	if err := s.deps.ReadStore.Read(ctx, func(tx port.TxStores) error {
-		_, err := tx.Jobs().GetForUpdate(ctx, runID)
-		return err
-	}); err != nil {
-		if errors.Is(err, port.ErrNotFound) {
-			return contract.MaintenanceResult{}, contract.NewAppError(contract.ErrorKindValidation, "maintenance_restore_run_not_found",
-				"no restore run is tracked under this run id").WithField("run_id", string(runID))
-		}
-		return contract.MaintenanceResult{}, storeError(err, "maintenance_restore_run_read_failed", "could not read the restore run")
+	if err := s.startRestoreRun(ctx, runID); err != nil {
+		return contract.MaintenanceResult{}, err
 	}
 
 	if cmd.Options.InvalidateAllSessions {
@@ -720,7 +695,11 @@ func (s *MaintenanceService) FinalizeRestore(ctx context.Context, meta contract.
 		}
 	}
 
-	blocking, err := s.blockingCAsNeedingCRLResumption(ctx)
+	plan, err := s.restoreCRLPlan(ctx, runID)
+	if err != nil {
+		return contract.MaintenanceResult{}, err
+	}
+	blocking, err := s.finalizeRestoreRun(ctx, meta, runID, plan)
 	if err != nil {
 		return contract.MaintenanceResult{}, err
 	}
@@ -730,10 +709,6 @@ func (s *MaintenanceService) FinalizeRestore(ctx context.Context, meta contract.
 		phase = contract.MaintenancePhaseBlocked
 	}
 
-	if err := s.finalizeRestoreRun(ctx, meta, runID, completed, blocking); err != nil {
-		return contract.MaintenanceResult{}, err
-	}
-
 	return contract.MaintenanceResult{
 		RunID:         runID,
 		Kind:          contract.MaintenanceKindRestoreFinalize,
@@ -741,6 +716,49 @@ func (s *MaintenanceService) FinalizeRestore(ctx context.Context, meta contract.
 		Completed:     completed,
 		BlockingCAIDs: blocking,
 	}, nil
+}
+
+// startRestoreRun creates or reopens the dedicated maintenance run. A
+// caller-chosen RunID is still accepted for idempotent retries, but the row is
+// maintained by MaintenanceRepository rather than being faked with a Job.
+func (s *MaintenanceService) startRestoreRun(ctx context.Context, runID domain.JobID) error {
+	now := s.deps.Clock.Now()
+	err := s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
+		run, err := tx.Maintenance().GetRunForUpdate(ctx, runID)
+		if errors.Is(err, port.ErrNotFound) {
+			run = port.MaintenanceRun{
+				ID:        runID,
+				CreatedAt: now,
+				UpdatedAt: now,
+				Kind:      contract.MaintenanceKindRestoreFinalize,
+				Phase:     contract.MaintenancePhaseStarted,
+				StartedAt: now,
+			}
+			if err := tx.Maintenance().InsertRun(ctx, run); err != nil {
+				return storeError(err, "maintenance_restore_run_insert_failed", "could not create the restore maintenance run")
+			}
+			return nil
+		}
+		if err != nil {
+			return storeError(err, "maintenance_restore_run_read_failed", "could not read the restore maintenance run")
+		}
+		if run.Kind != contract.MaintenanceKindRestoreFinalize {
+			return contract.NewAppError(contract.ErrorKindConflict, "maintenance_run_kind_conflict",
+				"the run id belongs to a different maintenance operation").WithField("run_id", string(runID))
+		}
+		run.Phase = contract.MaintenancePhaseStarted
+		run.CompletedAt = domain.Instant{}
+		run.ErrorCode = ""
+		run.UpdatedAt = now
+		if err := tx.Maintenance().SaveRun(ctx, run, run.Version); err != nil {
+			return storeError(err, "maintenance_restore_run_reopen_failed", "could not reopen the restore maintenance run")
+		}
+		return nil
+	})
+	if errors.Is(err, port.ErrCommitUnknown) {
+		s.deps.RuntimeGate.FailClosed("maintenance_restore_run_commit_unknown")
+	}
+	return err
 }
 
 // invalidateAllAdminSessions deletes every administrator session row and
@@ -952,142 +970,207 @@ func (s *MaintenanceService) restoreOneDelivery(ctx context.Context, deliveryID 
 	return changed, nil
 }
 
-// blockingCAsNeedingCRLResumption enumerates every stored authority and
-// reports which ones block completing this restore run
-// (docs/architecture.md "필요한 CA 키가 없거나 CRL 게시에 실패하면 복구
-// 미완료로 남기고 일반 서비스를 열지 않는다... 단순 이력 보관용으로 가져온
-// 서명 키 없는 CA 때문에 전체 복구를 차단하지 않는다").
-//
-// It reads through tx.Queries().ListAuthorities/GetCRLStatus (the
-// non-locking QueryRepository side) rather than CRLRepository.
-// GetStateForUpdate: this is a determination pass over potentially every
-// CA in the installation, not a write, and nothing here needs the
-// publication-serialization lock GetStateForUpdate exists for.
-func (s *MaintenanceService) blockingCAsNeedingCRLResumption(ctx context.Context) ([]domain.AuthorityID, error) {
-	var blocking []domain.AuthorityID
-	query := contract.AuthorityListQuery{Page: contract.PageRequest{Limit: 200}}
-	if err := query.Validate(); err != nil {
-		return nil, err
-	}
-	for {
-		var page contract.Page[domain.Authority]
-		if err := s.deps.ReadStore.Read(ctx, func(tx port.TxStores) error {
-			var readErr error
-			page, readErr = tx.Queries().ListAuthorities(ctx, query, port.QueryScope{All: true})
-			return readErr
-		}); err != nil {
-			return nil, storeError(err, "maintenance_restore_authority_list_failed", "could not list authorities")
-		}
-		for _, authority := range page.Items {
-			blocks, err := s.authorityBlocksRestore(ctx, authority)
-			if err != nil {
-				return nil, err
-			}
-			if blocks {
-				blocking = append(blocking, authority.ID())
-			}
-		}
-		if page.NextCursor == nil {
-			return blocking, nil
-		}
-		query.Page.Cursor = *page.NextCursor
-	}
+type restoreCRLPlan struct {
+	BlockingCAIDs []domain.AuthorityID
+	Requirements  []port.MaintenanceCRLRequirement
 }
 
-// authorityBlocksRestore reports whether one authority blocks this restore.
-// An archived authority, one with no CRL activity at all, or one whose
-// published generation already covers its revocation ledger is never
-// blocking. A CA with unpublished revocations AND a usable signing key is
-// not blocking either -- its CRL demand is (re-)recorded so the worker
-// resumes publishing, exactly the "게시 재개가 필요한 운영 CA" case.
-// Blocking is reserved for the one case architecture.md names: unpublished
-// revocations with NO usable key to sign them.
-func (s *MaintenanceService) authorityBlocksRestore(ctx context.Context, authority domain.Authority) (bool, error) {
-	if authority.IsArchived() {
-		return false, nil
-	}
+// restoreRunDetails is deliberately public-fact-only JSON. It is persisted in
+// maintenance_runs.details_json so a restart can explain why admission stayed
+// closed without consulting a jobs payload or retaining any secret input.
+type restoreRunDetails struct {
+	SchemaVersion        int                  `json:"schema_version"`
+	BlockingAuthorityIDs []domain.AuthorityID `json:"blocking_authority_ids"`
+	CRLRequirementCount  int                  `json:"crl_requirement_count"`
+}
 
-	var state domain.CRLState
-	found := false
-	if err := s.deps.ReadStore.Read(ctx, func(tx port.TxStores) error {
-		s2, err := tx.Queries().GetCRLStatus(ctx, authority.KeyGenerationID(), port.QueryScope{All: true})
-		if err != nil {
-			if errors.Is(err, port.ErrNotFound) {
-				return nil
-			}
+// restoreCRLPlan enumerates every operational CA and carries the durable
+// minimum generation/number forward across retries. A requirement already
+// stored for this run is never replaced with a newly computed "next number"
+// after a worker has published it; this is what makes SatisfiedCRLID an
+// observable completion proof rather than a moving target.
+func (s *MaintenanceService) restoreCRLPlan(ctx context.Context, runID domain.JobID) (restoreCRLPlan, error) {
+	var plan restoreCRLPlan
+	err := s.deps.ReadStore.Read(ctx, func(tx port.TxStores) error {
+		existing, err := tx.Maintenance().ListCRLRequirements(ctx, runID)
+		if err != nil && !errors.Is(err, port.ErrNotFound) {
+			return storeError(err, "maintenance_restore_requirements_read_failed", "could not read restore CRL requirements")
+		}
+		existingByIssuer := make(map[domain.CAKeyGenerationID]port.MaintenanceCRLRequirement, len(existing))
+		for _, requirement := range existing {
+			existingByIssuer[requirement.CAKeyGenerationID] = requirement
+		}
+
+		query := contract.AuthorityListQuery{Page: contract.PageRequest{Limit: 200}}
+		if err := query.Validate(); err != nil {
 			return err
 		}
-		state, found = s2, true
-		return nil
-	}); err != nil {
-		return false, storeError(err, "maintenance_restore_crl_status_read_failed", "could not read the authority's CRL state")
-	}
-	if !found {
-		// No CRL activity ever recorded for this CA -- a plain historical
-		// import with nothing to publish, never blocking.
-		return false, nil
-	}
+		for {
+			page, err := tx.Queries().ListAuthorities(ctx, query, port.QueryScope{All: true})
+			if err != nil {
+				return storeError(err, "maintenance_restore_authority_list_failed", "could not list authorities")
+			}
+			for _, authority := range page.Items {
+				if authority.IsArchived() || authority.KeyGenerationID() == "" {
+					continue
+				}
+				state, err := tx.Queries().GetCRLStatus(ctx, authority.KeyGenerationID(), port.QueryScope{All: true})
+				if errors.Is(err, port.ErrNotFound) {
+					// A keyless inventory CA with no CRL state has no
+					// operational publication obligation and must not block restore.
+					continue
+				}
+				if err != nil {
+					return storeError(err, "maintenance_restore_crl_status_read_failed", "could not read the authority's CRL state")
+				}
 
-	backlog := state.RevocationGeneration() > state.PublishedGeneration()
-	if !backlog {
-		return false, nil
-	}
-	if authority.KeyAvailable() {
-		if err := s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
-			return recordCRLDemand(ctx, tx, authority.KeyGenerationID(), state.RevocationGeneration())
-		}); err != nil {
-			return false, storeError(err, "maintenance_restore_crl_demand_failed", "could not record the CRL resumption demand")
+				requirement, hadRequirement := existingByIssuer[authority.KeyGenerationID()]
+				if !hadRequirement {
+					if state.RevocationGeneration() <= state.PublishedGeneration() {
+						continue
+					}
+					requirement = port.MaintenanceCRLRequirement{
+						MaintenanceRunID:  runID,
+						CAKeyGenerationID: authority.KeyGenerationID(),
+						MinimumGeneration: state.RevocationGeneration(),
+						MinimumNumber:     state.MaxReservedNumber().Increment(),
+					}
+				} else if state.RevocationGeneration() > requirement.MinimumGeneration {
+					requirement.MinimumGeneration = state.RevocationGeneration()
+					nextNumber := state.MaxReservedNumber().Increment()
+					if nextNumber.Compare(requirement.MinimumNumber) > 0 {
+						requirement.MinimumNumber = nextNumber
+					}
+				}
+
+				requirement.SatisfiedCRLID = ""
+				if crlRequirementSatisfied(state, requirement) {
+					requirement.SatisfiedCRLID = state.PublishedDocumentID()
+				}
+				plan.Requirements = append(plan.Requirements, requirement)
+				if requirement.SatisfiedCRLID == "" && !authority.KeyAvailable() {
+					plan.BlockingCAIDs = append(plan.BlockingCAIDs, authority.ID())
+				}
+			}
+			if page.NextCursor == nil {
+				break
+			}
+			query.Page.Cursor = *page.NextCursor
 		}
-		return false, nil
+		return nil
+	})
+	if err != nil {
+		return restoreCRLPlan{}, err
 	}
-	// Unpublished revocations with no usable key to sign them for --
-	// architecture.md's blocking case.
-	return true, nil
+	return plan, nil
 }
 
-// finalizeRestoreRun records this run's outcome on its job row and appends
-// the run's own summary audit event. A blocked outcome is stored as
-// JobStateFailed, a terminal state, rather than JobStatePending:
-// JobRepository.ClaimDue (internal/app/port/jobs.go) has no per-kind filter,
-// so a Pending row here would be eligible for whatever generic worker loop
-// claims due jobs, which has no handler for a restore run. Architecture.md's
-// own retry story is an OPERATOR action ("유지보수 CLI에서 키·자료 보완 후
-// 재시도한다"), not an automatic background retry -- the operator reissues
-// FinalizeRestore with the SAME RunID once the missing CA key/material is
-// restored, which re-enters this method and recomputes fresh state (see
-// this method's caller's own transaction-boundary doc comment on why that
-// re-run is safe).
-func (s *MaintenanceService) finalizeRestoreRun(ctx context.Context, meta contract.MutationMeta, runID domain.JobID, completed bool, blocking []domain.AuthorityID) error {
-	return s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
-		job, err := tx.Jobs().GetForUpdate(ctx, runID)
+func crlRequirementSatisfied(state domain.CRLState, requirement port.MaintenanceCRLRequirement) bool {
+	return requirement.MinimumGeneration >= 0 &&
+		!requirement.MinimumNumber.IsZero() &&
+		state.PublishedGeneration() >= requirement.MinimumGeneration &&
+		state.PublishedNumber().Compare(requirement.MinimumNumber) >= 0 &&
+		state.PublishedDocumentID() != ""
+}
+
+// finalizeRestoreRun re-reads each CRL state under its publication lock,
+// records the requirement and satisfaction evidence, requeues an ordinary
+// CRL worker demand when a usable key exists, and updates the dedicated run in
+// one transaction. Jobs are used only for the publication work; they never
+// carry the restore execution state.
+func (s *MaintenanceService) finalizeRestoreRun(ctx context.Context, meta contract.MutationMeta, runID domain.JobID, plan restoreCRLPlan) ([]domain.AuthorityID, error) {
+	var blocking []domain.AuthorityID
+	err := s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
+		run, err := tx.Maintenance().GetRunForUpdate(ctx, runID)
 		if err != nil {
-			return storeError(err, "maintenance_restore_run_read_failed", "could not re-read the restore run")
+			return storeError(err, "maintenance_restore_run_read_failed", "could not re-read the restore maintenance run")
 		}
-		jobVersion := job.Version
-		if completed {
-			job.State = contract.JobStateSucceeded
-			job.LastErrorCode = ""
-		} else {
-			job.State = contract.JobStateFailed
-			job.LastErrorCode = "maintenance_restore_blocked_ca_key_missing"
+		if run.Kind != contract.MaintenanceKindRestoreFinalize {
+			return contract.NewAppError(contract.ErrorKindConflict, "maintenance_run_kind_conflict",
+				"the run id belongs to a different maintenance operation")
 		}
-		if err := tx.Jobs().Save(ctx, job, jobVersion); err != nil {
+
+		for _, prepared := range plan.Requirements {
+			requirement := prepared
+			state, err := tx.CRLs().GetStateForUpdate(ctx, requirement.CAKeyGenerationID)
+			if err != nil {
+				if errors.Is(err, port.ErrNotFound) {
+					continue
+				}
+				return storeError(err, "maintenance_restore_crl_state_lock_failed", "could not lock the restore CRL state")
+			}
+			if state.RevocationGeneration() > requirement.MinimumGeneration {
+				requirement.MinimumGeneration = state.RevocationGeneration()
+				nextNumber := state.MaxReservedNumber().Increment()
+				if nextNumber.Compare(requirement.MinimumNumber) > 0 {
+					requirement.MinimumNumber = nextNumber
+				}
+			}
+			requirement.SatisfiedCRLID = ""
+			if crlRequirementSatisfied(state, requirement) {
+				requirement.SatisfiedCRLID = state.PublishedDocumentID()
+			}
+			if err := tx.Maintenance().UpsertCRLRequirement(ctx, requirement); err != nil {
+				return storeError(err, "maintenance_restore_requirement_save_failed", "could not record the restore CRL requirement")
+			}
+
+			generation, err := tx.PKI().GetCAKeyGeneration(ctx, requirement.CAKeyGenerationID)
+			if err != nil {
+				return storeError(err, "maintenance_restore_ca_generation_read_failed", "could not read the restore CA key generation")
+			}
+			authority, err := tx.PKI().GetIssuerForUpdate(ctx, generation.AuthorityID)
+			if err != nil {
+				return storeError(err, "maintenance_restore_authority_lock_failed", "could not read the restore authority")
+			}
+			if requirement.SatisfiedCRLID == "" {
+				if authority.KeyAvailable() {
+					if err := recordCRLDemand(ctx, tx, requirement.CAKeyGenerationID, requirement.MinimumGeneration); err != nil {
+						return storeError(err, "maintenance_restore_crl_demand_failed", "could not record the CRL resumption demand")
+					}
+				} else if !authority.IsArchived() {
+					blocking = append(blocking, authority.ID())
+				}
+			}
+		}
+
+		completed := len(blocking) == 0
+		now := s.deps.Clock.Now()
+		run.UpdatedAt = now
+		run.Phase = contract.MaintenancePhaseFinished
+		run.CompletedAt = now
+		run.ErrorCode = ""
+		if !completed {
+			run.Phase = contract.MaintenancePhaseBlocked
+			run.CompletedAt = domain.Instant{}
+			run.ErrorCode = "maintenance_restore_blocked_ca_key_missing"
+		}
+		runDetails, err := json.Marshal(restoreRunDetails{
+			SchemaVersion:        1,
+			BlockingAuthorityIDs: append([]domain.AuthorityID(nil), blocking...),
+			CRLRequirementCount:  len(plan.Requirements),
+		})
+		if err != nil {
+			return contract.WrapAppError(contract.ErrorKindValidation, "maintenance_restore_details_encode_failed",
+				"could not encode the restore run details", err)
+		}
+		run.DetailsJSON = runDetails
+		if err := tx.Maintenance().SaveRun(ctx, run, run.Version); err != nil {
 			return storeError(err, "maintenance_restore_run_save_failed", "could not record the restore run outcome")
 		}
 
-		now := s.deps.Clock.Now()
 		event := port.AuditEvent{
 			ID:         s.deps.IDs.NewUUID(),
 			OccurredAt: now,
 			ActorKind:  contract.AuditActorSystem,
 			Action:     "maintenance.finalize_restore",
-			TargetType: "job",
+			TargetType: "maintenance_run",
 			TargetID:   string(runID),
 			ClientIP:   clientIP(meta.RequestMeta),
 			Result:     contract.AuditResultSuccess,
 			Details: contract.AuditDetails{SchemaVersion: 1, Fields: map[string]string{
-				"completed":      fmt.Sprintf("%t", completed),
-				"blocking_count": fmt.Sprintf("%d", len(blocking)),
+				"completed":         fmt.Sprintf("%t", completed),
+				"blocking_count":    fmt.Sprintf("%d", len(blocking)),
+				"requirement_count": fmt.Sprintf("%d", len(plan.Requirements)),
 			}},
 		}
 		if err := tx.Audit().Append(ctx, event, maintenanceScope()); err != nil {
@@ -1095,4 +1178,11 @@ func (s *MaintenanceService) finalizeRestoreRun(ctx context.Context, meta contra
 		}
 		return nil
 	})
+	if errors.Is(err, port.ErrCommitUnknown) {
+		s.deps.RuntimeGate.FailClosed("maintenance_restore_run_commit_unknown")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return blocking, nil
 }
