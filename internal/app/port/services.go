@@ -468,10 +468,11 @@ type ParsedCertificateFacts struct {
 	Validity        domain.ValidityWindow
 	Subject         domain.Subject
 	SANs            []domain.SAN
-	Kind            domain.CertificateKind // from the BasicConstraints CA boolean, not assigned by the parser
-	IssuerSubject   domain.Subject         // the DER's own issuer DN, for the app's own issuer lookup
-	AuthorityKeyID  []byte                 // raw AKI keyIdentifier, nil if the extension is absent
-	SubjectKeyID    []byte                 // raw SKI, nil if the extension is absent
+	Kind            domain.CertificateKind    // from the BasicConstraints CA boolean, not assigned by the parser
+	Profile         domain.CertificateProfile // required for imported Leaf certificates; empty for CA certificates
+	IssuerSubject   domain.Subject            // the DER's own issuer DN, for the app's own issuer lookup
+	AuthorityKeyID  []byte                    // raw AKI keyIdentifier, nil if the extension is absent
+	SubjectKeyID    []byte                    // raw SKI, nil if the extension is absent
 }
 
 // CertificateBundleInput is a raw upload of one or more PEM- or DER-encoded
@@ -598,6 +599,14 @@ type PKIParser interface {
 // (docs/backend-implementation.md §5 "TLS: ... ChainValidator ...").
 type ChainValidator interface {
 	Validate(ctx context.Context, leafDER []byte, chainDER [][]byte, now domain.Instant) error
+}
+
+// CRLVerifier verifies a signed CRL against the DER of the CA certificate
+// the application resolved from stored/bundled relationships. It deliberately
+// accepts public bytes rather than an issuer id so the adapter performs the
+// cryptographic check against the exact certificate selected by the app.
+type CRLVerifier interface {
+	Verify(ctx context.Context, crlDER []byte, issuerCertificateDER []byte) error
 }
 
 // S2 fix (round 1): PreparedTLSConfig used to be a marker interface with an

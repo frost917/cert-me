@@ -418,6 +418,20 @@ func (c CRLState) ReserveNext() (CRLNumber, CRLState) {
 	return next, state
 }
 
+// ObserveImportedNumber advances the local reservation floor to an imported
+// CRL number without treating the external document as the currently
+// published CRL. Future generated documents therefore remain strictly above
+// imported history, while a repeated or numberless import is a no-op.
+func (c CRLState) ObserveImportedNumber(number CRLNumber) (CRLState, bool) {
+	if number.IsZero() || number.Compare(c.maxReservedNumber) <= 0 {
+		return c, false
+	}
+	next := c
+	next.maxReservedNumber = number
+	next.version = c.version.Next()
+	return next, true
+}
+
 // CanPublish reports whether a completed CRL document may become the
 // published one. Both the number and the covered generation must not go
 // backwards, even if completion order is reversed across concurrent CRL

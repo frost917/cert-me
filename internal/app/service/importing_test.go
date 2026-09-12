@@ -10,6 +10,7 @@ import (
 	"cert-me/internal/app/port"
 	"cert-me/internal/app/porttest"
 	"cert-me/internal/domain"
+	"cert-me/internal/secret"
 )
 
 // ---- fakes ----
@@ -21,10 +22,16 @@ import (
 // fakeSigner/fakeKeyEngine avoid real crypto elsewhere in this package.
 type fakePKIParser struct {
 	bundles map[string]port.CertificateBundleFacts
+	crls    map[string]port.ParsedCRLFacts
+	caKeys  map[string]domain.PublicKey
 }
 
 func newFakePKIParser() *fakePKIParser {
-	return &fakePKIParser{bundles: map[string]port.CertificateBundleFacts{}}
+	return &fakePKIParser{
+		bundles: map[string]port.CertificateBundleFacts{},
+		crls:    map[string]port.ParsedCRLFacts{},
+		caKeys:  map[string]domain.PublicKey{},
+	}
 }
 
 // addCert registers facts for data, forcing facts.DER = data so a caller
@@ -35,6 +42,10 @@ func (p *fakePKIParser) addCert(data []byte, facts port.ParsedCertificateFacts) 
 	p.bundles[string(data)] = port.CertificateBundleFacts{Certificates: []port.ParsedCertificateFacts{facts}}
 }
 
+func (p *fakePKIParser) registerChain(data []byte, facts ...port.ParsedCertificateFacts) {
+	p.bundles[string(data)] = port.CertificateBundleFacts{Certificates: facts}
+}
+
 func (p *fakePKIParser) ParseCertificateBundle(_ context.Context, input port.CertificateBundleInput) (port.CertificateBundleFacts, error) {
 	b, ok := p.bundles[string(input.Data)]
 	if !ok {
@@ -43,12 +54,33 @@ func (p *fakePKIParser) ParseCertificateBundle(_ context.Context, input port.Cer
 	return b, nil
 }
 
-func (p *fakePKIParser) ParseCRL(context.Context, port.CRLInput) (port.ParsedCRLFacts, error) {
-	return port.ParsedCRLFacts{}, errors.New("fakePKIParser: ParseCRL not supported")
+func (p *fakePKIParser) addCRL(data []byte, facts port.ParsedCRLFacts) {
+	facts.DER = data
+	p.crls[string(data)] = facts
 }
 
-func (p *fakePKIParser) ParseCAKey(context.Context, port.CAKeyInput) (port.ValidatedCAKeyInput, error) {
-	return port.ValidatedCAKeyInput{}, errors.New("fakePKIParser: ParseCAKey not supported")
+func (p *fakePKIParser) addCAKey(data []byte, publicKey domain.PublicKey) {
+	p.caKeys[string(data)] = publicKey
+}
+
+func (p *fakePKIParser) ParseCRL(_ context.Context, input port.CRLInput) (port.ParsedCRLFacts, error) {
+	crl, ok := p.crls[string(input.Data)]
+	if !ok {
+		return port.ParsedCRLFacts{}, errors.New("fakePKIParser: no CRL registered for this data")
+	}
+	return crl, nil
+}
+
+func (p *fakePKIParser) ParseCAKey(_ context.Context, input port.CAKeyInput) (port.ValidatedCAKeyInput, error) {
+	publicKey, ok := p.caKeys[string(input.Data)]
+	if !ok || !publicKey.Equal(input.ExpectedPublicKey) {
+		return port.ValidatedCAKeyInput{}, errors.New("fakePKIParser: CA key does not match expected public key")
+	}
+	return port.ValidatedCAKeyInput{
+		PrivateKey: secret.FromString("fake-ca-private-key"),
+		Algorithm:  publicKey.Algorithm(),
+		PublicKey:  publicKey,
+	}, nil
 }
 
 func (p *fakePKIParser) ParseInternalTLSKey(context.Context, port.TLSKeyInput) (port.ValidatedTLSKeyInput, error) {
@@ -71,6 +103,18 @@ func (v *fakeChainValidator) Validate(_ context.Context, _ []byte, _ [][]byte, _
 
 var _ port.ChainValidator = (*fakeChainValidator)(nil)
 
+type fakeCRLVerifier struct {
+	calls int
+	fail  error
+}
+
+func (v *fakeCRLVerifier) Verify(_ context.Context, _ []byte, _ []byte) error {
+	v.calls++
+	return v.fail
+}
+
+var _ port.CRLVerifier = (*fakeCRLVerifier)(nil)
+
 // ---- fixture plumbing ----
 
 type importFixture struct {
@@ -78,6 +122,7 @@ type importFixture struct {
 	ids            *seqIDs
 	parser         *fakePKIParser
 	chainValidator *fakeChainValidator
+	crlVerifier    *fakeCRLVerifier
 	keyEngine      *fakeKeyEngine
 	authorizer     *toggleAuthorizer
 	svc            *ImportService
@@ -91,6 +136,7 @@ func newImportFixture(t *testing.T) *importFixture {
 	ids := &seqIDs{}
 	parser := newFakePKIParser()
 	chainValidator := &fakeChainValidator{}
+	crlVerifier := &fakeCRLVerifier{}
 	keyEngine := &fakeKeyEngine{}
 	authorizer := &toggleAuthorizer{allow: true}
 
@@ -104,12 +150,13 @@ func newImportFixture(t *testing.T) *importFixture {
 		},
 		PKIParser:      parser,
 		ChainValidator: chainValidator,
+		CRLVerifier:    crlVerifier,
 		KeyEngine:      keyEngine,
 	})
 	if err != nil {
 		t.Fatalf("new import service: %v", err)
 	}
-	return &importFixture{store: store, ids: ids, parser: parser, chainValidator: chainValidator, keyEngine: keyEngine, authorizer: authorizer, svc: svc}
+	return &importFixture{store: store, ids: ids, parser: parser, chainValidator: chainValidator, crlVerifier: crlVerifier, keyEngine: keyEngine, authorizer: authorizer, svc: svc}
 }
 
 func importMeta(idempotencyKey string) contract.MutationMeta {
@@ -165,6 +212,27 @@ func uploadOneCert(fileName string, data []byte) contract.ImportUploadCommand {
 		},
 	}
 	cmd.Metadata.PreviewManifest = manifestFor(cmd.Files...)
+	return cmd
+}
+
+func importCommand(files []contract.UploadedFile, metadata []contract.ImportFileMetadataInput, hashes map[string]string) contract.ImportUploadCommand {
+	cmd := contract.ImportUploadCommand{
+		Files: files,
+		Metadata: contract.ImportMetadataInput{
+			SchemaVersion: 1,
+			Files:         metadata,
+		},
+	}
+	manifestFiles := make([]contract.ImportManifestFileInput, len(metadata))
+	for i, m := range metadata {
+		manifestFiles[i] = contract.ImportManifestFileInput{
+			FileID:              m.FileName,
+			Kind:                m.Kind,
+			SHA256Hex:           hashes[m.FileName],
+			IssuerCertificateID: m.IssuerCertificateID,
+		}
+	}
+	cmd.Metadata.PreviewManifest = &contract.ImportPreviewManifestInput{SchemaVersion: 1, Files: manifestFiles}
 	return cmd
 }
 
@@ -268,6 +336,340 @@ func TestImportServiceCommitStoresNewRootAuthority(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("read after commit: %v", err)
+	}
+}
+
+func TestImportServiceCommitImportsCAKeyWithOrderIndependentBundle(t *testing.T) {
+	f := newImportFixture(t)
+	rootDER := []byte("root-der-with-key")
+	keyDER := []byte("root-private-key")
+	facts := caFacts(t, "Keyed Root", "keyed-root", "18", testNow().Add(domain.NewDuration(-time.Hour)), testNow().Add(domain.NewDuration(24*365*time.Hour)))
+	f.parser.addCert(rootDER, facts)
+	f.parser.addCAKey(keyDER, facts.PublicKey)
+	cmd := importCommand(
+		[]contract.UploadedFile{{FileName: "ca-key.pem", Data: keyDER}, {FileName: "root.pem", Data: rootDER}},
+		[]contract.ImportFileMetadataInput{{FileName: "ca-key.pem", Kind: contract.ImportFileKindCAKey}, {FileName: "root.pem", Kind: contract.ImportFileKindCertificate}},
+		map[string]string{
+			"ca-key.pem": facts.PublicKey.Fingerprint().Hex(),
+			"root.pem":   domain.NewFingerprint(rootDER).Hex(),
+		},
+	)
+
+	preview, err := f.svc.Preview(context.Background(), importMeta("18181818-1818-4818-8818-181818181818"), cmd)
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	if len(preview.Items) != 2 || preview.Items[0].SHA256 != facts.PublicKey.Fingerprint() {
+		t.Fatalf("preview items = %+v, want key item normalized to the SPKI fingerprint", preview.Items)
+	}
+
+	result, err := f.svc.Commit(context.Background(), importMeta("19191919-1919-4919-8919-191919191919"), cmd)
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if len(result.CertificateIDs) != 1 || len(result.AuthorityIDs) != 1 {
+		t.Fatalf("result = %+v, want one imported CA and authority", result)
+	}
+	if f.keyEngine.importCalls != 1 {
+		t.Fatalf("ImportCA calls = %d, want 1", f.keyEngine.importCalls)
+	}
+
+	if err := f.store.Write(context.Background(), func(tx port.TxStores) error {
+		authority, err := tx.PKI().GetIssuerForUpdate(context.Background(), result.AuthorityIDs[0])
+		if err != nil {
+			return err
+		}
+		if !authority.KeyAvailable() {
+			t.Fatal("want the same-batch CA key to make the authority key available")
+		}
+		generation, err := tx.PKI().GetCAKeyGeneration(context.Background(), authority.KeyGenerationID())
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Secrets().GetEncrypted(context.Background(), generation.KeyMaterialID, domain.SecretPurposeCASigning); err != nil {
+			t.Fatalf("stored CA secret: %v", err)
+		}
+		material, err := tx.PKI().GetKeyMaterial(context.Background(), generation.KeyMaterialID)
+		if err != nil {
+			return err
+		}
+		if !material.PublicKey.Equal(facts.PublicKey) {
+			t.Fatalf("stored public key = %v, want %v", material.PublicKey, facts.PublicKey)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read after keyed import: %v", err)
+	}
+}
+
+func TestImportServiceCommitAcceptsPEMCertificateBundle(t *testing.T) {
+	f := newImportFixture(t)
+	seedDefaultSettings(t, f.store)
+	now := testNow()
+	rootDER := []byte("bundle-root-der")
+	rootFacts := caFacts(t, "Bundle Root", "bundle-root", "1e", now.Add(domain.NewDuration(-time.Hour)), now.Add(domain.NewDuration(365*24*time.Hour)))
+	rootFacts.DER = rootDER
+
+	intermediateDER := []byte("bundle-intermediate-der")
+	intermediateFacts := caFacts(t, "Bundle Intermediate", "bundle-intermediate", "1f", now.Add(domain.NewDuration(-time.Hour)), now.Add(domain.NewDuration(180*24*time.Hour)))
+	intermediateFacts.DER = intermediateDER
+	intermediateFacts.IssuerSubject = rootFacts.Subject
+
+	leafDER := []byte("bundle-leaf-der")
+	leafFacts := caFacts(t, "Bundle Leaf", "bundle-leaf", "20", now.Add(domain.NewDuration(-time.Hour)), now.Add(domain.NewDuration(30*24*time.Hour)))
+	leafFacts.DER = leafDER
+	leafFacts.Kind = domain.CertificateKindLeaf
+	leafFacts.Profile = domain.CertificateProfileServerTLS
+	leafFacts.IssuerSubject = intermediateFacts.Subject
+	san, err := domain.NewSAN(domain.SANTypeDNS, "bundle.example.test")
+	if err != nil {
+		t.Fatalf("leaf SAN: %v", err)
+	}
+	leafFacts.SANs = []domain.SAN{san}
+
+	bundleDER := []byte("root-and-intermediate-and-leaf.pem")
+	f.parser.registerChain(bundleDER, rootFacts, intermediateFacts, leafFacts)
+	cmd := contract.ImportUploadCommand{
+		Files: []contract.UploadedFile{{FileName: "pki-bundle.pem", Data: bundleDER}},
+		Metadata: contract.ImportMetadataInput{
+			SchemaVersion: 1,
+			Files:         []contract.ImportFileMetadataInput{{FileName: "pki-bundle.pem", Kind: contract.ImportFileKindCertificate}},
+			PreviewManifest: &contract.ImportPreviewManifestInput{
+				SchemaVersion: 1,
+				Files: []contract.ImportManifestFileInput{
+					{FileID: "pki-bundle.pem", Kind: contract.ImportFileKindCertificate, SHA256Hex: domain.NewFingerprint(rootDER).Hex()},
+					{FileID: "pki-bundle.pem", Kind: contract.ImportFileKindCertificate, SHA256Hex: domain.NewFingerprint(intermediateDER).Hex()},
+					{FileID: "pki-bundle.pem", Kind: contract.ImportFileKindCertificate, SHA256Hex: domain.NewFingerprint(leafDER).Hex()},
+				},
+			},
+		},
+	}
+
+	preview, err := f.svc.Preview(context.Background(), importMeta("28282828-2828-4828-8828-282828282828"), cmd)
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	if len(preview.Items) != 3 || len(preview.Manifest.Files) != 3 {
+		t.Fatalf("preview = %+v, want three logical certificate items", preview)
+	}
+	for _, item := range preview.Items {
+		if item.FileID != "pki-bundle.pem" || item.Status != contract.ImportItemStatusNew {
+			t.Fatalf("preview item = %+v, want new item projected to the uploaded file", item)
+		}
+	}
+
+	result, err := f.svc.Commit(context.Background(), importMeta("29292929-2929-4929-8929-292929292929"), cmd)
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if len(result.CertificateIDs) != 3 || len(result.AuthorityIDs) != 2 || len(result.Items) != 3 {
+		t.Fatalf("result = %+v, want root/intermediate/leaf and two authorities", result)
+	}
+	for _, item := range result.Items {
+		if item.FileID != "pki-bundle.pem" {
+			t.Fatalf("result item = %+v, want original bundle file id", item)
+		}
+	}
+}
+
+func TestImportServiceAttachSigningKeyReusesExistingGeneration(t *testing.T) {
+	f := newImportFixture(t)
+	rootDER := []byte("root-der-attach")
+	facts := caFacts(t, "Attach Root", "attach-root", "19", testNow().Add(domain.NewDuration(-time.Hour)), testNow().Add(domain.NewDuration(24*365*time.Hour)))
+	f.parser.addCert(rootDER, facts)
+	result, err := f.svc.Commit(context.Background(), importMeta("20202020-2020-4020-8020-202020202020"), uploadOneCert("root.pem", rootDER))
+	if err != nil {
+		t.Fatalf("seed Commit: %v", err)
+	}
+	authorityID := result.AuthorityIDs[0]
+	keyDER := []byte("attach-private-key")
+	f.parser.addCAKey(keyDER, facts.PublicKey)
+
+	var originalGeneration domain.CAKeyGenerationID
+	if err := f.store.Write(context.Background(), func(tx port.TxStores) error {
+		authority, err := tx.PKI().GetIssuerForUpdate(context.Background(), authorityID)
+		if err != nil {
+			return err
+		}
+		originalGeneration = authority.KeyGenerationID()
+		return nil
+	}); err != nil {
+		t.Fatalf("read authority: %v", err)
+	}
+
+	view, err := f.svc.AttachSigningKey(context.Background(), importVersionMeta(0), contract.ImportAttachSigningKeyCommand{
+		AuthorityID: authorityID,
+		Key:         keyDER,
+	})
+	if err != nil {
+		t.Fatalf("AttachSigningKey: %v", err)
+	}
+	if !view.KeyAvailable || view.KeyGenerationID != originalGeneration || view.Version != 1 {
+		t.Fatalf("view = %+v, want the existing generation attached with authority version 1", view)
+	}
+	if f.keyEngine.importCalls != 1 {
+		t.Fatalf("ImportCA calls = %d, want 1", f.keyEngine.importCalls)
+	}
+}
+
+func TestImportServiceCommitImportsCRLAndRetainsExpiredHistory(t *testing.T) {
+	f := newImportFixture(t)
+	rootDER := []byte("root-der-crl")
+	facts := caFacts(t, "CRL Root", "crl-root", "1a", testNow().Add(domain.NewDuration(-time.Hour)), testNow().Add(domain.NewDuration(24*365*time.Hour)))
+	f.parser.addCert(rootDER, facts)
+	rootResult, err := f.svc.Commit(context.Background(), importMeta("21212121-2121-4121-8121-212121212121"), uploadOneCert("root.pem", rootDER))
+	if err != nil {
+		t.Fatalf("seed Commit: %v", err)
+	}
+	crlDER := []byte("expired-crl-der")
+	crlNumber, err := domain.ParseCRLNumber("2a")
+	if err != nil {
+		t.Fatalf("CRL number: %v", err)
+	}
+	crlFacts := port.ParsedCRLFacts{
+		IssuerSubject: facts.Subject,
+		Number:        crlNumber,
+		ThisUpdate:    testNow().Add(domain.NewDuration(-2 * time.Hour)),
+		NextUpdate:    testNow().Add(domain.NewDuration(-time.Hour)),
+		Revoked: []port.RevokedEntryFacts{{
+			Serial:    serial(t, "dead"),
+			RevokedAt: testNow().Add(domain.NewDuration(-90 * time.Minute)),
+			Reason:    domain.RevocationReasonCessationOfOperation,
+		}},
+	}
+	f.parser.addCRL(crlDER, crlFacts)
+	cmd := importCommand(
+		[]contract.UploadedFile{{FileName: "root.crl", Data: crlDER}},
+		[]contract.ImportFileMetadataInput{{FileName: "root.crl", Kind: contract.ImportFileKindCRL, IssuerCertificateID: rootResult.CertificateIDs[0]}},
+		map[string]string{"root.crl": domain.NewFingerprint(crlDER).Hex()},
+	)
+	preview, err := f.svc.Preview(context.Background(), importMeta("22222222-2222-4222-8222-222222222222"), cmd)
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	if preview.Items[0].Status != contract.ImportItemStatusNew || preview.Items[0].ErrorCode != "import_crl_expired" {
+		t.Fatalf("preview item = %+v, want new with expired warning", preview.Items[0])
+	}
+	if f.crlVerifier.calls != 1 {
+		t.Fatalf("CRL verifier calls after Preview = %d, want 1", f.crlVerifier.calls)
+	}
+	result, err := f.svc.Commit(context.Background(), importMeta("23232323-2323-4323-8323-232323232323"), cmd)
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if result.Items[0].ErrorCode != "import_crl_expired" {
+		t.Fatalf("result item = %+v, want expired warning preserved", result.Items[0])
+	}
+	if err := f.store.Write(context.Background(), func(tx port.TxStores) error {
+		authority, err := tx.PKI().GetIssuerForUpdate(context.Background(), rootResult.AuthorityIDs[0])
+		if err != nil {
+			return err
+		}
+		revocation, err := tx.Revocations().FindForUpdate(context.Background(), authority.KeyGenerationID(), serial(t, "dead"))
+		if err != nil {
+			return err
+		}
+		if revocation.Source() != domain.RevocationSourceImport || revocation.CertificateID() != "" {
+			t.Fatalf("revocation = %+v, want imported certificate-less history", revocation)
+		}
+		state, err := tx.CRLs().GetStateForUpdate(context.Background(), authority.KeyGenerationID())
+		if err != nil {
+			return err
+		}
+		if state.MaxReservedNumber().Compare(crlNumber) != 0 {
+			t.Fatalf("max reserved CRL number = %s, want %s", state.MaxReservedNumber(), crlNumber)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read after CRL import: %v", err)
+	}
+}
+
+func TestImportServiceCommitImportsLeafWithoutSecretAndRejectsRootDirectLeaf(t *testing.T) {
+	f := newImportFixture(t)
+	seedDefaultSettings(t, f.store)
+	rootDER := []byte("root-der-leaf-import")
+	rootFacts := caFacts(t, "Leaf Root", "leaf-root", "1b", testNow().Add(domain.NewDuration(-time.Hour)), testNow().Add(domain.NewDuration(24*365*time.Hour)))
+	f.parser.addCert(rootDER, rootFacts)
+	rootResult, err := f.svc.Commit(context.Background(), importMeta("24242424-2424-4424-8424-242424242424"), uploadOneCert("root.pem", rootDER))
+	if err != nil {
+		t.Fatalf("root Commit: %v", err)
+	}
+
+	leafSubject, err := domain.NewSubject(domain.SubjectFacts{CommonName: "Imported Leaf"})
+	if err != nil {
+		t.Fatalf("leaf subject: %v", err)
+	}
+	leafSAN, err := domain.NewSAN(domain.SANTypeDNS, "leaf.example.test")
+	if err != nil {
+		t.Fatalf("leaf SAN: %v", err)
+	}
+	leafDER := []byte("leaf-direct-root")
+	leafFacts := caFacts(t, "unused", "leaf-key", "1c", testNow().Add(domain.NewDuration(-time.Hour)), testNow().Add(domain.NewDuration(30*24*time.Hour)))
+	leafFacts.Subject = leafSubject
+	leafFacts.IssuerSubject = rootFacts.Subject
+	leafFacts.Kind = domain.CertificateKindLeaf
+	leafFacts.Profile = domain.CertificateProfileServerTLS
+	leafFacts.SANs = []domain.SAN{leafSAN}
+	f.parser.addCert(leafDER, leafFacts)
+	leafCmd := uploadOneCert("leaf.pem", leafDER)
+	leafCmd.Metadata.Files[0].IssuerCertificateID = rootResult.CertificateIDs[0]
+	leafCmd.Metadata.PreviewManifest.Files[0].IssuerCertificateID = rootResult.CertificateIDs[0]
+	if _, err := f.svc.Commit(context.Background(), importMeta("25252525-2525-4525-8525-252525252525"), leafCmd); err == nil {
+		t.Fatal("expected a leaf directly below a Root to be rejected")
+	} else {
+		requireConflict(t, err, "import_batch_conflict")
+	}
+
+	intermediateDER := []byte("intermediate-for-leaf")
+	intermediateFacts := caFacts(t, "Leaf Intermediate", "leaf-intermediate", "1d", testNow().Add(domain.NewDuration(-time.Hour)), testNow().Add(domain.NewDuration(90*24*time.Hour)))
+	intermediateFacts.IssuerSubject = rootFacts.Subject
+	f.parser.addCert(intermediateDER, intermediateFacts)
+	intermediateCmd := uploadOneCert("intermediate.pem", intermediateDER)
+	intermediateCmd.Metadata.Files[0].IssuerCertificateID = rootResult.CertificateIDs[0]
+	intermediateCmd.Metadata.PreviewManifest.Files[0].IssuerCertificateID = rootResult.CertificateIDs[0]
+	intermediateResult, err := f.svc.Commit(context.Background(), importMeta("26262626-2626-4626-8626-262626262626"), intermediateCmd)
+	if err != nil {
+		t.Fatalf("intermediate Commit: %v", err)
+	}
+
+	leafFacts.IssuerSubject = intermediateFacts.Subject
+	f.parser.addCert(leafDER, leafFacts)
+	leafCmd.Metadata.Files[0].IssuerCertificateID = intermediateResult.CertificateIDs[0]
+	leafCmd.Metadata.PreviewManifest.Files[0].IssuerCertificateID = intermediateResult.CertificateIDs[0]
+	leafResult, err := f.svc.Commit(context.Background(), importMeta("27272727-2727-4727-8727-272727272727"), leafCmd)
+	if err != nil {
+		t.Fatalf("leaf Commit: %v", err)
+	}
+	if len(leafResult.CertificateIDs) != 1 {
+		t.Fatalf("leaf certificate_ids = %v, want one", leafResult.CertificateIDs)
+	}
+	if err := f.store.Write(context.Background(), func(tx port.TxStores) error {
+		cert, err := tx.PKI().GetCertificate(context.Background(), leafResult.CertificateIDs[0])
+		if err != nil {
+			return err
+		}
+		record, err := tx.PKI().GetLeafCertificateRecord(context.Background(), cert.ID())
+		if err != nil {
+			return err
+		}
+		if record.IssuerCACertificateID != intermediateResult.CertificateIDs[0] || record.RenewalCountAtIssue != 0 {
+			t.Fatalf("leaf record = %+v, want intermediate issuer and renewal count 0", record)
+		}
+		snapshot, err := tx.PKI().GetSeriesForUpdate(context.Background(), record.SeriesID)
+		if err != nil {
+			return err
+		}
+		generation := snapshot.CurrentKeyGeneration
+		if generation.RenewalCount() != 0 || !generation.PriorHistoryUnknown() || generation.Custody() != domain.KeyCustodyClientHeld {
+			t.Fatalf("leaf generation = %+v, want imported history markers", generation)
+		}
+		if _, err := tx.Secrets().GetEncrypted(context.Background(), cert.KeyMaterialID(), domain.SecretPurposeLeafDelivery); !errors.Is(err, port.ErrNotFound) {
+			t.Fatalf("leaf secret lookup = %v, want ErrNotFound", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read after leaf import: %v", err)
 	}
 }
 

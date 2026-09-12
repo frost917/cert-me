@@ -51,6 +51,7 @@ type RevocationChange struct {
 	// transaction, never from a client-supplied id
 	// (docs/backend-implementation.md §2).
 	AuthorityID domain.AuthorityID
+	NeedsReview bool // imported historical CRL is expired or otherwise not current
 }
 
 // RevocationMeta is the audit identity and clock one applyRevocations batch
@@ -248,6 +249,7 @@ func resolveChange(ctx context.Context, tx port.TxStores, change RevocationChang
 		RevokedAt:     change.RevokedAt,
 		Reason:        change.Reason,
 		Source:        change.Source,
+		NeedsReview:   change.NeedsReview,
 	}
 
 	existing, err := tx.Revocations().FindForUpdate(ctx, change.IssuerID, change.Serial)
