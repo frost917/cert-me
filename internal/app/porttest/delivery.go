@@ -108,6 +108,20 @@ func (r deliveryRepo) InvalidatePublicGrants(_ context.Context, certificateID do
 	return nil
 }
 
+func (r deliveryRepo) InvalidateAllPublicGrants(_ context.Context, now domain.Instant) error {
+	for id, g := range r.s.grants {
+		if g.Purpose() != domain.GrantPurposeLeafPublic {
+			continue
+		}
+		next, err := g.Invalidate(now)
+		if err != nil {
+			continue
+		}
+		r.s.grants[id] = next
+	}
+	return nil
+}
+
 // ListExpired backs the once-a-minute expiry sweep. Expiry is `now >=
 // expires_at` project-wide, which is what Instant.IsExpiredAt encodes.
 func (r deliveryRepo) ListExpired(_ context.Context, now domain.Instant, limit int) ([]domain.Delivery, error) {
@@ -117,6 +131,19 @@ func (r deliveryRepo) ListExpired(_ context.Context, now domain.Instant, limit i
 			continue
 		}
 		if d.ExpiresAt().IsExpiredAt(now) {
+			out = append(out, d)
+		}
+	}
+	return limitDeliveries(out, limit), nil
+}
+
+// ListPending backs restore finalization. It deliberately does not inspect
+// expires_at: restore cleanup is a safety boundary, not the ordinary expiry
+// sweep, and must fail even an otherwise unexpired pending delivery.
+func (r deliveryRepo) ListPending(_ context.Context, limit int) ([]domain.Delivery, error) {
+	out := make([]domain.Delivery, 0)
+	for _, d := range r.s.deliveries {
+		if d.State() == domain.DeliveryStatePending {
 			out = append(out, d)
 		}
 	}

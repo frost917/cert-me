@@ -85,6 +85,11 @@ func NewMaintenanceService(deps MaintenanceDeps) (*MaintenanceService, error) {
 // delivery_expired·interrupted_transfer 원인을 구별한다."
 const deliveryExpiredFailureCode = "delivery_expired"
 
+// restoreDeliveryFailureCode distinguishes restore cleanup from the ordinary
+// expiry and restart-transfer sweeps. A restore must not disguise an
+// unexpired pending delivery as expired merely to reach a terminal state.
+const restoreDeliveryFailureCode = "restore_pending"
+
 // requireMaintenanceOperation gates a MaintenanceService entry point to the
 // exact contract.InternalOperation it needs, checked directly against the
 // principal rather than through the generic port.Authorizer/
@@ -800,36 +805,29 @@ func (s *MaintenanceService) invalidateAllAdminSessions(ctx context.Context) err
 // key_deliveries rows at all, so they are excluded by construction, not by
 // an extra check here).
 //
-// KNOWN GAP, reported rather than guessed at: this reaches the two
-// non-terminal delivery states this package's ports can enumerate in bulk
-// -- transferring (via ListTransferring, resolved exactly like
-// RecoverTransfers) and pending rows already past their own receipt
-// deadline as of the real current clock (via ListExpired, resolved exactly
-// like ExpireDeliveries). A delivery that is still pending AND still
-// within its own deadline at restore time is NOT reached here:
-// DeliveryRepository (internal/app/port/delivery.go) has no bulk listing
-// for "every currently pending delivery" analogous to ListExpired/
-// ListTransferring -- only GetDeliveryForUpdate by a single already-known
-// id, and MaintenanceFinalizeRestoreOptions carries no list of specific
-// delivery ids for this method to target either. Adding a
-// DeliveryRepository.ListPending-style method is a port change outside
-// this developer's assigned files; see the PR report.
+// Restore uses ListPending rather than ListExpired: the deadline is not the
+// deciding fact here. Both pending and transferring rows are re-locked and
+// handled by restoreOneDelivery, which deletes the leaf secret, invalidates
+// private grants, marks the delivery failed with a restore-specific reason,
+// revokes the certificate, records the CRL demand and appends the audit event
+// in one row transaction. The global public-grant invalidation is committed
+// after the row sweep and is safe to repeat.
 func (s *MaintenanceService) deleteRestorePendingKeys(ctx context.Context) error {
 	for {
 		var batch []domain.Delivery
 		if err := s.deps.ReadStore.Read(ctx, func(tx port.TxStores) error {
 			var readErr error
-			batch, readErr = tx.Delivery().ListTransferring(ctx, recoveryBatchSize)
+			batch, readErr = tx.Delivery().ListPending(ctx, recoveryBatchSize)
 			return readErr
 		}); err != nil {
-			return storeError(err, "maintenance_restore_transferring_list_failed", "could not list mid-transfer deliveries")
+			return storeError(err, "maintenance_restore_pending_list_failed", "could not list pending deliveries")
 		}
 		if len(batch) == 0 {
 			break
 		}
 		progressed := false
 		for _, delivery := range batch {
-			changed, err := s.recoverOneTransfer(ctx, delivery.ID())
+			changed, err := s.restoreOneDelivery(ctx, delivery.ID())
 			if err != nil {
 				return err
 			}
@@ -846,17 +844,17 @@ func (s *MaintenanceService) deleteRestorePendingKeys(ctx context.Context) error
 		var batch []domain.Delivery
 		if err := s.deps.ReadStore.Read(ctx, func(tx port.TxStores) error {
 			var readErr error
-			batch, readErr = tx.Delivery().ListExpired(ctx, s.deps.Clock.Now(), recoveryBatchSize)
+			batch, readErr = tx.Delivery().ListTransferring(ctx, recoveryBatchSize)
 			return readErr
 		}); err != nil {
-			return storeError(err, "maintenance_restore_expired_list_failed", "could not list expired deliveries")
+			return storeError(err, "maintenance_restore_transferring_list_failed", "could not list mid-transfer deliveries")
 		}
 		if len(batch) == 0 {
 			break
 		}
 		progressed := false
 		for _, delivery := range batch {
-			changed, err := s.expireOneDelivery(ctx, delivery.ID())
+			changed, err := s.restoreOneDelivery(ctx, delivery.ID())
 			if err != nil {
 				return err
 			}
@@ -868,7 +866,90 @@ func (s *MaintenanceService) deleteRestorePendingKeys(ctx context.Context) error
 			break
 		}
 	}
+
+	if err := s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
+		if err := tx.Delivery().InvalidateAllPublicGrants(ctx, s.deps.Clock.Now()); err != nil {
+			return storeError(err, "maintenance_restore_public_grants_invalidate_failed", "could not invalidate restored public download links")
+		}
+		return nil
+	}); err != nil {
+		if errors.Is(err, port.ErrCommitUnknown) {
+			s.deps.RuntimeGate.FailClosed("maintenance_restore_public_grants_commit_unknown")
+		}
+		return err
+	}
 	return nil
+}
+
+// restoreOneDelivery resolves one pending or transferring delivery under its
+// row lock. It is deliberately separate from the ordinary expiry and restart
+// recovery helpers: restore cleanup has stronger semantics and must delete the
+// leaf secret even when the receipt deadline has not passed.
+func (s *MaintenanceService) restoreOneDelivery(ctx context.Context, deliveryID domain.DeliveryID) (bool, error) {
+	changed := false
+	err := s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
+		changed = false
+		delivery, err := tx.Delivery().GetDeliveryForUpdate(ctx, deliveryID)
+		if err != nil {
+			if errors.Is(err, port.ErrNotFound) {
+				return nil
+			}
+			return storeError(err, "maintenance_restore_delivery_read_failed", "could not read the restored delivery")
+		}
+		if delivery.State() != domain.DeliveryStatePending && delivery.State() != domain.DeliveryStateTransferring {
+			return nil
+		}
+
+		certificate, err := tx.PKI().GetCertificate(ctx, delivery.CertificateID())
+		if err != nil {
+			return storeError(err, "maintenance_restore_delivery_certificate_read_failed", "could not read the restored delivery's certificate")
+		}
+		scope, err := leafManagementAuthority(ctx, tx, certificate.ID())
+		if err != nil {
+			return err
+		}
+		now := s.deps.Clock.Now()
+		failedDelivery, err := delivery.Fail(restoreDeliveryFailureCode, now)
+		if err != nil {
+			return contract.FromDomainError(err)
+		}
+		if err := tx.Delivery().SaveDelivery(ctx, failedDelivery, delivery.Version()); err != nil {
+			return storeError(err, "maintenance_restore_delivery_save_failed", "could not record the restored delivery failure")
+		}
+		if err := tx.Secrets().Delete(ctx, certificate.KeyMaterialID(), domain.SecretPurposeLeafDelivery); err != nil {
+			return storeError(err, "maintenance_restore_leaf_secret_delete_failed", "could not delete the restored leaf delivery secret")
+		}
+		if err := tx.Delivery().InvalidatePrivateGrants(ctx, delivery.ID(), now); err != nil {
+			return storeError(err, "maintenance_restore_private_grants_invalidate_failed", "could not invalidate the restored private download links")
+		}
+
+		change := RevocationChange{
+			IssuerID:      certificate.IssuerCAKeyGenerationID(),
+			Serial:        certificate.Serial(),
+			CertificateID: certificate.ID(),
+			RevokedAt:     now,
+			Reason:        domain.RevocationReasonUnspecified,
+			Source:        domain.RevocationSourceCascade,
+			AuthorityID:   scope,
+		}
+		if _, err := applyRevocations(ctx, tx, []RevocationChange{change}, RevocationMeta{
+			ActorKind: contract.AuditActorSystem,
+			Action:    "maintenance.finalize_restore.restore_pending",
+			Now:       now,
+			IDs:       s.deps.IDs,
+		}); err != nil {
+			return err
+		}
+		changed = true
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, port.ErrCommitUnknown) {
+			s.deps.RuntimeGate.FailClosed("maintenance_restore_delivery_commit_unknown")
+		}
+		return false, err
+	}
+	return changed, nil
 }
 
 // blockingCAsNeedingCRLResumption enumerates every stored authority and

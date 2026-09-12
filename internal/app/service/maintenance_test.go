@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -115,6 +117,59 @@ func TestMaintenanceExpireDeliveriesUsesDeliveryExpiredFailureCode(t *testing.T)
 	}
 	if delivery.FailureCode() != deliveryExpiredFailureCode {
 		t.Fatalf("failure code = %q, want %q", delivery.FailureCode(), deliveryExpiredFailureCode)
+	}
+	if n := countRevocations(t, fx.store, fx.issuerID, distSerial(t, "a1")); n != 1 {
+		t.Fatalf("revocations = %d, want 1", n)
+	}
+}
+
+func TestMaintenanceRestoreCleansUnexpiredPendingDeliveryAndAllPublicGrants(t *testing.T) {
+	future := distTestNow().Add(domain.NewDuration(time.Hour))
+	fx := seedPrivateFixture(t, future, domain.DeliveryStatePending)
+	seedCRLStateFor(t, fx.store, fx.issuerID)
+
+	publicGrant := distGrant(t, 2, domain.GrantPurposeLeafPublic, fx.certID, "", tokenHashFor("restore-public-token-0123456789ABCDEF"), future)
+	if err := fx.store.Write(context.Background(), func(tx port.TxStores) error {
+		return tx.Delivery().InsertGrant(context.Background(), publicGrant)
+	}); err != nil {
+		t.Fatalf("seed public grant: %v", err)
+	}
+
+	if err := newMaintenanceTestService(t, fx.store).deleteRestorePendingKeys(context.Background()); err != nil {
+		t.Fatalf("restore delivery cleanup: %v", err)
+	}
+
+	delivery := storedDelivery(t, fx.store, fx.deliverID)
+	if delivery.State() != domain.DeliveryStateFailed {
+		t.Fatalf("state = %s, want failed", delivery.State())
+	}
+	if delivery.FailureCode() != restoreDeliveryFailureCode {
+		t.Fatalf("failure code = %q, want %q", delivery.FailureCode(), restoreDeliveryFailureCode)
+	}
+
+	if err := fx.store.Read(context.Background(), func(tx port.TxStores) error {
+		if _, err := tx.Secrets().GetEncrypted(context.Background(), fx.keyMatID, domain.SecretPurposeLeafDelivery); err == nil {
+			return fmt.Errorf("leaf delivery secret still exists")
+		} else if !errors.Is(err, port.ErrNotFound) {
+			return err
+		}
+		private, err := tx.Delivery().GetGrantForUpdate(context.Background(), tokenHashFor(fx.rawToken))
+		if err != nil {
+			return err
+		}
+		if private.InvalidatedAt().IsZero() {
+			return fmt.Errorf("private grant is still valid")
+		}
+		public, err := tx.Delivery().GetGrantForUpdate(context.Background(), publicGrant.TokenHash())
+		if err != nil {
+			return err
+		}
+		if public.InvalidatedAt().IsZero() {
+			return fmt.Errorf("public grant is still valid")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify restored delivery cleanup: %v", err)
 	}
 	if n := countRevocations(t, fx.store, fx.issuerID, distSerial(t, "a1")); n != 1 {
 		t.Fatalf("revocations = %d, want 1", n)

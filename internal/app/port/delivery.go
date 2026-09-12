@@ -60,10 +60,22 @@ type DeliveryRepository interface {
 	// batch는 100개").
 	ListExpired(ctx context.Context, now domain.Instant, limit int) ([]domain.Delivery, error)
 
+	// ListPending returns every delivery still waiting for receipt, regardless
+	// of its deadline, up to limit rows. Restore finalization must use this
+	// recovery-specific listing so an unexpired pending delivery cannot survive
+	// merely because it is not yet eligible for the ordinary expiry sweep.
+	ListPending(ctx context.Context, limit int) ([]domain.Delivery, error)
+
 	// ListTransferring returns every delivery still in the transferring
 	// state, the restart-recovery set that must be resolved to failed before
 	// new download/issuance requests are allowed
 	// (docs/backend-implementation.md §9 "초기 재시작 복구에서 transferring을
 	// failed로 바꾸는 동안 다운로드/갱신 요청을 열지 않는다").
 	ListTransferring(ctx context.Context, limit int) ([]domain.Delivery, error)
+
+	// InvalidateAllPublicGrants invalidates every outstanding public download
+	// grant in the restored snapshot. A restore can contain public links for
+	// certificates whose delivery rows are not present in the local listing, so
+	// this is intentionally global rather than certificate-scoped.
+	InvalidateAllPublicGrants(ctx context.Context, now domain.Instant) error
 }
