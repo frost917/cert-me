@@ -112,6 +112,11 @@ type PKIRepository interface {
 	// UQ). It returns ErrNotFound when no certificate has this exact DER.
 	FindCertificateByDER(ctx context.Context, derSHA256 domain.Fingerprint) (domain.Certificate, error)
 
+	// FindCertificateByIssuerSerial finds a certificate occupying one
+	// issuer/serial namespace, used by import to distinguish an exact DER
+	// duplicate from a serial collision.
+	FindCertificateByIssuerSerial(ctx context.Context, issuer domain.CAKeyGenerationID, serial domain.SerialNumber) (domain.Certificate, error)
+
 	// FindKeyBySPKI looks up a key_material row by the SHA-256 of its SPKI
 	// (key_materials.spki_sha256 UQ), the same-public-key check import and
 	// issuance use. It returns ErrNotFound when the public key is unknown.
@@ -205,6 +210,22 @@ type PKIRepository interface {
 	// SaveAuthority persists authority under the standard optimistic-lock
 	// contract.
 	SaveAuthority(ctx context.Context, authority domain.Authority, expectedVersion domain.Version) error
+
+	// SaveCAKeyGeneration persists the destruction marker on an existing CA
+	// generation. Authority destruction uses the locked Authority row for
+	// serialization because CA generations have no version column.
+	SaveCAKeyGeneration(ctx context.Context, generation CAKeyGeneration) error
+
+	// ListCertificatesByIssuer returns every certificate signed under one CA key
+	// generation, used to verify closure conditions before archival or key
+	// destruction.
+	ListCertificatesByIssuer(ctx context.Context, issuer domain.CAKeyGenerationID) ([]domain.Certificate, error)
+
+	// ListCACertificates returns every stored CA certificate. Import uses this
+	// public-facts view to resolve bundled CA keys/CRLs by issuer subject and
+	// authority key identifier without accepting a client-provided relation as
+	// authoritative.
+	ListCACertificates(ctx context.Context) ([]domain.Certificate, error)
 
 	// ListCertificatesUsingKey returns every certificate signed for
 	// keyMaterialID, the compromise-cascade lookup

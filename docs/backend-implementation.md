@@ -386,3 +386,50 @@ PR #3의 질문 번호에 대응한다. 기존 HTTP·수명 정책에서 이미 
 소비 트랜잭션에서 잠금 획득 후 읽은 시각은 grant/delivery 기한 검사, consumed_at 및 시작 감사에 사용한다. Send가 반환하거나 panic을 회수한 뒤 payload를 정리하고 app Clock.Now()를 다시 읽어 종료 관측 시각을 정한다. 시스템 시계 역행 시 종료 시각은 consumed_at보다 이르지 않도록 둘 중 늦은 값으로 보정한다. 이 값을 Complete/Fail의 finished_at, 결과 감사, 해당 전송 실패로 새로 생성하는 폐기 변경의 revoked_at 및 반환 TransferSummary.FinishedAt에 일관되게 사용한다. 기존 폐기 기록의 시각·사유 병합 규칙은 유지한다.
 
 TransferOutcome.FinishedAt은 sink가 관측한 시각이며 app의 영속 종료 시각을 대체하지 않는다. 오류·panic으로 outcome이 비어 있어도 동일한 app 종료 시각 경로를 사용한다. 후처리 트랜잭션 재시도에는 최초 종료 관측 시각을 보존하며 재시도마다 새 종료 시각을 만들지 않는다. 성공 전송이 소비 후 수령 기한을 넘겼다는 이유만으로 소급 실패 처리하지 않는다. 기한은 소비 가능 여부를 결정하고 전송은 별도 timeout으로 제한한다. 느린 sink와 전진 clock, 실패/panic, 시계 역행을 통해 소비·종료 시각 구분과 결과 일관성을 검증한다.
+
+## 15. B04 기획 판단과 보완 순서
+
+PR #4의 `9c381c547b7c413982b47b3761a5f6b03f6ad7f0`에 제기된 6개 질문의 결정이다. §3의 메서드와 기존 import/복원 정책은 B04 완료 조건이다. domain/port의 메서드 누락이나 개발자별 파일 배정은 기능을 후속 단계로 제외하는 근거가 아니다. 필요한 도메인 전이·포트·대역을 B04에서 함께 보완한다. 실제 SQL·암호화·파일·listener 어댑터는 B05, HTTP/CLI/worker 연결은 B06을 유지한다.
+
+### 15.1. Authority 종료·키 파기
+
+DestroyKey는 Authority 잠금과 expectedVersion 검사 후 최신 ClosureFacts로 종료 조건을 검사한다. 명시적 도메인 전이와 `SaveCAKeyGeneration` 계약을 추가하여 기존 세대의 key_destroyed_at, Authority의 키 가용 상태/version, signing secret 삭제, 감사를 같은 Write로 반영한다. 세대에 별도 version이 없다면 부모 Authority 잠금/version으로 직렬화한다. key material·인증서·발급 이력·CRL은 보존한다. 저장 중 어느 단계가 실패해도 전체 rollback한다.
+
+Archive는 발급이 비활성인 상태(inventory/stopped)에서 등록 하위 인증서 만료와 필요한 최종 CRL 게시 완료를 검사한 뒤 archived_at/version을 저장한다. 발급을 자동 중지하거나 키를 자동 삭제하지 않는다. 키 파기는 기존의 별도 명시적 작업이므로 Archive의 필수 선행 조건으로 만들지 않는다. 보관 후에도 남아 있는 키의 명시적 DestroyKey는 동일 종료 조건으로 허용한다. 반대로 Archive 이후 발급 재개·키 추가는 허용하지 않는다. 따라서 CanDestroyKey가 보관 상태만으로 거부하는 현재 도메인도 수정 대상이다. 처음부터 키 없이 이력만 관리하고 운영 CRL 게시 의무가 없던 CA는 불필요한 CRL 생성이나 가상의 파기 이력을 요구하지 않는다. 공개 자료 제공은 유지한다.
+
+### 15.2. 키 연결과 import 묶음
+
+AttachSigningKey는 기존 CA 인증서의 SPKI와 일치하는 키를 기존 key material/CA key generation에 연결하는 작업이다. 동일 공개키에 새 세대를 생성하거나 인증서·issuer·계보를 교체하지 않는다. Authority 잠금/version 아래 보관 상태·기존 secret·key_destroyed_at·키 유출 상태를 재검사한다. 명시적으로 파기한 키를 되살리거나 유출 키를 가용 상태로 복구하지 않는다. 이미 연결된 키는 덮어쓰지 않는다. 키 연결만으로 issuance enabled, 인수 완료, CRL 게시 완료를 추정하지 않는다. 검증된 암호문 저장·키 가용 전이·Authority version·감사는 같은 Write다.
+
+같은 묶음은 파일 순서와 무관하게 파싱한 뒤 공개 Facts로 연결한다. CA 키는 SPKI 일치로, 인증서 issuer와 CRL issuer는 실제 서명 검증과 CA 제약으로 기존 DB 및 같은 묶음의 CA 후보에서 확정한다. 명시적 issuer_certificate_id가 있으면 그 제약도 검증한다. 이름만으로 연결하지 않으며 미해결·모호한 연결은 거부한다. 새 파일에 미발급 DB UUID를 요구하지 않는다. 필요한 CRL 서명 검증 포트를 추가하고 B04에서는 대역으로 협력을 검증한다.
+
+기존 pki-import의 원자성·중복·충돌 정책을 유지한다. 동일 DER에 키를 추가하는 경우도 같은 내부 키 연결 규칙을 재사용하며 공개 서비스 메서드를 중첩 호출하지 않는다. Leaf는 공개 인증서와 Series/LeafKeyGeneration, 갱신 횟수 0을 저장하고 secret/delivery는 생성하지 않는다. CA 키·CRL·Leaf·PEM 인증서 묶음을 일괄 미지원으로 거부하는 것은 B04 완료 조건을 충족하지 않는다. preview 뒤 commit에서 현재 DB 충돌과 인수 조건을 다시 검사한다.
+
+### 15.3. TLS Reload·Bootstrap
+
+Reload의 Empty command는 유지한다. runtime/config가 생성자에 주입하는 제한된 파일 소스 포트가 구성된 인증서·체인·키를 읽어 소유권 있는 입력을 반환한다. 요청에서 경로를 받거나 Context에 숨기지 않는다. 서비스는 기존 UploadCandidate와 동일한 내부 검증·암호화 저장 경로를 사용하고 성공/오류 모두 비밀 입력을 정리한다. Reload는 후보 생성이며 Activate 없이 listener를 바꾸지 않는다. 원본 파일을 수정하지 않는다.
+
+Bootstrap의 Root와 임시 serverAuth Leaf는 각각 CN=cert-me, 추가 Subject 필드 없음, DNS SAN=cert-me(Leaf), ECDSA P-256으로 고정한다. 둘 다 동일 기준 시각에서 30일이며 Leaf 만료는 Root를 넘지 않는다. 실제 호스트 DNS/IP 수집·자동 신뢰·접속 이름 일치 보장을 추가하지 않는다. SAN의 고정 이름은 기존 임시 TLS 예외의 구체화이며 운영 후보의 service_url 검증에는 적용하지 않는다. Root는 bootstrap_ca, Leaf는 internal_tls 목적이며 일반 delivery를 만들지 않는다. 최초 bootstrap은 기존 활성 TLS가 없는 초기 경로, 재생성은 명시적 local 유지보수 경로로 제한하고 만료에 따른 자동 재생성은 금지한다. 계정/setup 상태를 초기화하지 않는다. 운영 TLS 적용 완료 후 bootstrap secret 삭제와 공개 이력 보존도 대역으로 검증한다.
+
+### 15.4. Restore 전체 정리
+
+기한이 남은 pending을 포함한 모든 대기 delivery를 열거하는 `ListPending`과 모든 기존 공개 grant를 무효화하는 저장 계약을 추가한다. ListExpired에 미래 시각을 넣어 대체하지 않는다. 기존 transferring 복구와 함께 각 행을 다시 잠그고 현재 상태를 검사하여 secret 삭제·private grant 무효화·terminal 전이·폐기·CRL 요구·감사를 같은 행별 Write로 처리한다. 미만료 pending의 복원 정리는 expired로 위장하지 않고 복원 사유의 failed 전이를 사용한다.
+
+세션·reset token·공개/개인키 토큰 전체 무효화와 대상 정리가 완료됐는지 확인하기 전 복구 단계를 완료 처리하지 않는다. 페이지 중간 실패와 재실행에도 누락이 없어야 한다. CA/internal_tls secret은 유지한다. 필요한 CRL 게시가 끝나기 전 일반 서비스는 열지 않는다. 키 없는 단순 inventory CA 예외는 architecture의 기존 게시 필요 범위를 따른다.
+
+### 15.5. 설치 전역 권한·감사 범위
+
+권한과 감사의 범위를 typed `installation` / `authorities`로 명시한다. installation은 현재 단일 설치 자체이며 새 tenant나 가짜 Authority를 만들지 않는다. 전체 관리자의 기존 권한과 내부 Principal별 Action 제한을 유지하고, 빈 Authority 배열을 만능 권한으로 해석하지 않는다. authorities는 저장 관계에서 얻은 비어 있지 않은 ID 집합이며 기존 복수 범위 모두 허용 규칙을 유지한다.
+
+Settings, TLS 설치 관리, Maintenance 실행 요약, Setup/Identity 등 CA 관계 없는 이벤트는 installation이다. CA를 생성/변경하거나 복원에서 개별 Leaf를 폐기하는 이벤트는 실제 authority 범위를 보존한다. 예를 들어 Root 생성의 사전 권한은 installation이고 생성 결과 감사는 생성한 Authority다. 전역 작업의 세부 CA 이벤트를 전역 요약만으로 대체하지 않는다. CA 관계 조회 실패를 installation으로 강등하지 않는다.
+
+감사 저장에는 scope_kind를 명시하고 authority 범위 행과 함께 일관성을 검사한다. §14의 scope 비저장 금지는 CA 관련 이벤트에 적용하며 전역 이벤트는 명시적으로 저장된 installation 범위로 충족한다. B04에서 포트·저장 대역·조회/export의 타입과 검증을 맞추고, B05에서 SQL migration으로 scope_kind를 추가한다. 기존 이벤트의 범위 행/허용된 전역 Action에 근거해 이관하며 분류 불가능한 행을 임의 전역으로 처리하지 않는다. CA 범위 관리자에게 전역 감사가 노출되지 않는 조회 계약을 유지하되 장기 역할 구현 자체를 앞당기지 않는다.
+
+### 15.6. 개발 순서와 판정
+
+1. Restore의 미만료 pending 및 전체 grant 정리를 먼저 보완한다. 미만료/만료 pending, transferring, 공개 grant, 중간 실패·재실행, CA/TLS 키 보존을 서비스 대역에서 검증한다.
+2. Authority 전이·세대 저장, AttachSigningKey, 전체 import 경로를 구현한다. 종료 조건 거부·보관 후 명시적 파기·rollback, 같은 묶음 순서 변경·서명 불일치·SPKI 충돌·인수 미완료를 검증한다.
+3. TLS 소스/Bootstrap과 typed 전역 감사 계약을 보완한다. 초기·재생성 권한, 비밀 정리, 후보 생성과 활성화 분리, 전역/CA 감사 및 export 필터를 검증한다. 감사 포트 변경은 앞선 작업과 함께 진행해도 된다.
+4. Reconcile 미해결 시 FailClosed 호출과 정상 성공 결과 미반환은 B04 대역 검증 대상이다. 실제 listener admission·프로세스 복구·SQL 원자성은 B05/B06 검증으로 남긴다.
+
+위 항목은 기존 B04를 완성하는 작업이다. 작업 커밋/PR 분리는 가능하지만 잔여 항목을 명시하고 전체 보완 전 B04 완료로 표시하지 않는다. 이 결정은 PR #4의 '모든 항목을 별도 제품 결정 이후로 제외' 방침을 대체한다. 구현 완료와 병합 가능 여부는 이후 정확한 구현 SHA를 대상으로 최종 검수한다.

@@ -219,6 +219,10 @@ func (c ImportUploadCommand) Validate() error {
 		}
 		uploaded[f.FileName] = struct{}{}
 	}
+	if len(c.Metadata.Files) != len(c.Files) {
+		return NewAppError(ErrorKindValidation, "import_metadata_file_count_mismatch",
+			"metadata.files must contain exactly one entry for each uploaded file")
+	}
 	if err := c.Metadata.validate(c.RequireManifest); err != nil {
 		return err
 	}

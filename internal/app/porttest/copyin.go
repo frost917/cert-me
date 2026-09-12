@@ -54,6 +54,11 @@ func cloneJob(j port.Job) port.Job {
 	return j
 }
 
+func cloneMaintenanceRun(r port.MaintenanceRun) port.MaintenanceRun {
+	r.DetailsJSON = cloneBytes(r.DetailsJSON)
+	return r
+}
+
 // cloneRevision copies revision's two JSON snapshots.
 func cloneRevision(r port.RevocationRevision) port.RevocationRevision {
 	r.PreviousValuesJSON = cloneBytes(r.PreviousValuesJSON)
@@ -78,6 +83,21 @@ func cloneRequestResult(r port.OperationRequestResult) port.OperationRequestResu
 func cloneAuditEvent(e port.AuditEvent) port.AuditEvent {
 	e.Details.Fields = cloneStringMap(e.Details.Fields)
 	return e
+}
+
+func cloneAuditRows(rows []auditRow) []auditRow {
+	if rows == nil {
+		return nil
+	}
+	out := make([]auditRow, len(rows))
+	for i, row := range rows {
+		out[i] = auditRow{
+			event:     cloneAuditEvent(row.event),
+			scopeKind: row.scopeKind,
+			scopes:    cloneAuthorityIDs(row.scopes),
+		}
+	}
+	return out
 }
 
 // cloneManifestFiles copies a PublicImportManifest.Files slice. Each element

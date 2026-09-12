@@ -88,3 +88,16 @@ func (s *Store) DeploymentConfirmations() []domain.DeploymentConfirmation {
 	copy(out, snapshot.deploymentConfirmations)
 	return out
 }
+
+// ListDeploymentConfirmations returns transitionID's confirmations in the
+// order they were added, which is the order a real append-only table would
+// read them back in.
+func (r transitionRepo) ListDeploymentConfirmations(_ context.Context, transitionID domain.TransitionID) ([]domain.DeploymentConfirmation, error) {
+	var out []domain.DeploymentConfirmation
+	for _, c := range r.s.deploymentConfirmations {
+		if c.TransitionID() == transitionID {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}

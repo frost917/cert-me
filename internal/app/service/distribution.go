@@ -321,44 +321,6 @@ type consumedTransfer struct {
 	delivery domain.Delivery // zero value for a public transfer
 }
 
-// distributionManagementAuthority resolves the management authority a
-// download/delivery/recovery event is scoped to (§14.6): leaf_certificates
-// -> SeriesID -> LeafSeries.ManagementAuthorityID, both read from stored
-// relations under this same transaction. This is deliberately NOT the
-// certificate's cryptographic issuance chain buildChainDER walks (§14.2) --
-// "인증서의 역사적 발급 체인은 2번 경로로 별도로 구하고 관리 관계와 혼용하지
-// 않는다" -- and it never trusts a caller-supplied AuthorityID. Every audit
-// call in this file and in recovery.go goes through this one function so a
-// download's audit scope and the RevocationChange.AuthorityID a failed
-// transfer or recovery hands to applyRevocations cannot drift apart.
-//
-// A missing leaf record or series row is an error, never a silently empty
-// scope (§14.6 "현재 MVP도 scope를 비워 저장하지 않는다").
-func distributionManagementAuthority(ctx context.Context, tx port.TxStores, certificateID domain.CertificateID) (domain.AuthorityID, error) {
-	leaf, err := tx.PKI().GetLeafCertificateRecord(ctx, certificateID)
-	if err != nil {
-		if errors.Is(err, port.ErrNotFound) {
-			return "", contract.NewAppError(contract.ErrorKindUnavailable, "distribution_scope_leaf_record_missing",
-				"this certificate has no stored issuance record to scope the audit to").WithField("certificate_id", string(certificateID))
-		}
-		return "", storeError(err, "distribution_scope_leaf_record_read_failed", "could not read the certificate's issuance record")
-	}
-	snapshot, err := tx.PKI().GetSeriesForUpdate(ctx, leaf.SeriesID)
-	if err != nil {
-		if errors.Is(err, port.ErrNotFound) {
-			return "", contract.NewAppError(contract.ErrorKindUnavailable, "distribution_scope_series_missing",
-				"this certificate's series record is missing").WithField("certificate_id", string(certificateID))
-		}
-		return "", storeError(err, "distribution_scope_series_read_failed", "could not read the certificate's series")
-	}
-	authorityID := snapshot.Series.ManagementAuthorityID()
-	if authorityID == "" {
-		return "", contract.NewAppError(contract.ErrorKindUnavailable, "distribution_scope_empty",
-			"could not resolve a management authority for this certificate").WithField("certificate_id", string(certificateID))
-	}
-	return authorityID, nil
-}
-
 // appendDistributionAudit records one Deliver-related audit event, scoped to
 // the certificate's management authority (§14.6).
 func appendDistributionAudit(ctx context.Context, tx port.TxStores, ids port.IDGenerator, now domain.Instant, meta contract.RequestMeta, action string, grantID domain.GrantID, result contract.AuditResult, scope domain.AuthorityID) error {
@@ -375,7 +337,7 @@ func appendDistributionAudit(ctx context.Context, tx port.TxStores, ids port.IDG
 		Result:     result,
 		Details:    contract.AuditDetails{SchemaVersion: 1},
 	}
-	if err := tx.Audit().Append(ctx, event, []domain.AuthorityID{scope}); err != nil {
+	if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(scope)); err != nil {
 		return storeError(err, "distribution_audit_failed", "could not record the download audit event")
 	}
 	return nil
@@ -427,7 +389,7 @@ func (s *DistributionService) commitConsumption(ctx context.Context, meta contra
 			return contract.NewAppError(contract.ErrorKindConflict, "download_grant_changed", "the download link changed since it was read")
 		}
 
-		scope, err := distributionManagementAuthority(ctx, tx, prep.certificate.ID())
+		scope, err := leafManagementAuthority(ctx, tx, prep.certificate.ID())
 		if err != nil {
 			return err
 		}

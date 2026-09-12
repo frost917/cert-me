@@ -24,6 +24,33 @@ func TestAuthorizationScope_EmptyIsNil(t *testing.T) {
 	if got := scope.AuthorityIDs(); got != nil {
 		t.Fatalf("an empty scope must report a nil id list, got %v", got)
 	}
+	if scope.Kind() != AuthorizationScopeInstallation {
+		t.Fatalf("empty scope kind = %q, want installation", scope.Kind())
+	}
+	if err := scope.Validate(); err != nil {
+		t.Fatalf("installation scope validation: %v", err)
+	}
+}
+
+func TestAuthorizationScope_AuthoritiesAreTypedAndNormalized(t *testing.T) {
+	id := domain.AuthorityID("11111111-1111-1111-1111-111111111111")
+	scope := NewAuthoritiesAuthorizationScope(id, id)
+	if scope.Kind() != AuthorizationScopeAuthorities {
+		t.Fatalf("authority scope kind = %q, want authorities", scope.Kind())
+	}
+	if got := scope.AuthorityIDs(); len(got) != 1 || got[0] != id {
+		t.Fatalf("normalized authority ids = %v, want [%s]", got, id)
+	}
+	if err := scope.Validate(); err != nil {
+		t.Fatalf("authority scope validation: %v", err)
+	}
+}
+
+func TestAuthorizationScope_ZeroValueIsInvalid(t *testing.T) {
+	var scope AuthorizationScope
+	if err := scope.Validate(); err == nil {
+		t.Fatal("zero-value authorization scope must be rejected")
+	}
 }
 
 // These four tests previously constructed EncodedBundle with a public Data

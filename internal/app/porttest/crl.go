@@ -46,8 +46,30 @@ func (r crlRepo) InsertDocument(_ context.Context, document port.CRLDocument) er
 	if _, ok := r.s.crlDocuments[document.ID]; ok {
 		return ErrDuplicate
 	}
+	derKey := crlDocumentUniqueKey(document)
+	if derKey != "" {
+		if _, ok := r.s.crlDocumentsByDER[derKey]; ok {
+			return ErrDuplicate
+		}
+	}
 	r.s.crlDocuments[document.ID] = cloneCRLDocument(document)
+	if derKey != "" {
+		r.s.crlDocumentsByDER[derKey] = document.ID
+	}
 	return nil
+}
+
+// crlDocumentUniqueKey mirrors crl_documents.der_sha256 UQ. Normal service
+// calls provide the parser's DER fingerprint; deriving it for a zero value
+// keeps the in-memory double honest for hand-built fixtures as well.
+func crlDocumentUniqueKey(document port.CRLDocument) string {
+	if !document.DERSHA256.IsZero() {
+		return document.DERSHA256.Hex()
+	}
+	if len(document.DER) == 0 {
+		return ""
+	}
+	return domain.NewFingerprint(document.DER).Hex()
 }
 
 func (r crlRepo) GetDocument(_ context.Context, id domain.CRLDocumentID) (port.CRLDocument, error) {

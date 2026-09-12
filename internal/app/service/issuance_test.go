@@ -25,6 +25,7 @@ import (
 // linkage and how many times a new key was actually generated.
 type fakeKeyEngine struct {
 	generateCalls int
+	importCalls   int
 	fail          error
 }
 
@@ -51,8 +52,23 @@ func (e *fakeKeyEngine) Generate(_ context.Context, spec port.KeySpec) (port.Gen
 	return port.GeneratedKey{PublicKey: pub, EncryptedSecret: secret}, nil
 }
 
-func (e *fakeKeyEngine) ImportCA(context.Context, port.ValidatedCAKeyInput, port.KeySpec) (port.GeneratedKey, error) {
-	return port.GeneratedKey{}, errors.New("fakeKeyEngine: ImportCA not supported")
+func (e *fakeKeyEngine) ImportCA(_ context.Context, input port.ValidatedCAKeyInput, spec port.KeySpec) (port.GeneratedKey, error) {
+	e.importCalls++
+	if e.fail != nil {
+		return port.GeneratedKey{}, e.fail
+	}
+	secret, err := domain.NewEncryptedSecret(domain.EncryptedSecretFacts{
+		OwnerKeyID:             spec.KeyMaterialID,
+		Purpose:                spec.Purpose,
+		FormatVersion:          1,
+		EncryptionGenerationID: "gen-1",
+		Nonce:                  []byte("nonce-0123456789012"),
+		Ciphertext:             []byte("ciphertext-for-" + string(spec.KeyMaterialID)),
+	})
+	if err != nil {
+		return port.GeneratedKey{}, err
+	}
+	return port.GeneratedKey{PublicKey: input.PublicKey, EncryptedSecret: secret}, nil
 }
 
 func (e *fakeKeyEngine) ImportTLS(context.Context, port.ValidatedTLSKeyInput, port.KeySpec) (port.GeneratedKey, error) {

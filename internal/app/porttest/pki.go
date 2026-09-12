@@ -51,6 +51,15 @@ func (r pkiRepo) FindCertificateByDER(_ context.Context, derSHA256 domain.Finger
 	return r.s.certificates[id], nil
 }
 
+func (r pkiRepo) FindCertificateByIssuerSerial(_ context.Context, issuer domain.CAKeyGenerationID, serial domain.SerialNumber) (domain.Certificate, error) {
+	for _, certificate := range r.s.certificates {
+		if certificate.IssuerCAKeyGenerationID() == issuer && certificate.Serial().Equal(serial) {
+			return certificate, nil
+		}
+	}
+	return domain.Certificate{}, port.ErrNotFound
+}
+
 // GetCertificate looks up a certificate by its own id, the read
 // Renew/Reissue need to resolve a command's source_certificate_id (see
 // port.PKIRepository.GetCertificate's doc comment).
@@ -180,6 +189,41 @@ func (r pkiRepo) SaveAuthority(_ context.Context, authority domain.Authority, ex
 	}
 	r.s.authorities[authority.ID()] = authority
 	return nil
+}
+
+func (r pkiRepo) SaveCAKeyGeneration(_ context.Context, generation port.CAKeyGeneration) error {
+	existing, ok := r.s.caKeyGenerations[generation.ID]
+	if !ok {
+		return port.ErrNotFound
+	}
+	if !existing.KeyDestroyedAt.IsZero() && generation.KeyDestroyedAt.IsZero() {
+		return domain.ErrConflict
+	}
+	r.s.caKeyGenerations[generation.ID] = generation
+	return nil
+}
+
+func (r pkiRepo) ListCertificatesByIssuer(_ context.Context, issuer domain.CAKeyGenerationID) ([]domain.Certificate, error) {
+	out := make([]domain.Certificate, 0)
+	for _, certificate := range r.s.certificates {
+		if certificate.IssuerCAKeyGenerationID() == issuer {
+			out = append(out, certificate)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID() < out[j].ID() })
+	return out, nil
+}
+
+func (r pkiRepo) ListCACertificates(_ context.Context) ([]domain.Certificate, error) {
+	out := make([]domain.Certificate, 0, len(r.s.caCertRecords))
+	for certificateID := range r.s.caCertRecords {
+		certificate, ok := r.s.certificates[certificateID]
+		if ok && certificate.Kind() == domain.CertificateKindCA {
+			out = append(out, certificate)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID() < out[j].ID() })
+	return out, nil
 }
 
 // GetKeyMaterial looks up a key_material row by its own id, the ID-based

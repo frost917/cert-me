@@ -72,6 +72,18 @@ func seedCRLState(t *testing.T, store *porttest.Store, issuer domain.CAKeyGenera
 		t.Fatalf("new crl state: %v", err)
 	}
 	if err := store.Write(context.Background(), func(tx port.TxStores) error {
+		if _, err := tx.PKI().GetCAKeyGeneration(context.Background(), issuer); errors.Is(err, port.ErrNotFound) {
+			if err := tx.PKI().InsertKeyGeneration(context.Background(), port.CAKeyGeneration{
+				ID:            issuer,
+				AuthorityID:   domain.AuthorityID("44444444-4444-4444-8444-444444444444"),
+				KeyMaterialID: domain.KeyMaterialID("55555555-5555-4555-8555-555555555555"),
+				GenerationNo:  1,
+			}); err != nil {
+				return err
+			}
+		} else if err != nil {
+			return err
+		}
 		return tx.CRLs().SaveState(context.Background(), state, state.Version())
 	}); err != nil {
 		t.Fatalf("seed crl state: %v", err)

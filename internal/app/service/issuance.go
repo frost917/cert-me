@@ -437,11 +437,19 @@ func verifyCASigningKeyLive(ctx context.Context, tx port.TxStores, issuer domain
 		return domain.Certificate{}, port.CAKeyGeneration{}, contract.NewAppError(contract.ErrorKindForbidden,
 			"issuance_ca_key_destroyed", "the issuing authority's signing key has been destroyed")
 	}
+	if generation.AuthorityID != issuer.ID() {
+		return domain.Certificate{}, port.CAKeyGeneration{}, contract.NewAppError(contract.ErrorKindForbidden,
+			"issuance_ca_key_generation_mismatch", "the CA key generation does not belong to the issuing authority")
+	}
 
 	caCert, err := tx.PKI().GetCertificate(ctx, issuer.IssuanceCertificateID())
 	if err != nil {
 		return domain.Certificate{}, port.CAKeyGeneration{}, storeError(err, "issuance_issuer_certificate_read_failed",
 			"could not read the issuing authority's own certificate")
+	}
+	if caCert.Kind() != domain.CertificateKindCA {
+		return domain.Certificate{}, port.CAKeyGeneration{}, contract.NewAppError(contract.ErrorKindForbidden,
+			"issuance_issuer_certificate_invalid", "the issuing authority's own certificate is not a CA certificate")
 	}
 	if caCert.KeyMaterialID() != generation.KeyMaterialID {
 		return domain.Certificate{}, port.CAKeyGeneration{}, contract.NewAppError(contract.ErrorKindForbidden,
@@ -618,7 +626,7 @@ func appendIssuanceAudit(ctx context.Context, tx port.TxStores, ids port.IDGener
 			},
 		},
 	}
-	if err := tx.Audit().Append(ctx, event, []domain.AuthorityID{authorityID}); err != nil {
+	if err := tx.Audit().Append(ctx, event, port.NewAuthoritiesAuditScope(authorityID)); err != nil {
 		return storeError(err, "issuance_audit_failed", "could not record the issuance audit event")
 	}
 	return nil

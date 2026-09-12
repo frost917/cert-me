@@ -48,4 +48,20 @@ type TransitionRepository interface {
 	// ListImpacts returns every impact recorded under transitionID, used to
 	// build TransitionClosureFacts.AllImpactsAddressed for Complete.
 	ListImpacts(ctx context.Context, transitionID domain.TransitionID) ([]domain.TransitionImpact, error)
+
+	// ListDeploymentConfirmations returns every confirmation recorded under
+	// transitionID. Complete needs it for the other half of
+	// TransitionClosureFacts: AllImpactsAddressed comes from ListImpacts,
+	// and ManualDeploymentConfirmed comes from these rows
+	// (domain.TransitionClosureFacts documents it as read "from the
+	// confirmation rows").
+	//
+	// Added in B04 alongside the service that consumes it. Without it the
+	// §13 ruling 1 wiring -- "Complete는 기존 영향 처리·수동 외부 배포 확인
+	// 조건을 검사해 externally_completed로 옮긴다" -- has no way to read the
+	// confirmations it is required to check, and the only alternative would
+	// be for the service to assume a value it cannot observe. §13's closing
+	// paragraph governs: "범용 raw SQL 우회 대신 소비 서비스가 필요한 typed
+	// port를 추가한다."
+	ListDeploymentConfirmations(ctx context.Context, transitionID domain.TransitionID) ([]domain.DeploymentConfirmation, error)
 }
