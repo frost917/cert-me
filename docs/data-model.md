@@ -149,8 +149,10 @@ import 원본은 같은 번호라도 서로 다른 DER일 수 있으므로 crl_d
 | `maintenance_crl_requirements` | `(maintenance_run_id,ca_key_generation_id)` PK/FK, `minimum_generation`, `minimum_number_hex`, `satisfied_crl_id` FK nullable | 복구 서비스 재개를 막는 실제 CRL 대상·충족 증거 |
 | `operation_requests` | `(actor_key,operation,request_id)` UQ, `input_hash`, `state`, `result_certificate_id` FK nullable, `result_json` | 발급·갱신·재발급 재시도 결과. 결과에 토큰 원문·개인키 포함 금지 |
 | `jobs` | `kind`, `dedup_key` UQ, `payload_version`, `payload_json`, `state`, `available_at`, `lease_until`, `attempt_count`, `last_error_code` | 영속 작업 큐. CRL 발행·수령 만료·복구 정리 등. 원문 비밀 없음 |
-| `audit_events` | `occurred_at`, `actor_kind`, `actor_id` nullable, `token_id` nullable, `action`, `target_type`, `target_id`, `client_ip`, `result`, `details_json` | append-only 업무 감사. CLI/system actor 구분. 토큰 삭제 뒤에도 식별 메타데이터 보존 |
+| `audit_events` | `occurred_at`, `actor_kind`, `actor_id` nullable, `token_id` nullable, `action`, `target_type`, `target_id`, `client_ip`, `result`, `details_json`, `scope_kind` | append-only 업무 감사. scope_kind=installation/authorities. CLI/system actor 구분. 토큰 삭제 뒤에도 식별 메타데이터 보존 |
 | `audit_event_scopes` | `(event_id,authority_id)` PK/FK | 복수 CA 작업의 관련 범위. 장기 조회는 모든 범위 권한 필요 |
+
+scope_kind=installation은 단일 설치 전역 이벤트이며 authority 범위 행이 없다. authorities는 하나 이상의 범위 행을 요구한다. 빈 범위나 관계 조회 실패에서 전역 접근을 추정하지 않는다. B04는 typed 저장/조회 계약과 대역을 구현하고 실제 scope_kind SQL 추가·이관은 B05에서 수행한다. 기존 SQL에 이미 반영됐다는 뜻은 아니다. 전역 Action 분류·이관 조건은 [백엔드 구현 설계 §15.5](./backend-implementation.md#155-설치-전역-권한감사-범위)를 따른다.
 
 TLS 스냅샷은 active·교체 진행·롤백 후보가 참조하는 키를 유지한다. 완료 후 bootstrap 키는 삭제하되 공개 스냅샷·교체 기록은 보존한다. 따라서 과거 tls_version에 key_material이 있어도 secret이 있다고 가정하지 않는다. 재시작 복구는 완료 여부에 맞는 활성 버전만 사용한다.
 
