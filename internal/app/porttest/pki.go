@@ -182,6 +182,29 @@ func (r pkiRepo) SaveAuthority(_ context.Context, authority domain.Authority, ex
 	return nil
 }
 
+func (r pkiRepo) SaveCAKeyGeneration(_ context.Context, generation port.CAKeyGeneration) error {
+	existing, ok := r.s.caKeyGenerations[generation.ID]
+	if !ok {
+		return port.ErrNotFound
+	}
+	if !existing.KeyDestroyedAt.IsZero() && generation.KeyDestroyedAt.IsZero() {
+		return domain.ErrConflict
+	}
+	r.s.caKeyGenerations[generation.ID] = generation
+	return nil
+}
+
+func (r pkiRepo) ListCertificatesByIssuer(_ context.Context, issuer domain.CAKeyGenerationID) ([]domain.Certificate, error) {
+	out := make([]domain.Certificate, 0)
+	for _, certificate := range r.s.certificates {
+		if certificate.IssuerCAKeyGenerationID() == issuer {
+			out = append(out, certificate)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID() < out[j].ID() })
+	return out, nil
+}
+
 // GetKeyMaterial looks up a key_material row by its own id, the ID-based
 // read FindKeyBySPKI cannot serve (see port.PKIRepository.GetKeyMaterial's
 // doc comment).

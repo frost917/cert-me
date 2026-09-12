@@ -1,67 +1,9 @@
 // authority.go implements AuthorityService (docs/backend-implementation.md
-// §3 AuthorityService row): Create, Rename and SetIssuanceState.
-//
-// DestroyKey and Archive are deliberately NOT implemented here, the same way
-// issuance.go leaves Reissue/UpdateSeries/ArchiveSeries out of its assigned
-// scope. contract.AuthorityDestroyKeyCommand/AuthorityArchiveCommand already
-// exist (B02), so the command shape is not the gap -- the two are blocked
-// for two DIFFERENT reasons, verified separately rather than assumed:
-//
-//   - DestroyKey is a pure missing-CAPABILITY gap, not a product-decision
-//     gap. The business rule is already fully specified in domain:
-//     Authority.CanDestroyKey(ClosureFacts, now) checks issuance already
-//     stopped, every dependent certificate expired, required CRLs
-//     published, key not already destroyed -- nothing here is ambiguous.
-//     What is missing is a way to PERSIST the result: the fact DestroyKey
-//     must record is ca_key_generations.key_destroyed_at (§14.9's
-//     verifyCASigningKeyLive in certificate.go reads
-//     generation.KeyDestroyedAt directly, never Authority.KeyAvailable()).
-//     port.PKIRepository has GetCAKeyGeneration (read) and
-//     InsertKeyGeneration (first-row create) but NO method that saves a
-//     change to an EXISTING ca_key_generations row -- confirmed against
-//     both the interface (internal/app/port/pki.go) and its test double
-//     (internal/app/porttest/pki.go, which implements exactly the interface
-//     and no more, so its absence there is not an incomplete fake). Nothing
-//     in internal/app/service can substitute: SaveAuthority cannot help,
-//     because keyAvailable is not a column on the authorities table
-//     (docs/data-model.md's authorities row lists none) -- bumping it on an
-//     in-memory domain.Authority and calling SaveAuthority would bump
-//     authorities.version while leaving the real fact on
-//     ca_key_generations untouched, so a re-read would still report the key
-//     available. A future implementer needs one new port method (something
-//     shaped like SaveLeafKeyGeneration's no-expectedVersion convention, or
-//     MarkCompromised's narrower single-field-write shape) before DestroyKey
-//     can be written at all; nothing else about it is undecided.
-//   - Archive has TWO separate problems, one plumbing and one product.
-//     Plumbing: archived_at IS a column SaveAuthority already writes, but
-//     there is no domain.Authority transition method that produces a copy
-//     with it set -- unlike StopIssuance/Enable/Rename, which each exist
-//     specifically so a transition's invariants live in domain rather than
-//     being reassembled from facts in the app layer (docs/backend-
-//     implementation.md §5 "생성자에 Facts를 다시 조립하는 방식을 업무
-//     전이의 대체 수단으로 사용하지 않는다"). This alone would be a smaller
-//     gap than DestroyKey's (a method could plausibly be added without a
-//     new stored fact), except: Product decision: Archive's own
-//     preconditions are not settled by any doc this developer found. Must
-//     issuance already be stopped? Must the key already be destroyed
-//     first, i.e. is Archive only reachable after DestroyKey? Can an
-//     inventory (never-enabled) authority be archived directly?
-//     certificate-lifecycle.md's "CA 종료와 보관" section describes the end
-//     state ("한 번 발급에 사용한 CA ... 는 일반 삭제하지 않고 보관 상태로
-//     남긴다") but never names Archive as a distinct, separately-triggered
-//     transition with its own precondition set. Adding the missing method
-//     without an answer to this would mean inventing the precondition
-//     logic -- exactly what "never invent product behaviour" forbids.
-//     domain.LeafSeries has the identical missing-transition-method shape
-//     (no Archive-style method either, and IssuanceService.ArchiveSeries is
-//     likewise unimplemented per issuance.go's own comment), so this looks
-//     like a systemic B01 gap nobody has hit yet, not something specific to
-//     Authority.
-//
-// Both are reported to the lead rather than worked around by widening
-// internal/domain or internal/app/port, which are outside this developer's
-// assigned files (settings_service.go, settings_service_test.go,
-// authority.go, authority_test.go only).
+// §3 AuthorityService row): authority creation, policy changes, issuance
+// state transitions, closure/key destruction and archival. Closure facts are
+// read from the issuer's certificate and CRL rows while the authority row is
+// locked; the CA generation marker and signing secret are changed in the same
+// transaction as the authority transition.
 package service
 
 import (
@@ -180,12 +122,7 @@ func (v storedAuthorityCreateResult) toView(ctx context.Context, tx port.TxStore
 // toAuthorityView projects a domain.Authority into the OpenAPI response
 // shape. createdAt is the instant this call created the authority; pass the
 // zero value when the caller cannot know it (a replay, or an authority read
-// back after Rename/SetIssuanceState -- see the toView doc comment above).
-// ArchivedAt is always nil here: domain.Authority exposes IsArchived() but
-// no accessor for the underlying instant, and none of Create/Rename/
-// SetIssuanceState can ever produce an archived authority (both transitions
-// explicitly refuse when IsArchived() is already true), so there is nothing
-// this file could put there even if the accessor existed.
+// back after Rename/SetIssuanceState).
 func toAuthorityView(a domain.Authority, createdAt domain.Instant) contract.AuthorityView {
 	view := contract.AuthorityView{
 		ID:              a.ID(),
@@ -204,6 +141,9 @@ func toAuthorityView(a domain.Authority, createdAt domain.Instant) contract.Auth
 	}
 	if certID := a.IssuanceCertificateID(); certID != "" {
 		view.IssuanceCertificateID = &certID
+	}
+	if archivedAt := a.ArchivedAt(); !archivedAt.IsZero() {
+		view.ArchivedAt = &archivedAt
 	}
 	return view
 }
@@ -950,6 +890,227 @@ func (s *AuthorityService) SetIssuanceState(ctx context.Context, meta contract.M
 		}
 
 		result = toAuthorityView(next, domain.Instant{})
+		return nil
+	})
+	if err != nil {
+		return contract.AuthorityView{}, err
+	}
+	return result, nil
+}
+
+// authorityClosureFacts reads the stored certificates and CRL publication
+// state needed by Authority.Archive/DestroyKey. The CA generation row is the
+// issuer namespace; management parentage is not substituted for it.
+func authorityClosureFacts(ctx context.Context, tx port.TxStores, authority domain.Authority, now domain.Instant) (domain.ClosureFacts, error) {
+	certificates, err := tx.PKI().ListCertificatesByIssuer(ctx, authority.KeyGenerationID())
+	if err != nil {
+		return domain.ClosureFacts{}, storeError(err, "authority_closure_certificates_read_failed", "could not read certificates signed by the authority")
+	}
+	facts := domain.ClosureFacts{AllDependentCertificatesExpired: true}
+	for _, certificate := range certificates {
+		if !certificate.IsExpiredAt(now) {
+			facts.AllDependentCertificatesExpired = false
+			break
+		}
+	}
+	if len(certificates) == 0 {
+		// A never-used inventory authority has no certificate interval that
+		// requires a final CRL. This is the explicit inventory exception in
+		// backend-implementation.md §15.1.
+		facts.RequiredCRLsPublished = true
+		return facts, nil
+	}
+
+	state, err := tx.CRLs().GetStateForUpdate(ctx, authority.KeyGenerationID())
+	if errors.Is(err, port.ErrNotFound) {
+		return facts, nil
+	}
+	if err != nil {
+		return domain.ClosureFacts{}, storeError(err, "authority_closure_crl_state_read_failed", "could not read the authority's CRL state")
+	}
+	facts.RequiredCRLsPublished = state.PublishedDocumentID() != "" &&
+		state.PublishedGeneration() >= state.RevocationGeneration()
+	return facts, nil
+}
+
+// DestroyKey permanently removes the CA signing secret while preserving the
+// key material, certificates, issuance history and CRL state. Closure facts
+// are collected from current rows inside the same transaction that locks the
+// Authority and records the generation marker/version/audit changes.
+func (s *AuthorityService) DestroyKey(ctx context.Context, meta contract.MutationMeta, cmd contract.AuthorityDestroyKeyCommand) (contract.AuthorityView, error) {
+	if err := cmd.Validate(); err != nil {
+		return contract.AuthorityView{}, err
+	}
+	if !meta.Principal.IsAdmin() {
+		return contract.AuthorityView{}, contract.NewAppError(contract.ErrorKindForbidden, "authority_requires_admin",
+			"destroying an authority key requires an administrator session")
+	}
+	expectedVersion, err := meta.RequireExpectedVersion()
+	if err != nil {
+		return contract.AuthorityView{}, err
+	}
+
+	var result contract.AuthorityView
+	err = s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
+		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
+			return err
+		}
+		authority, err := tx.PKI().GetIssuerForUpdate(ctx, cmd.AuthorityID)
+		if errors.Is(err, port.ErrNotFound) {
+			return contract.NewAppError(contract.ErrorKindValidation, "authority_not_found", "authority does not exist").
+				WithField("authority_id", string(cmd.AuthorityID))
+		}
+		if err != nil {
+			return storeError(err, "authority_read_failed", "could not read the authority")
+		}
+		scope, err := authorityScopeFromRow(authority)
+		if err != nil {
+			return err
+		}
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionAuthorityDestroyKey, port.NewAuthorizationScope(scope)); err != nil {
+			return err
+		}
+		if authority.Version() != expectedVersion {
+			return contract.NewAppError(contract.ErrorKindConflict, "authority_version_conflict",
+				"authority has changed since this request was prepared")
+		}
+		if authority.KeyGenerationID() != cmd.KeyGenerationID {
+			return contract.NewAppError(contract.ErrorKindConflict, "authority_key_generation_mismatch",
+				"the requested key generation is not the authority's current generation")
+		}
+
+		generation, err := tx.PKI().GetCAKeyGeneration(ctx, cmd.KeyGenerationID)
+		if errors.Is(err, port.ErrNotFound) {
+			return contract.NewAppError(contract.ErrorKindValidation, "authority_key_generation_not_found",
+				"the requested CA key generation does not exist")
+		}
+		if err != nil {
+			return storeError(err, "authority_key_generation_read_failed", "could not read the CA key generation")
+		}
+		if generation.AuthorityID != authority.ID() {
+			return contract.NewAppError(contract.ErrorKindConflict, "authority_key_generation_mismatch",
+				"the requested key generation belongs to another authority")
+		}
+		now := s.deps.Clock.Now()
+		closure, err := authorityClosureFacts(ctx, tx, authority, now)
+		if err != nil {
+			return err
+		}
+		destroyed, err := authority.DestroyKey(closure, now)
+		if err != nil {
+			return contract.FromDomainError(err)
+		}
+		generation.KeyDestroyedAt = now
+		if err := tx.PKI().SaveCAKeyGeneration(ctx, generation); err != nil {
+			return storeError(err, "authority_key_generation_save_failed", "could not record CA key destruction")
+		}
+		purpose := domain.SecretPurposeCASigning
+		if authority.Kind() == domain.AuthorityKindBootstrap {
+			purpose = domain.SecretPurposeBootstrapCA
+		}
+		if err := tx.Secrets().Delete(ctx, generation.KeyMaterialID, purpose); err != nil {
+			return storeError(err, "authority_secret_delete_failed", "could not delete the CA signing secret")
+		}
+		if err := tx.PKI().SaveAuthority(ctx, destroyed, expectedVersion); err != nil {
+			return storeError(err, "authority_save_failed", "could not record authority key availability")
+		}
+
+		event := port.AuditEvent{
+			ID:         s.deps.IDs.NewUUID(),
+			OccurredAt: now,
+			ActorKind:  contract.AuditActorAccount,
+			ActorID:    string(meta.Principal.AccountID()),
+			Action:     "authority.destroy_key",
+			TargetType: "authority",
+			TargetID:   string(authority.ID()),
+			ClientIP:   clientIP(meta.RequestMeta),
+			Result:     contract.AuditResultSuccess,
+			Details: contract.AuditDetails{SchemaVersion: 1, Fields: map[string]string{
+				"key_generation_id": string(cmd.KeyGenerationID),
+				"justification":     cmd.Justification,
+			}},
+		}
+		if err := tx.Audit().Append(ctx, event, []domain.AuthorityID{scope}); err != nil {
+			return storeError(err, "authority_audit_failed", "could not record the key destruction audit event")
+		}
+		result = toAuthorityView(destroyed, domain.Instant{})
+		return nil
+	})
+	if err != nil {
+		return contract.AuthorityView{}, err
+	}
+	return result, nil
+}
+
+// Archive retains an authority and its public history after issuance has been
+// stopped, all dependent certificates have expired and the final CRL proof is
+// present. It does not destroy the signing key; that remains a separate
+// explicit DestroyKey operation.
+func (s *AuthorityService) Archive(ctx context.Context, meta contract.MutationMeta, cmd contract.AuthorityArchiveCommand) (contract.AuthorityView, error) {
+	if err := cmd.Validate(); err != nil {
+		return contract.AuthorityView{}, err
+	}
+	if !meta.Principal.IsAdmin() {
+		return contract.AuthorityView{}, contract.NewAppError(contract.ErrorKindForbidden, "authority_requires_admin",
+			"archiving an authority requires an administrator session")
+	}
+	expectedVersion, err := meta.RequireExpectedVersion()
+	if err != nil {
+		return contract.AuthorityView{}, err
+	}
+
+	var result contract.AuthorityView
+	err = s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
+		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
+			return err
+		}
+		authority, err := tx.PKI().GetIssuerForUpdate(ctx, cmd.AuthorityID)
+		if errors.Is(err, port.ErrNotFound) {
+			return contract.NewAppError(contract.ErrorKindValidation, "authority_not_found", "authority does not exist").
+				WithField("authority_id", string(cmd.AuthorityID))
+		}
+		if err != nil {
+			return storeError(err, "authority_read_failed", "could not read the authority")
+		}
+		scope, err := authorityScopeFromRow(authority)
+		if err != nil {
+			return err
+		}
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionAuthorityArchive, port.NewAuthorizationScope(scope)); err != nil {
+			return err
+		}
+		if authority.Version() != expectedVersion {
+			return contract.NewAppError(contract.ErrorKindConflict, "authority_version_conflict",
+				"authority has changed since this request was prepared")
+		}
+		now := s.deps.Clock.Now()
+		closure, err := authorityClosureFacts(ctx, tx, authority, now)
+		if err != nil {
+			return err
+		}
+		archived, err := authority.Archive(closure, now)
+		if err != nil {
+			return contract.FromDomainError(err)
+		}
+		if err := tx.PKI().SaveAuthority(ctx, archived, expectedVersion); err != nil {
+			return storeError(err, "authority_save_failed", "could not archive the authority")
+		}
+		event := port.AuditEvent{
+			ID:         s.deps.IDs.NewUUID(),
+			OccurredAt: now,
+			ActorKind:  contract.AuditActorAccount,
+			ActorID:    string(meta.Principal.AccountID()),
+			Action:     "authority.archive",
+			TargetType: "authority",
+			TargetID:   string(authority.ID()),
+			ClientIP:   clientIP(meta.RequestMeta),
+			Result:     contract.AuditResultSuccess,
+			Details:    contract.AuditDetails{SchemaVersion: 1},
+		}
+		if err := tx.Audit().Append(ctx, event, []domain.AuthorityID{scope}); err != nil {
+			return storeError(err, "authority_audit_failed", "could not record the authority archive audit event")
+		}
+		result = toAuthorityView(archived, domain.Instant{})
 		return nil
 	})
 	if err != nil {

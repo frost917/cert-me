@@ -206,6 +206,16 @@ type PKIRepository interface {
 	// contract.
 	SaveAuthority(ctx context.Context, authority domain.Authority, expectedVersion domain.Version) error
 
+	// SaveCAKeyGeneration persists the destruction marker on an existing CA
+	// generation. Authority destruction uses the locked Authority row for
+	// serialization because CA generations have no version column.
+	SaveCAKeyGeneration(ctx context.Context, generation CAKeyGeneration) error
+
+	// ListCertificatesByIssuer returns every certificate signed under one CA key
+	// generation, used to verify closure conditions before archival or key
+	// destruction.
+	ListCertificatesByIssuer(ctx context.Context, issuer domain.CAKeyGenerationID) ([]domain.Certificate, error)
+
 	// ListCertificatesUsingKey returns every certificate signed for
 	// keyMaterialID, the compromise-cascade lookup
 	// (docs/backend-implementation.md §11 U09 "유출 공개키의 유효 인증서

@@ -191,6 +191,141 @@ func newAuthorityFixture(t *testing.T) *authorityFixture {
 	return &authorityFixture{store: store, ids: ids, keyEngine: keyEngine, signer: signer, serials: serials, authorizer: authorizer, svc: svc, rootID: rootID}
 }
 
+// newClosedAuthorityFixture builds a stopped authority whose dependent CA
+// certificate is expired and whose latest CRL generation is published. It is
+// the smallest complete fixture for the Archive/DestroyKey closure contract.
+func newClosedAuthorityFixture(t *testing.T) (*porttest.Store, *seqIDs, *AuthorityService, domain.AuthorityID, domain.CAKeyGenerationID) {
+	t.Helper()
+	ctx := context.Background()
+	store := porttest.NewStore()
+	ids := &seqIDs{}
+	authorityID, err := domain.ParseAuthorityID(ids.NewUUID())
+	if err != nil {
+		t.Fatalf("authority id: %v", err)
+	}
+	seedTime := testNow().Add(domain.NewDuration(-20 * 365 * 24 * time.Hour))
+	keyGenerationID, certificateID := seedRootKeyGeneration(t, store, ids, authorityID, 1, "11", seedTime, domain.Instant{})
+	var certificate domain.Certificate
+	if err := store.Write(ctx, func(tx port.TxStores) error {
+		var err error
+		certificate, err = tx.PKI().GetCertificate(ctx, certificateID)
+		return err
+	}); err != nil {
+		t.Fatalf("read closed authority certificate: %v", err)
+	}
+	authority, err := domain.NewAuthority(domain.AuthorityFacts{
+		ID:                    authorityID,
+		Kind:                  domain.AuthorityKindRoot,
+		Name:                  "Closed Root",
+		IssuanceState:         domain.IssuanceStateStopped,
+		IssuanceCertificateID: certificateID,
+		KeyGenerationID:       keyGenerationID,
+		KeyAvailable:          true,
+		CertificateWindow:     certificate.Validity(),
+	})
+	if err != nil {
+		t.Fatalf("closed authority: %v", err)
+	}
+	crlDocumentID, err := domain.ParseCRLDocumentID(ids.NewUUID())
+	if err != nil {
+		t.Fatalf("crl document id: %v", err)
+	}
+	number, err := domain.ParseCRLNumber("1")
+	if err != nil {
+		t.Fatalf("crl number: %v", err)
+	}
+	crlState, err := domain.NewCRLState(domain.CRLStateFacts{
+		CAKeyGenerationID:    keyGenerationID,
+		RevocationGeneration: 1,
+		PublishedDocumentID:  crlDocumentID,
+		PublishedNumber:      number,
+		PublishedGeneration:  1,
+		PublicationState:     domain.PublicationStateActive,
+	})
+	if err != nil {
+		t.Fatalf("closed authority crl state: %v", err)
+	}
+	if err := store.Write(ctx, func(tx port.TxStores) error {
+		if err := tx.PKI().InsertAuthority(ctx, authority); err != nil {
+			return err
+		}
+		if err := tx.CRLs().InsertDocument(ctx, port.CRLDocument{
+			ID:                crlDocumentID,
+			CAKeyGenerationID: keyGenerationID,
+			NumberHex:         number,
+			DERSHA256:         domain.NewFingerprint([]byte("closed-crl")),
+			DER:               []byte("closed-crl"),
+			ThisUpdate:        seedTime,
+			CoveredGeneration: 1,
+			Origin:            "generated",
+		}); err != nil {
+			return err
+		}
+		return tx.CRLs().SaveState(ctx, crlState, crlState.Version())
+	}); err != nil {
+		t.Fatalf("seed closed authority: %v", err)
+	}
+	seedDefaultSettings(t, store)
+	seedAdminSessionForIssuance(t, store)
+	svc, err := NewAuthorityService(AuthorityDeps{
+		CommonDeps: CommonDeps{
+			UnitOfWork: store,
+			ReadStore:  store,
+			Authorizer: &toggleAuthorizer{allow: true},
+			Clock:      fixedClock{now: testNow()},
+			IDs:        ids,
+		},
+		KeyEngine:         &fakeKeyEngine{},
+		CertificateSigner: &fakeSigner{},
+		SerialGenerator:   &fakeSerialGenerator{},
+		ProfileValidator:  noopProfileValidator{},
+	})
+	if err != nil {
+		t.Fatalf("new closed authority service: %v", err)
+	}
+	return store, ids, svc, authorityID, keyGenerationID
+}
+
+func TestAuthorityServiceArchiveThenDestroyKeyPreservesHistoryAndDeletesSecret(t *testing.T) {
+	store, _, svc, authorityID, keyGenerationID := newClosedAuthorityFixture(t)
+
+	archived, err := svc.Archive(context.Background(), authorityVersionMeta(0), contract.AuthorityArchiveCommand{AuthorityID: authorityID})
+	if err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	if archived.ArchivedAt == nil || !archived.KeyAvailable {
+		t.Fatalf("Archive view = %+v, want archived authority with key retained", archived)
+	}
+
+	destroyed, err := svc.DestroyKey(context.Background(), authorityVersionMeta(archived.Version), contract.AuthorityDestroyKeyCommand{
+		AuthorityID:     authorityID,
+		KeyGenerationID: keyGenerationID,
+		Justification:   "retire closed authority",
+	})
+	if err != nil {
+		t.Fatalf("DestroyKey after Archive: %v", err)
+	}
+	if destroyed.KeyAvailable {
+		t.Fatal("DestroyKey view must report key_available=false")
+	}
+
+	if err := store.Write(context.Background(), func(tx port.TxStores) error {
+		generation, err := tx.PKI().GetCAKeyGeneration(context.Background(), keyGenerationID)
+		if err != nil {
+			return err
+		}
+		if generation.KeyDestroyedAt.IsZero() {
+			t.Fatal("key_destroyed_at was not persisted")
+		}
+		if _, err := tx.Secrets().GetEncrypted(context.Background(), generation.KeyMaterialID, domain.SecretPurposeCASigning); !errors.Is(err, port.ErrNotFound) {
+			t.Fatalf("CA signing secret error = %v, want ErrNotFound", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify destroyed key: %v", err)
+	}
+}
+
 func rootCreateCommand(name string) contract.AuthorityCreateCommand {
 	return contract.AuthorityCreateCommand{
 		Kind:    string(domain.AuthorityKindRoot),
@@ -393,10 +528,8 @@ func TestAuthorityServiceCreateRejectsWhenParentKeyAlreadyDestroyed(t *testing.T
 	if err != nil {
 		t.Fatalf("authority id: %v", err)
 	}
-	// InsertKeyGeneration is the only way this test double can express a
-	// destroyed key at all (see authority.go's DestroyKey gap comment: there
-	// is no port method to destroy an EXISTING generation's key), so the
-	// destroyed state is seeded directly at insert time.
+	// InsertKeyGeneration seeds a generation whose signing key was already
+	// destroyed, allowing the service to exercise the parent-key guard.
 	keyGenID, certID := seedRootKeyGeneration(t, store, ids, authorityID, 1, "11", testNow(), testNow())
 	certRow, err := func() (domain.Certificate, error) {
 		var c domain.Certificate

@@ -140,6 +140,7 @@ func (a Authority) KeyAvailable() bool                   { return a.keyAvailable
 func (a Authority) Affected() bool                       { return a.affected }
 func (a Authority) PendingTakeover() bool                { return a.pendingTakeover }
 func (a Authority) CertificateWindow() ValidityWindow    { return a.certificateWindow }
+func (a Authority) ArchivedAt() Instant                  { return a.archivedAt }
 func (a Authority) Version() Version                     { return a.version }
 
 func (a Authority) IsArchived() bool { return !a.archivedAt.IsZero() }
@@ -332,9 +333,6 @@ type ClosureFacts struct {
 // dependent expiry) must be published, and the key must not already be
 // destroyed.
 func (a Authority) CanDestroyKey(facts ClosureFacts, now Instant) error {
-	if a.IsArchived() {
-		return fmt.Errorf("%w: authority is archived", ErrInvalidTransition)
-	}
 	if !a.keyAvailable {
 		return fmt.Errorf("%w: authority signing key is already destroyed", ErrAlreadyConsumed)
 	}
@@ -349,6 +347,59 @@ func (a Authority) CanDestroyKey(facts ClosureFacts, now Instant) error {
 	}
 	_ = now // reserved: a future grace-period check may compare against now
 	return nil
+}
+
+// DestroyKey records the authority-side half of permanent signing-key
+// destruction. The CA generation's key_destroyed_at and secret row are stored
+// by the application transaction; this transition only changes the aggregate's
+// key availability and version after the same closure facts have passed.
+func (a Authority) DestroyKey(facts ClosureFacts, now Instant) (Authority, error) {
+	if err := a.CanDestroyKey(facts, now); err != nil {
+		return Authority{}, err
+	}
+	next := a
+	next.keyAvailable = false
+	next.version = a.version.Next()
+	return next, nil
+}
+
+// Archive moves a stopped authority into its retained historical state. It
+// does not destroy a key and does not implicitly stop issuance: callers must
+// satisfy the closure facts and explicitly stop issuance before invoking it.
+func (a Authority) Archive(facts ClosureFacts, now Instant) (Authority, error) {
+	if a.IsArchived() {
+		return Authority{}, fmt.Errorf("%w: authority is already archived", ErrInvalidTransition)
+	}
+	if a.issuanceState == IssuanceStateEnabled {
+		return Authority{}, fmt.Errorf("%w: authority must stop issuance before archival", ErrNotPermitted)
+	}
+	if !facts.AllDependentCertificatesExpired {
+		return Authority{}, fmt.Errorf("%w: dependent certificates have not all expired", ErrNotPermitted)
+	}
+	if !facts.RequiredCRLsPublished {
+		return Authority{}, fmt.Errorf("%w: required crl publications are not complete", ErrNotPermitted)
+	}
+	next := a
+	next.archivedAt = now
+	next.version = a.version.Next()
+	return next, nil
+}
+
+// AttachSigningKey makes an existing, independently verified key available to
+// an inventory authority. It never changes the key generation or issuance
+// state; the service layer verifies SPKI, destruction and compromise facts
+// before calling this transition.
+func (a Authority) AttachSigningKey() (Authority, error) {
+	if a.IsArchived() {
+		return Authority{}, fmt.Errorf("%w: authority is archived", ErrInvalidTransition)
+	}
+	if a.keyAvailable {
+		return Authority{}, fmt.Errorf("%w: authority signing key is already available", ErrConflict)
+	}
+	next := a
+	next.keyAvailable = true
+	next.version = a.version.Next()
+	return next, nil
 }
 
 // AuthorityPolicy is the subset of authority configuration an operator can

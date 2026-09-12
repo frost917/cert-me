@@ -365,3 +365,67 @@ func TestAuthority_CanDestroyKey(t *testing.T) {
 		}
 	})
 }
+
+func TestAuthority_ArchiveDoesNotDestroyKeyAndDestroyedKeyMayFollow(t *testing.T) {
+	facts := baseAuthorityFacts()
+	facts.IssuanceState = IssuanceStateStopped
+	authority, err := NewAuthority(facts)
+	if err != nil {
+		t.Fatalf("NewAuthority: %v", err)
+	}
+	now := NewInstant(time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC))
+	closure := ClosureFacts{AllDependentCertificatesExpired: true, RequiredCRLsPublished: true}
+
+	archived, err := authority.Archive(closure, now)
+	if err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	if !archived.IsArchived() || !archived.ArchivedAt().Equal(now) {
+		t.Fatalf("archived_at = %v, want %v", archived.ArchivedAt(), now)
+	}
+	if !archived.KeyAvailable() {
+		t.Fatal("Archive must not destroy the signing key")
+	}
+
+	destroyed, err := archived.DestroyKey(closure, now)
+	if err != nil {
+		t.Fatalf("DestroyKey after Archive: %v", err)
+	}
+	if destroyed.KeyAvailable() {
+		t.Fatal("DestroyKey must make the signing key unavailable")
+	}
+}
+
+func TestAuthority_AttachSigningKeyOnlyChangesAvailability(t *testing.T) {
+	facts := baseAuthorityFacts()
+	facts.IssuanceState = IssuanceStateInventory
+	facts.KeyAvailable = false
+	authority, err := NewAuthority(facts)
+	if err != nil {
+		t.Fatalf("NewAuthority: %v", err)
+	}
+
+	attached, err := authority.AttachSigningKey()
+	if err != nil {
+		t.Fatalf("AttachSigningKey: %v", err)
+	}
+	if !attached.KeyAvailable() || attached.KeyGenerationID() != authority.KeyGenerationID() || attached.IssuanceState() != authority.IssuanceState() {
+		t.Fatal("AttachSigningKey must preserve the existing generation and issuance state")
+	}
+	if attached.Version() != authority.Version().Next() {
+		t.Fatalf("version = %v, want %v", attached.Version(), authority.Version().Next())
+	}
+
+	if _, err := attached.AttachSigningKey(); !errors.Is(err, ErrConflict) {
+		t.Fatalf("second AttachSigningKey error = %v, want ErrConflict", err)
+	}
+	archived := attached
+	archivedFacts := ClosureFacts{AllDependentCertificatesExpired: true, RequiredCRLsPublished: true}
+	archived, err = archived.Archive(archivedFacts, NewInstant(time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)))
+	if err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	if _, err := archived.AttachSigningKey(); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("AttachSigningKey after Archive error = %v, want ErrInvalidTransition", err)
+	}
+}
