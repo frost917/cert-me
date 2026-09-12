@@ -132,6 +132,16 @@ const (
 	ActionTransitionSetTarget         Action = "Transition.SetTarget"
 	ActionTransitionConfirmDeployment Action = "Transition.ConfirmDeployment"
 	ActionTransitionComplete          Action = "Transition.Complete"
+	// ActionTransitionClose is the separate authorization for the closing
+	// half of §13 ruling 1. Complete and Close are different operations on
+	// different preconditions -- Complete checks impacts and the manual
+	// deployment confirmation to reach externally_completed, Close checks
+	// that the source CA's publication has actually ended, and the ruling is
+	// explicit that "closed는 ... Complete만으로 추정하지 않는다". Ruling 5
+	// declares one Action per operation, so reusing Complete's here would
+	// leave an Authorizer unable to tell the two apart the moment the role
+	// model stops being admin-only.
+	ActionTransitionClose             Action = "Transition.Close"
 	ActionCRLRequestPublication       Action = "CRL.RequestPublication"
 	ActionCRLPublish                  Action = "CRL.Publish"
 	ActionTLSStatus                   Action = "TLS.Status"
@@ -216,7 +226,7 @@ var definedActions = map[Action]bool{
 	ActionImportPreview: true, ActionImportCommit: true, ActionImportAttachSigningKey: true,
 	ActionImportConfirmTakeover: true,
 	ActionTransitionCreate:      true, ActionTransitionSetTarget: true, ActionTransitionConfirmDeployment: true,
-	ActionTransitionComplete:    true,
+	ActionTransitionComplete: true, ActionTransitionClose: true,
 	ActionCRLRequestPublication: true, ActionCRLPublish: true,
 	ActionTLSStatus: true, ActionTLSUploadCandidate: true, ActionTLSIssueCandidate: true,
 	ActionTLSReload: true, ActionTLSActivate: true,

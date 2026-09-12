@@ -59,6 +59,20 @@ type JobRepository interface {
 	// read before the merge loses rather than erasing the new demand.
 	UpsertDemand(ctx context.Context, dedupKey, kind string, payloadVersion int, payload []byte) error
 
+	// GetByDedupKey returns the single job row holding dedupKey's work, or
+	// ErrNotFound when no demand has ever been recorded under it.
+	//
+	// UpsertDemand deliberately returns only an error: merging a demand is
+	// the whole of its contract and every existing caller wants nothing
+	// back. A caller that must NAME the resulting job -- CRLService.
+	// RequestPublication, whose JobAccepted result is a job id -- reads it
+	// back through this method instead, rather than UpsertDemand growing a
+	// return value that four other call sites would have to ignore.
+	//
+	// Added in B04 under §13's rule that a consuming service gets the typed
+	// port it needs.
+	GetByDedupKey(ctx context.Context, dedupKey string) (Job, error)
+
 	// ClaimDue selects up to limit jobs available at or before now, sets
 	// their lease_until to leaseUntil and returns them. A job whose lease
 	// has already expired is due again for claiming, which is how a crashed

@@ -67,7 +67,11 @@ func (r jobRepo) UpsertDemand(_ context.Context, dedupKey, kind string, payloadV
 		r.s.jobs[id] = existing
 		return nil
 	}
-	id := domain.JobID(dedupKey + ":" + itoa(len(r.s.jobs)+1))
+	// jobs.id is a uuid in the real schema, and contract commands that carry
+	// a job id validate it as one, so the double must mint the same shape --
+	// a counter-based "dedupkey:3" would make a service that round-trips a
+	// job id through a command untestable here for the wrong reason.
+	id := domain.JobID(syntheticUUID(len(r.s.jobs) + 1))
 	r.s.jobs[id] = port.Job{
 		ID:             id,
 		Kind:           kind,
@@ -174,4 +178,33 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(buf[i:])
+}
+
+// syntheticUUID builds a deterministic, validly-shaped uuid from a counter,
+// so stored job ids are reproducible across a test run while still passing
+// the uuid validation a contract command applies to them.
+func syntheticUUID(n int) string {
+	const hex = "0123456789abcdef"
+	var buf [32]byte
+	for i := 31; i >= 0; i-- {
+		buf[i] = hex[n&0xf]
+		n >>= 4
+	}
+	// version 4, variant 10xx: the shape domain.Parse*ID enforces.
+	buf[12] = '4'
+	buf[16] = '8'
+	return string(buf[0:8]) + "-" + string(buf[8:12]) + "-" + string(buf[12:16]) + "-" + string(buf[16:20]) + "-" + string(buf[20:32])
+}
+
+// GetByDedupKey returns the job row holding dedupKey's work.
+func (r jobRepo) GetByDedupKey(_ context.Context, dedupKey string) (port.Job, error) {
+	id, ok := r.s.jobByDedup[dedupKey]
+	if !ok {
+		return port.Job{}, port.ErrNotFound
+	}
+	job, ok := r.s.jobs[id]
+	if !ok {
+		return port.Job{}, port.ErrNotFound
+	}
+	return cloneJob(job), nil
 }
