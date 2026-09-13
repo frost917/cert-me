@@ -332,14 +332,12 @@ func TestAuthority_CanSignCRL_EnforcesValidityWindow(t *testing.T) {
 }
 
 func TestAuthority_CanDestroyKey(t *testing.T) {
-	now := NewInstant(time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC))
-
 	t.Run("blocked while still enabled", func(t *testing.T) {
 		authority, err := NewAuthority(baseAuthorityFacts())
 		if err != nil {
 			t.Fatalf("NewAuthority: %v", err)
 		}
-		err = authority.CanDestroyKey(ClosureFacts{AllDependentCertificatesExpired: true, RequiredCRLsPublished: true}, now)
+		err = authority.CanDestroyKey(ClosureFacts{AllDependentCertificatesExpired: true, RequiredCRLsPublished: true})
 		if !errors.Is(err, ErrNotPermitted) {
 			t.Fatalf("expected ErrNotPermitted, got %v", err)
 		}
@@ -352,7 +350,7 @@ func TestAuthority_CanDestroyKey(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewAuthority: %v", err)
 		}
-		err = authority.CanDestroyKey(ClosureFacts{AllDependentCertificatesExpired: false, RequiredCRLsPublished: true}, now)
+		err = authority.CanDestroyKey(ClosureFacts{AllDependentCertificatesExpired: false, RequiredCRLsPublished: true})
 		if !errors.Is(err, ErrNotPermitted) {
 			t.Fatalf("expected ErrNotPermitted, got %v", err)
 		}
@@ -365,7 +363,7 @@ func TestAuthority_CanDestroyKey(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewAuthority: %v", err)
 		}
-		err = authority.CanDestroyKey(ClosureFacts{AllDependentCertificatesExpired: true, RequiredCRLsPublished: false}, now)
+		err = authority.CanDestroyKey(ClosureFacts{AllDependentCertificatesExpired: true, RequiredCRLsPublished: false})
 		if !errors.Is(err, ErrNotPermitted) {
 			t.Fatalf("expected ErrNotPermitted, got %v", err)
 		}
@@ -378,7 +376,7 @@ func TestAuthority_CanDestroyKey(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewAuthority: %v", err)
 		}
-		err = authority.CanDestroyKey(ClosureFacts{AllDependentCertificatesExpired: true, RequiredCRLsPublished: true}, now)
+		err = authority.CanDestroyKey(ClosureFacts{AllDependentCertificatesExpired: true, RequiredCRLsPublished: true})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -392,7 +390,7 @@ func TestAuthority_CanDestroyKey(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewAuthority: %v", err)
 		}
-		err = authority.CanDestroyKey(ClosureFacts{AllDependentCertificatesExpired: true, RequiredCRLsPublished: true}, now)
+		err = authority.CanDestroyKey(ClosureFacts{AllDependentCertificatesExpired: true, RequiredCRLsPublished: true})
 		if !errors.Is(err, ErrAlreadyConsumed) {
 			t.Fatalf("expected ErrAlreadyConsumed, got %v", err)
 		}
@@ -420,7 +418,7 @@ func TestAuthority_ArchiveDoesNotDestroyKeyAndDestroyedKeyMayFollow(t *testing.T
 		t.Fatal("Archive must not destroy the signing key")
 	}
 
-	destroyed, err := archived.DestroyKey(closure, now)
+	destroyed, err := archived.DestroyKey(closure)
 	if err != nil {
 		t.Fatalf("DestroyKey after Archive: %v", err)
 	}

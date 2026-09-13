@@ -28,6 +28,21 @@ type CommonDeps struct {
 	IDs        port.IDGenerator
 }
 
+// QueryDeps contains only the read-side dependencies used by QueryService.
+type QueryDeps struct {
+	ReadStore  port.ReadStore
+	Authorizer port.Authorizer
+	Clock      port.Clock
+}
+
+func (d QueryDeps) Validate() error {
+	return firstMissing(
+		required{"ReadStore", d.ReadStore == nil},
+		required{"Authorizer", d.Authorizer == nil},
+		required{"Clock", d.Clock == nil},
+	)
+}
+
 // Validate reports the first missing common dependency. Construction fails
 // at startup rather than at the first request (§5 "필수 의존성이 nil이면
 // 시작 시 실패한다").

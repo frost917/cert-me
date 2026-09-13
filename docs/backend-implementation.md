@@ -49,7 +49,7 @@ AuthorityID, CAKeyGenerationID, CertificateID, SeriesID, LeafKeyGenerationID, Ke
 | 객체 | 생성/메서드 | 규칙·반환값 |
 | --- | --- | --- |
 | Certificate | ParseCertificate를 통과한 CertificateFacts로 NewCertificate, IsValidAt(now) | 원본 DER 불변. 암호학적 파싱은 어댑터, 원본 기간/식별자는 객체 |
-| Authority | CanIssue(IssuerContext, now), StopIssuance(), CanDestroyKey(ClosureFacts, now) | 인증서·키·인수·상위 영향 검사, 중지와 CRL 서명 허용 분리 |
+| Authority | CanIssue(IssuerContext, now), StopIssuance(), CanDestroyKey(ClosureFacts) | 인증서·키·인수·상위 영향 검사, 중지와 CRL 서명 허용 분리 |
 | LeafSeries | PlanRenewal(RenewalFacts, now), ChangePolicy(policy) | RenewalPlan에 reuse/rotate, 다음 횟수·대상 issuer·기간. 입력 객체를 미리 변경하지 않음 |
 | Delivery | CanConsume(now), Consume(now), Complete(now), Fail(code, now), Expire(now) | 전이마다 새 상태/오류 반환. 완료는 서버 전송 관측값 |
 | DownloadGrant | Validate(purpose, certificateID, deliveryID, now), Consume(now), Invalidate(now) | 토큰·권한·대상 결합. 원문 토큰 미보유 |
@@ -172,13 +172,13 @@ Write callback 내부 순서는 인증/권한 확인 → 요청 결과 재확인
 | --- | --- |
 | Setup/Identity | PasswordHasher, TokenCodec |
 | Settings | URLValidator, 현재 TLS 공개 스냅샷 조회 |
-| Authority/Issuance | KeyEngine, CertificateSigner, SerialGenerator, ProfileValidator |
+| Authority/Issuance | KeyEngine, CertificateSigner, SerialGenerator |
 | Distribution | TokenCodec, DeliveryEncoder, PublicCertificateEncoder, OperationalLogger, RuntimeGate |
 | Revocation/Transition | 추가 외부 I/O 없음; app 내부 revocationChanges 공통 함수 |
 | Import | PKIParser, ChainValidator, KeyEngine |
 | CRL | CRLSigner |
 | TLS | KeyEngine, CertificateSigner, ChainValidator, TLSInstaller, 허용된 파일 소스 |
-| Query | ReadStore, Authorizer |
+| Query | ReadStore, Authorizer, Clock |
 | Maintenance | KeyEngine, RuntimeGate; CRL 후속 작업은 JobStore로 기록 |
 
 app 내부 `applyRevocations(ctx, tx, changes, meta)`는 폐기 병합·generation 증가·CRL 작업·감사 추가를 함께 수행한다. Distribution의 실패/만료, Transition의 부모 CA 폐기, Import의 CRL 병합, RevocationService가 이 함수를 사용한다. 자체 트랜잭션을 열지 않는다. 여러 항목은 issuer별 generation을 한 번 증가시키고 같은 generation을 부여할 수 있다.

@@ -1073,37 +1073,6 @@ func (s *ImportService) buildVerificationChain(ctx context.Context, tx port.TxSt
 	return chain, nil
 }
 
-// existingIssuerChainDER walks the ALREADY-stored issuer chain starting AT
-// (and including) certID, up to and including the self-signed root, using
-// the same stored-relation walk buildChainDER uses for a leaf -- but
-// starting from an arbitrary CA certificate id rather than a leaf's own
-// record, since Import resolves issuers by certificate id directly.
-func existingIssuerChainDER(ctx context.Context, tx port.TxStores, certID domain.CertificateID) ([][]byte, error) {
-	var chain [][]byte
-	seen := map[domain.CertificateID]struct{}{}
-	next := certID
-	for depth := 0; depth < maxChainDepth; depth++ {
-		if _, cycle := seen[next]; cycle {
-			return nil, chainError("import_chain_cycle", "the stored issuer chain is cyclic", next)
-		}
-		seen[next] = struct{}{}
-		cert, err := tx.PKI().GetCertificate(ctx, next)
-		if err != nil {
-			return nil, storeError(err, "import_chain_certificate_read_failed", "could not read a chain certificate")
-		}
-		chain = append(chain, cert.DER())
-		record, err := tx.PKI().GetCACertificateRecord(ctx, next)
-		if err != nil {
-			return nil, storeError(err, "import_chain_record_read_failed", "could not read a CA certificate record")
-		}
-		if record.IssuerCACertificateID == "" {
-			return chain, nil
-		}
-		next = record.IssuerCACertificateID
-	}
-	return nil, chainError("import_chain_too_deep", "the stored issuer chain is longer than supported", certID)
-}
-
 // ---- manifest/item projection ----
 
 func buildManifestAndItems(out []importResolution) (contract.PublicImportManifest, []contract.ImportItemView, error) {
@@ -1186,7 +1155,7 @@ func (s *ImportService) Preview(ctx context.Context, meta contract.MutationMeta,
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionImportPreview, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionImportPreview, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		resolved, err := s.resolveImportItems(ctx, tx, files)
@@ -1221,7 +1190,7 @@ func (s *ImportService) checkAuth(ctx context.Context, meta contract.MutationMet
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		return s.deps.Authorizer.Authorize(ctx, meta.Principal, action, port.NewAuthorizationScope())
+		return s.deps.Authorizer.Authorize(ctx, meta.Principal, action, port.NewInstallationAuthorizationScope())
 	})
 }
 
@@ -1407,7 +1376,7 @@ func (s *ImportService) replayCommit(ctx context.Context, reqKey port.OperationR
 		if err := requireCurrentAuth(ctx, tx, principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, principal, port.ActionImportCommit, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, principal, port.ActionImportCommit, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		stored, ok, err := ReplayStoredResult(ctx, tx, reqKey, inputHash)
@@ -1486,16 +1455,13 @@ func verifyPreviewManifestMatches(cmd contract.ImportUploadCommand, files []pars
 // item by its own DER SHA-256 (contract.ImportTakeoverConfirmationInput.
 // CACertificateSHA256Hex). A matched CA is created with PendingTakeover=true
 // plus a pending ca_takeovers row for ConfirmTakeover to later confirm; an
-// unmatched imported CA is created with PendingTakeover=false. No doc
-// settles whether every imported CA MUST carry a takeover declaration --
-// see this file's report to the lead -- so an absent declaration is treated
-// as the operator's choice not to gate this CA behind a takeover
-// confirmation, not as a validation error.
+// unmatched imported CA is created with PendingTakeover=false. An absent
+// declaration does not require takeover confirmation.
 func (s *ImportService) commitImport(ctx context.Context, tx port.TxStores, meta contract.MutationMeta, reqKey port.OperationRequestKey, inputHash string, files []parsedImportFile, takeovers []contract.ImportTakeoverConfirmationInput, preparedKeys map[string]preparedImportKey, result *contract.ImportResultView) error {
 	if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 		return err
 	}
-	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionImportCommit, port.NewAuthorizationScope()); err != nil {
+	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionImportCommit, port.NewInstallationAuthorizationScope()); err != nil {
 		return err
 	}
 	if stored, found, err := ReplayStoredResult(ctx, tx, reqKey, inputHash); err != nil {
@@ -1757,7 +1723,7 @@ func (s *ImportService) AttachSigningKey(ctx context.Context, meta contract.Muta
 		if err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionImportAttachSigningKey, port.NewAuthorizationScope(scope)); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionImportAttachSigningKey, port.NewAuthoritiesAuthorizationScope(scope)); err != nil {
 			return err
 		}
 		if authority.Version() != expectedVersion {
@@ -1842,7 +1808,7 @@ func (s *ImportService) AttachSigningKey(ctx context.Context, meta contract.Muta
 		if err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionImportAttachSigningKey, port.NewAuthorizationScope(scope)); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionImportAttachSigningKey, port.NewAuthoritiesAuthorizationScope(scope)); err != nil {
 			return err
 		}
 		if authority.Version() != expectedVersion {
@@ -2281,7 +2247,7 @@ func (s *ImportService) attachImportedExistingKey(ctx context.Context, tx port.T
 	if err != nil {
 		return err
 	}
-	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionImportAttachSigningKey, port.NewAuthorizationScope(scope)); err != nil {
+	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionImportAttachSigningKey, port.NewAuthoritiesAuthorizationScope(scope)); err != nil {
 		return err
 	}
 	if authority.KeyGenerationID() != generationID || authority.IssuanceCertificateID() != certificate.ID() {
@@ -2594,14 +2560,8 @@ func (s *ImportService) insertImportedAuthority(
 	return certificateID, authorityID, keyGenerationID, nil
 }
 
-// insertPendingTakeover stores the pending ca_takeovers row a freshly
-// imported, PendingTakeover-flagged authority needs before ConfirmTakeover
-// can ever confirm it. This is the missing link the lead's mid-task
-// correction named: without it, ConfirmTakeover had no path through Commit
-// that could ever produce a row for it to act on -- exactly the kind of gap
-// §13's closing paragraph refuses to accept as contract completeness ("대역
-// 내부 map에 직접 fixture를 넣어야만 가능한 정상 업무 흐름은 계약 완성으로
-// 인정하지 않는다").
+// insertPendingTakeover stores the pending takeover alongside its imported CA,
+// so ConfirmTakeover can resolve the same generation without fixture-only state.
 func (s *ImportService) insertPendingTakeover(ctx context.Context, tx port.TxStores, keyGenerationID domain.CAKeyGenerationID, confirmation contract.ImportTakeoverConfirmationInput) error {
 	takeoverID, err := domain.ParseTakeoverID(s.deps.IDs.NewUUID())
 	if err != nil {
@@ -2688,7 +2648,7 @@ func (s *ImportService) ConfirmTakeover(ctx context.Context, meta contract.Mutat
 		if err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionImportConfirmTakeover, port.NewAuthorizationScope(scope)); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionImportConfirmTakeover, port.NewAuthoritiesAuthorizationScope(scope)); err != nil {
 			return err
 		}
 		if authority.Version() != expectedVersion {

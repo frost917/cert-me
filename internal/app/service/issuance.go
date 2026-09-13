@@ -27,15 +27,12 @@ const (
 )
 
 // IssuanceDeps is IssuanceService's dependency set: CommonDeps plus the
-// signing dependencies docs/backend-implementation.md §5 names for
-// Authority/Issuance ("KeyEngine, CertificateSigner, SerialGenerator,
-// ProfileValidator").
+// signing dependencies required for issuance.
 type IssuanceDeps struct {
 	CommonDeps
 	KeyEngine         port.KeyEngine
 	CertificateSigner port.CertificateSigner
 	SerialGenerator   port.SerialGenerator
-	ProfileValidator  port.ProfileValidator
 }
 
 // Validate reports the first missing dependency, common or Issuance-specific
@@ -49,7 +46,6 @@ func (d IssuanceDeps) Validate() error {
 		required{"KeyEngine", d.KeyEngine == nil},
 		required{"CertificateSigner", d.CertificateSigner == nil},
 		required{"SerialGenerator", d.SerialGenerator == nil},
-		required{"ProfileValidator", d.ProfileValidator == nil},
 	)
 }
 
@@ -693,7 +689,7 @@ func (s *IssuanceService) Issue(ctx context.Context, meta contract.MutationMeta,
 	// admission check, so permission is settled before preparation starts.
 	// It is checked again inside the commit -- preparation reads can never
 	// authorize a commit.
-	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionIssuanceIssue, port.NewAuthorizationScope(authorityID)); err != nil {
+	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionIssuanceIssue, port.NewAuthoritiesAuthorizationScope(authorityID)); err != nil {
 		return contract.IssuanceView{}, err
 	}
 
@@ -807,7 +803,7 @@ func (s *IssuanceService) replayBeforePreparation(
 // command, which needs no store read of its own.
 func (s *IssuanceService) authorizeIssue(principal contract.Principal, authorityID domain.AuthorityID) func(context.Context, port.TxStores) error {
 	return func(ctx context.Context, _ port.TxStores) error {
-		return s.deps.Authorizer.Authorize(ctx, principal, port.ActionIssuanceIssue, port.NewAuthorizationScope(authorityID))
+		return s.deps.Authorizer.Authorize(ctx, principal, port.ActionIssuanceIssue, port.NewAuthoritiesAuthorizationScope(authorityID))
 	}
 }
 
@@ -825,7 +821,7 @@ func (s *IssuanceService) authorizeRenew(principal contract.Principal, seriesID 
 			return storeError(err, "issuance_series_read_failed", "could not read the series")
 		}
 		return s.deps.Authorizer.Authorize(ctx, principal, port.ActionIssuanceRenew,
-			port.NewAuthorizationScope(snapshot.Series.ManagementAuthorityID()))
+			port.NewAuthoritiesAuthorizationScope(snapshot.Series.ManagementAuthorityID()))
 	}
 }
 
@@ -960,7 +956,7 @@ func (s *IssuanceService) commitIssue(ctx context.Context, tx port.TxStores, met
 	if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 		return err
 	}
-	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionIssuanceIssue, port.NewAuthorizationScope(authorityID)); err != nil {
+	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionIssuanceIssue, port.NewAuthoritiesAuthorizationScope(authorityID)); err != nil {
 		return err
 	}
 
@@ -1259,7 +1255,7 @@ func (s *IssuanceService) prepareRenew(ctx context.Context, meta contract.Mutati
 		}
 		prep.snapshot = snapshot
 
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionIssuanceRenew, port.NewAuthorizationScope(snapshot.Series.ManagementAuthorityID())); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionIssuanceRenew, port.NewAuthoritiesAuthorizationScope(snapshot.Series.ManagementAuthorityID())); err != nil {
 			return err
 		}
 		if snapshot.Series.IsArchived() {
@@ -1489,7 +1485,7 @@ func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, met
 	if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 		return err
 	}
-	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionIssuanceRenew, port.NewAuthorizationScope(snapshot.Series.ManagementAuthorityID())); err != nil {
+	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionIssuanceRenew, port.NewAuthoritiesAuthorizationScope(snapshot.Series.ManagementAuthorityID())); err != nil {
 		return err
 	}
 

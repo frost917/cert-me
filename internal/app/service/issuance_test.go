@@ -163,18 +163,6 @@ func (a *toggleAuthorizer) Authorize(context.Context, contract.Principal, port.A
 	return contract.NewAppError(contract.ErrorKindForbidden, "not_authorized", "principal is not authorized")
 }
 
-// noopProfileValidator satisfies the required ProfileValidator dependency.
-// docs/backend-implementation.md §5 lists it for Authority/Issuance, but
-// port.ProfileValidator's own doc comment says the operator-configurable
-// policy it would check is not yet specified anywhere -- so IssuanceService
-// holds the dependency (required at construction) without calling it, and
-// this fake simply always allows.
-type noopProfileValidator struct{}
-
-func (noopProfileValidator) Validate(context.Context, domain.CertificateProfile, []domain.SAN, domain.KeyAlgorithm) error {
-	return nil
-}
-
 // countingSecrets wraps a port.SecretRepository to count GetEncrypted calls,
 // the U05/U06 evidence that a normal renewal never reads the leaf's own
 // private key.
@@ -482,7 +470,6 @@ func newIssuanceFixtureWithCAOptions(t *testing.T, caOpts caSeedOptions) *issuan
 		KeyEngine:         keyEngine,
 		CertificateSigner: signer,
 		SerialGenerator:   serials,
-		ProfileValidator:  noopProfileValidator{},
 	})
 	if err != nil {
 		t.Fatalf("new issuance service: %v", err)
@@ -1284,7 +1271,6 @@ func TestIssuanceIssueRejectsWhenSettingsAreNotConfigured(t *testing.T) {
 			Clock: fixedClock{now: testNow()}, IDs: ids,
 		},
 		KeyEngine: &fakeKeyEngine{}, CertificateSigner: &fakeSigner{}, SerialGenerator: &fakeSerialGenerator{},
-		ProfileValidator: noopProfileValidator{},
 	})
 	if err != nil {
 		t.Fatalf("new issuance service: %v", err)

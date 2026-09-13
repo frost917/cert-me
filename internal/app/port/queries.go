@@ -73,7 +73,7 @@ type QueryRepository interface {
 	GetRevocation(ctx context.Context, id domain.RevocationID, scope QueryScope) (domain.Revocation, error)
 
 	// ListTransitions returns one page of transitions within scope.
-	ListTransitions(ctx context.Context, query contract.TransitionListQuery, scope QueryScope) (contract.Page[domain.Transition], error)
+	ListTransitions(ctx context.Context, query contract.TransitionListQuery, scope QueryScope) (contract.Page[QueriedTransition], error)
 	// GetTransition reads one transition and its impacts without locking.
 	GetTransition(ctx context.Context, id domain.TransitionID, scope QueryScope) (QueriedTransition, error)
 

@@ -332,7 +332,7 @@ type ClosureFacts struct {
 // certificate must have expired, the required CRLs (through the last
 // dependent expiry) must be published, and the key must not already be
 // destroyed.
-func (a Authority) CanDestroyKey(facts ClosureFacts, now Instant) error {
+func (a Authority) CanDestroyKey(facts ClosureFacts) error {
 	if !a.keyAvailable {
 		return fmt.Errorf("%w: authority signing key is already destroyed", ErrAlreadyConsumed)
 	}
@@ -345,7 +345,6 @@ func (a Authority) CanDestroyKey(facts ClosureFacts, now Instant) error {
 	if !facts.RequiredCRLsPublished {
 		return fmt.Errorf("%w: required crl publications are not complete", ErrNotPermitted)
 	}
-	_ = now // reserved: a future grace-period check may compare against now
 	return nil
 }
 
@@ -353,8 +352,8 @@ func (a Authority) CanDestroyKey(facts ClosureFacts, now Instant) error {
 // destruction. The CA generation's key_destroyed_at and secret row are stored
 // by the application transaction; this transition only changes the aggregate's
 // key availability and version after the same closure facts have passed.
-func (a Authority) DestroyKey(facts ClosureFacts, now Instant) (Authority, error) {
-	if err := a.CanDestroyKey(facts, now); err != nil {
+func (a Authority) DestroyKey(facts ClosureFacts) (Authority, error) {
+	if err := a.CanDestroyKey(facts); err != nil {
 		return Authority{}, err
 	}
 	next := a

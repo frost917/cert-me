@@ -53,11 +53,11 @@ func TestTransition_EmergencyCanBeCreatedWithoutTarget(t *testing.T) {
 		t.Fatalf("expected no target authority yet")
 	}
 
-	if _, err := tr.Complete(TransitionClosureFacts{AllImpactsAddressed: true, ManualDeploymentConfirmed: true}, t0()); err == nil {
+	if _, err := tr.Complete(TransitionClosureFacts{AllImpactsAddressed: true, ManualDeploymentConfirmed: true}); err == nil {
 		t.Fatalf("expected Complete without a target authority to fail")
 	}
 
-	withTarget, err := tr.SetTarget(mkAuthorityID(t, '2'), t0())
+	withTarget, err := tr.SetTarget(mkAuthorityID(t, '2'))
 	if err != nil {
 		t.Fatalf("set target: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestTransition_EmergencyCanBeCreatedWithoutTarget(t *testing.T) {
 	// B02 ruling: SetTarget is legal in_progress even when a target is
 	// already recorded (replacing the successor), and rejected once the
 	// transition has moved past in_progress.
-	replaced, err := withTarget.SetTarget(mkAuthorityID(t, '3'), t0())
+	replaced, err := withTarget.SetTarget(mkAuthorityID(t, '3'))
 	if err != nil {
 		t.Fatalf("expected replacing an already-set target to be legal in_progress: %v", err)
 	}
@@ -99,13 +99,13 @@ func TestTransition_CompleteRequiresBothImpactsAndDeployment(t *testing.T) {
 		t.Fatalf("new transition: %v", err)
 	}
 
-	if _, err := tr.Complete(TransitionClosureFacts{AllImpactsAddressed: false, ManualDeploymentConfirmed: true}, t0()); err == nil {
+	if _, err := tr.Complete(TransitionClosureFacts{AllImpactsAddressed: false, ManualDeploymentConfirmed: true}); err == nil {
 		t.Fatalf("expected incomplete impacts to block completion")
 	}
-	if _, err := tr.Complete(TransitionClosureFacts{AllImpactsAddressed: true, ManualDeploymentConfirmed: false}, t0()); err == nil {
+	if _, err := tr.Complete(TransitionClosureFacts{AllImpactsAddressed: true, ManualDeploymentConfirmed: false}); err == nil {
 		t.Fatalf("expected unconfirmed deployment to block completion")
 	}
-	done, err := tr.Complete(TransitionClosureFacts{AllImpactsAddressed: true, ManualDeploymentConfirmed: true}, t0())
+	done, err := tr.Complete(TransitionClosureFacts{AllImpactsAddressed: true, ManualDeploymentConfirmed: true})
 	if err != nil {
 		t.Fatalf("complete: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestTransition_CompleteRequiresBothImpactsAndDeployment(t *testing.T) {
 	if done.IsClosed() {
 		t.Fatalf("expected Complete alone to never reach closed (B02 ruling)")
 	}
-	if _, err := done.Complete(TransitionClosureFacts{AllImpactsAddressed: true, ManualDeploymentConfirmed: true}, t0()); err == nil {
+	if _, err := done.Complete(TransitionClosureFacts{AllImpactsAddressed: true, ManualDeploymentConfirmed: true}); err == nil {
 		t.Fatalf("expected completing an already-externally_completed transition to fail")
 	}
 }
@@ -135,29 +135,29 @@ func TestTransition_CloseRequiresExternallyCompletedAndPublicationEnded(t *testi
 
 	// Close must be refused while still in_progress -- closed requires
 	// externally_completed first.
-	if _, err := tr.Close(TransitionTerminationFacts{SourceCAPublicationEnded: true}, t0()); err == nil {
+	if _, err := tr.Close(TransitionTerminationFacts{SourceCAPublicationEnded: true}); err == nil {
 		t.Fatalf("expected Close to be refused while in_progress")
 	}
 
-	done, err := tr.Complete(TransitionClosureFacts{AllImpactsAddressed: true, ManualDeploymentConfirmed: true}, t0())
+	done, err := tr.Complete(TransitionClosureFacts{AllImpactsAddressed: true, ManualDeploymentConfirmed: true})
 	if err != nil {
 		t.Fatalf("complete: %v", err)
 	}
 
 	// Close must be refused when the CRL-termination fact says the source
 	// CA's publication has not ended, even though externally_completed.
-	if _, err := done.Close(TransitionTerminationFacts{SourceCAPublicationEnded: false}, t0()); err == nil {
+	if _, err := done.Close(TransitionTerminationFacts{SourceCAPublicationEnded: false}); err == nil {
 		t.Fatalf("expected Close to be refused when publication has not ended")
 	}
 
-	closed, err := done.Close(TransitionTerminationFacts{SourceCAPublicationEnded: true}, t0())
+	closed, err := done.Close(TransitionTerminationFacts{SourceCAPublicationEnded: true})
 	if err != nil {
 		t.Fatalf("close: %v", err)
 	}
 	if !closed.IsClosed() {
 		t.Fatalf("expected transition to be closed")
 	}
-	if _, err := closed.Close(TransitionTerminationFacts{SourceCAPublicationEnded: true}, t0()); err == nil {
+	if _, err := closed.Close(TransitionTerminationFacts{SourceCAPublicationEnded: true}); err == nil {
 		t.Fatalf("expected closing an already-closed transition to fail")
 	}
 }
@@ -248,11 +248,11 @@ func TestTransition_ConfirmDeploymentRefusedAfterCompletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new transition: %v", err)
 	}
-	done, err := tr.Complete(TransitionClosureFacts{AllImpactsAddressed: true, ManualDeploymentConfirmed: true}, t0())
+	done, err := tr.Complete(TransitionClosureFacts{AllImpactsAddressed: true, ManualDeploymentConfirmed: true})
 	if err != nil {
 		t.Fatalf("complete: %v", err)
 	}
-	if err := done.ConfirmDeployment(t0()); err == nil {
+	if err := done.ConfirmDeployment(); err == nil {
 		t.Fatalf("expected confirmation to be refused after completion")
 	}
 }
@@ -268,11 +268,11 @@ func TestTransition_SetTargetRejectedAfterComplete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new transition: %v", err)
 	}
-	done, err := tr.Complete(TransitionClosureFacts{AllImpactsAddressed: true, ManualDeploymentConfirmed: true}, t0())
+	done, err := tr.Complete(TransitionClosureFacts{AllImpactsAddressed: true, ManualDeploymentConfirmed: true})
 	if err != nil {
 		t.Fatalf("complete: %v", err)
 	}
-	if _, err := done.SetTarget(mkAuthorityID(t, '3'), t0()); err == nil {
+	if _, err := done.SetTarget(mkAuthorityID(t, '3')); err == nil {
 		t.Fatalf("expected SetTarget to be refused once externally_completed")
 	}
 }

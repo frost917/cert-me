@@ -329,7 +329,7 @@ func (s *IdentityService) Logout(ctx context.Context, meta contract.MutationMeta
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionIdentityLogout, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionIdentityLogout, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		if err := tx.Accounts().DeleteSession(ctx, meta.Principal.SessionID()); err != nil {

@@ -8,7 +8,7 @@ import (
 
 func TestAuthorizationScope_AuthorityIDsIsACopy(t *testing.T) {
 	id := domain.AuthorityID("11111111-1111-1111-1111-111111111111")
-	scope := NewAuthorizationScope(id)
+	scope := NewAuthoritiesAuthorizationScope(id)
 
 	ids := scope.AuthorityIDs()
 	ids[0] = domain.AuthorityID("22222222-2222-2222-2222-222222222222")
@@ -20,7 +20,7 @@ func TestAuthorizationScope_AuthorityIDsIsACopy(t *testing.T) {
 }
 
 func TestAuthorizationScope_EmptyIsNil(t *testing.T) {
-	scope := NewAuthorizationScope()
+	scope := NewInstallationAuthorizationScope()
 	if got := scope.AuthorityIDs(); got != nil {
 		t.Fatalf("an empty scope must report a nil id list, got %v", got)
 	}
@@ -43,6 +43,12 @@ func TestAuthorizationScope_AuthoritiesAreTypedAndNormalized(t *testing.T) {
 	}
 	if err := scope.Validate(); err != nil {
 		t.Fatalf("authority scope validation: %v", err)
+	}
+}
+
+func TestAuthorizationScope_EmptyAuthoritiesAreRejected(t *testing.T) {
+	if err := NewAuthoritiesAuthorizationScope().Validate(); err == nil {
+		t.Fatal("empty authority scope must be rejected")
 	}
 }
 

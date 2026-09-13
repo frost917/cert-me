@@ -183,7 +183,6 @@ func newAuthorityFixture(t *testing.T) *authorityFixture {
 		KeyEngine:         keyEngine,
 		CertificateSigner: signer,
 		SerialGenerator:   serials,
-		ProfileValidator:  noopProfileValidator{},
 	})
 	if err != nil {
 		t.Fatalf("new authority service: %v", err)
@@ -278,7 +277,6 @@ func newClosedAuthorityFixture(t *testing.T) (*porttest.Store, *seqIDs, *Authori
 		KeyEngine:         &fakeKeyEngine{},
 		CertificateSigner: &fakeSigner{},
 		SerialGenerator:   &fakeSerialGenerator{},
-		ProfileValidator:  noopProfileValidator{},
 	})
 	if err != nil {
 		t.Fatalf("new closed authority service: %v", err)
@@ -561,7 +559,7 @@ func TestAuthorityServiceCreateRejectsWhenParentKeyAlreadyDestroyed(t *testing.T
 
 	svc, err := NewAuthorityService(AuthorityDeps{
 		CommonDeps: CommonDeps{UnitOfWork: store, ReadStore: store, Authorizer: &toggleAuthorizer{allow: true}, Clock: fixedClock{now: testNow()}, IDs: ids},
-		KeyEngine:  &fakeKeyEngine{}, CertificateSigner: &fakeSigner{}, SerialGenerator: &fakeSerialGenerator{}, ProfileValidator: noopProfileValidator{},
+		KeyEngine:  &fakeKeyEngine{}, CertificateSigner: &fakeSigner{}, SerialGenerator: &fakeSerialGenerator{},
 	})
 	if err != nil {
 		t.Fatalf("new authority service: %v", err)
@@ -936,7 +934,7 @@ func TestAuthorityServiceSetIssuanceStateStoppedBlocksLeafIssuance(t *testing.T)
 		CommonDeps: CommonDeps{
 			UnitOfWork: f.store, ReadStore: f.store, Authorizer: f.authorizer, Clock: fixedClock{now: testNow()}, IDs: f.ids,
 		},
-		KeyEngine: f.keyEngine, CertificateSigner: f.signer, SerialGenerator: f.serials, ProfileValidator: noopProfileValidator{},
+		KeyEngine: f.keyEngine, CertificateSigner: f.signer, SerialGenerator: f.serials,
 	})
 	if err != nil {
 		t.Fatalf("new issuance service: %v", err)

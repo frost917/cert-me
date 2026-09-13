@@ -656,13 +656,3 @@ func cloneBytes(b []byte) []byte {
 	copy(out, b)
 	return out
 }
-
-// cloneStrings copies a string slice for immutable accessors.
-func cloneStrings(s []string) []string {
-	if s == nil {
-		return nil
-	}
-	out := make([]string, len(s))
-	copy(out, s)
-	return out
-}

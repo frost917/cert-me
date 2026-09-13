@@ -1377,8 +1377,6 @@ func TestDeliver_PublicSuccess_HappyPath(t *testing.T) {
 	}
 }
 
-var _ = bytes.MinRead // keep bytes imported if only used indirectly in future edits
-
 // TestDeliver_PrivateTokenRequestingCertificateOnlyIsRejected covers a gap
 // this file's original version left open and which distribution.go's
 // prepare() has since been fixed to close: docs/api-contract.md states

@@ -1,8 +1,9 @@
-// transition.go implements TransitionService (docs/backend-implementation.md
-// §3 TransitionService row): Create, SetTarget, ConfirmDeployment, Complete
-// -- plus Close, described below.
+// TransitionService coordinates the transition state machine
+// in_progress -> externally_completed -> closed. Authorization and all
+// related certificate, deployment, and CRL facts are rechecked in the write
+// transaction before each state change.
 //
-// §5 is explicit that Revocation/Transition need "추가 외부 I/O 없음" beyond
+/* §5 is explicit that Revocation/Transition need "추가 외부 I/O 없음" beyond
 // the shared app-internal applyRevocations function (revocations.go) -- there
 // is no separate TransitionDeps signing/crypto dependency, only CommonDeps.
 //
@@ -17,7 +18,7 @@
 // Complete reads TransitionClosureFacts from two sources, both now backed by
 // real port methods added for this file (TransitionRepository.
 // ListImpacts existed already; ListDeploymentConfirmations was added
-// alongside this file once the lead confirmed the earlier report that no
+// The repository exposes the confirmation trail used by completion.
 // production-reachable method could read confirmations back):
 //   - AllImpactsAddressed: every ListImpacts row is either resolved
 //     (RecordReplacement ran) or its underlying certificate has since
@@ -32,7 +33,7 @@
 //     trust_added/trust_removed for THIS purpose (the distinction §13
 //     ruling 2 draws is about what certificate_installed implies for key
 //     reuse, not about which actions count toward "the deployment was
-//     confirmed") -- flagged for the lead as a judgment call, not a literal
+//     confirmed").
 //     reading of a settled rule.
 //
 // Close is the separate domain transition §13 ruling 1 requires
@@ -40,15 +41,15 @@
 // 추정하지 않는다... CRL 종료와 연결하는 별도 도메인 전이가 필요하다") and is
 // NOT one of §3's four TransitionService methods -- there is no OpenAPI
 // schema or table row for it. Placement decision (naming/file-split is the
-// dev team's call per the lead's own framing): it lives here, as a fifth
+// it lives here as a fifth
 // TransitionService method, because it is fundamentally a transition-row
 // state change and every other transition-row mutation already lives in
 // this file. Its input is TransitionCloseCommand, a package-local type
 // rather than a new contract.TransitionCloseCommand: contract/transition.go
-// is outside this developer's assigned files (transition.go/
+// is outside the wire contract scope (transition.go/
 // transition_test.go/crl.go/crl_test.go only), and adding a client-facing
 // wire schema for an operation with no OpenAPI entry is a product-surface
-// decision this developer is not positioned to make -- the same restraint
+// decision reserved for a future API contract -- the same restraint
 // §3's own CRLPublishCommand shows for a worker-only trigger, just one layer
 // further out (that command at least got a home in contract/crl.go already;
 // this one has no such precedent to extend, so it stays local). For the same
@@ -56,7 +57,7 @@
 // ruling 5 declares one Action per operation, and Complete and Close are
 // different operations on different preconditions, so sharing Complete's
 // action would leave an Authorizer unable to tell them apart the moment the
-// role model stops being admin-only. The constant was added by the lead
+// role model stops being admin-only.
 // alongside this service; the command type below stays local because a new
 // wire schema is a product-surface decision, which the action name is not.
 //
@@ -75,10 +76,10 @@
 // calls CRLState.Close either, so that trigger is a separate, not-yet-
 // implemented piece of work belonging to whichever service ends up owning
 // CA retirement (Authority's future DestroyKey, or Maintenance) -- outside
-// this developer's assigned files. Close here is honest about that: it
+// this service's scope. Close here is honest about that: it
 // reflects whatever CRLState.PublicationState currently says, and returns
 // transition_publication_not_ended (via domain.Transition.Close's own
-// policy error) until something else closes the CRL state first.
+// policy error) until something else closes the CRL state first. */
 package service
 
 import (
@@ -104,8 +105,8 @@ func (d TransitionDeps) Validate() error {
 }
 
 // TransitionService implements the Create/SetTarget/ConfirmDeployment
-// methods (docs/backend-implementation.md §3 TransitionService row). See the
-// package-level doc comment above for why Complete is not here.
+// methods (docs/backend-implementation.md §3 TransitionService row), including
+// completion and closure.
 type TransitionService struct {
 	deps TransitionDeps
 }
@@ -134,17 +135,12 @@ func transitionScope(t domain.Transition) []domain.AuthorityID {
 	return scope
 }
 
-// toTransitionView projects a domain.Transition plus its stored impacts into
+// toTransitionView projects a domain.Transition plus its already-read impacts into
 // the OpenAPI response shape. CreatedAt is t.ReportedAt(): unlike
 // AuthorityView's CreatedAt gap (authority.go's own documented finding),
 // ca_transitions genuinely has a reported_at column, so there is nothing
 // missing here.
-func toTransitionView(ctx context.Context, tx port.TxStores, t domain.Transition) (contract.TransitionView, error) {
-	impacts, err := tx.Transitions().ListImpacts(ctx, t.ID())
-	if err != nil {
-		return contract.TransitionView{}, storeError(err, "transition_impacts_read_failed",
-			"could not read the transition's impact list")
-	}
+func toTransitionView(t domain.Transition, impacts []domain.TransitionImpact) contract.TransitionView {
 	view := contract.TransitionView{
 		ID:                         t.ID(),
 		SourceAuthorityID:          t.SourceAuthorityID(),
@@ -159,7 +155,15 @@ func toTransitionView(ctx context.Context, tx port.TxStores, t domain.Transition
 	if target := t.TargetAuthorityID(); target != "" {
 		view.TargetAuthorityID = &target
 	}
-	return view, nil
+	return view
+}
+
+func readTransitionView(ctx context.Context, tx port.TxStores, t domain.Transition) (contract.TransitionView, error) {
+	impacts, err := tx.Transitions().ListImpacts(ctx, t.ID())
+	if err != nil {
+		return contract.TransitionView{}, storeError(err, "transition_impacts_read_failed", "could not read the transition's impact list")
+	}
+	return toTransitionView(t, impacts), nil
 }
 
 func toImpactViews(impacts []domain.TransitionImpact) []contract.ImpactView {
@@ -244,7 +248,7 @@ func (s *TransitionService) Create(ctx context.Context, meta contract.MutationMe
 		if target.ID() != "" {
 			scope = append(scope, target.ID())
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTransitionCreate, port.NewAuthorizationScope(scope...)); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTransitionCreate, port.NewAuthoritiesAuthorizationScope(scope...)); err != nil {
 			return err
 		}
 
@@ -321,7 +325,7 @@ func (s *TransitionService) Create(ctx context.Context, meta contract.MutationMe
 			return storeError(err, "transition_audit_failed", "could not record the transition audit event")
 		}
 
-		view, err := toTransitionView(ctx, tx, transition)
+		view, err := readTransitionView(ctx, tx, transition)
 		if err != nil {
 			return err
 		}
@@ -372,12 +376,12 @@ func stopIssuanceIfEnabled(ctx context.Context, tx port.TxStores, authority doma
 //     자동으로 개별 CRL 항목을 추가하지 않는다"; planning.md "상위 영향이
 //     자동 개별 폐기로 표시되지 않는다").
 //
-// Judgment call flagged for the lead: certificate-lifecycle.md's only worked
+// certificate-lifecycle.md's only worked
 // impact-list example is an Intermediate-source report impacting its OWN
 // leaves. Whether a Root-source report's single transition_id should ALSO
 // enumerate impacts for every descendant Intermediate's leaves (as
 // implemented here) or leave that to separate, later per-Intermediate
-// reports is not settled by any doc this developer found. This
+// reports is not settled by the current contract. This
 // implementation takes the broader reading because ListAffectedDescendants's
 // own doc comment ties the descendant set to "an emergency transition marks
 // affected/stops issuance for" (singular transition, plural authorities),
@@ -591,7 +595,7 @@ func (s *TransitionService) SetTarget(ctx context.Context, meta contract.Mutatio
 		}
 
 		scope := append(transitionScope(t), target.ID())
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTransitionSetTarget, port.NewAuthorizationScope(scope...)); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTransitionSetTarget, port.NewAuthoritiesAuthorizationScope(scope...)); err != nil {
 			return err
 		}
 		if t.Version() != expectedVersion {
@@ -600,7 +604,7 @@ func (s *TransitionService) SetTarget(ctx context.Context, meta contract.Mutatio
 		}
 
 		now := s.deps.Clock.Now()
-		next, err := t.SetTarget(target.ID(), now)
+		next, err := t.SetTarget(target.ID())
 		if err != nil {
 			return contract.FromDomainError(err)
 		}
@@ -624,7 +628,7 @@ func (s *TransitionService) SetTarget(ctx context.Context, meta contract.Mutatio
 			return storeError(err, "transition_audit_failed", "could not record the set-target audit event")
 		}
 
-		view, err := toTransitionView(ctx, tx, next)
+		view, err := readTransitionView(ctx, tx, next)
 		if err != nil {
 			return err
 		}
@@ -682,7 +686,7 @@ func (s *TransitionService) ConfirmDeployment(ctx context.Context, meta contract
 		}
 
 		scope := transitionScope(t)
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTransitionConfirmDeployment, port.NewAuthorizationScope(scope...)); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTransitionConfirmDeployment, port.NewAuthoritiesAuthorizationScope(scope...)); err != nil {
 			return err
 		}
 		if t.Version() != expectedVersion {
@@ -691,7 +695,7 @@ func (s *TransitionService) ConfirmDeployment(ctx context.Context, meta contract
 		}
 
 		now := s.deps.Clock.Now()
-		if err := t.ConfirmDeployment(now); err != nil {
+		if err := t.ConfirmDeployment(); err != nil {
 			return contract.FromDomainError(err)
 		}
 
@@ -832,7 +836,7 @@ func (s *TransitionService) Complete(ctx context.Context, meta contract.Mutation
 		}
 
 		scope := transitionScope(t)
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTransitionComplete, port.NewAuthorizationScope(scope...)); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTransitionComplete, port.NewAuthoritiesAuthorizationScope(scope...)); err != nil {
 			return err
 		}
 		if t.Version() != expectedVersion {
@@ -845,7 +849,7 @@ func (s *TransitionService) Complete(ctx context.Context, meta contract.Mutation
 		if err != nil {
 			return err
 		}
-		next, err := t.Complete(facts, now)
+		next, err := t.Complete(facts)
 		if err != nil {
 			return contract.FromDomainError(err)
 		}
@@ -869,7 +873,7 @@ func (s *TransitionService) Complete(ctx context.Context, meta contract.Mutation
 			return storeError(err, "transition_audit_failed", "could not record the complete audit event")
 		}
 
-		view, err := toTransitionView(ctx, tx, next)
+		view, err := readTransitionView(ctx, tx, next)
 		if err != nil {
 			return err
 		}
@@ -924,7 +928,7 @@ func (s *TransitionService) Close(ctx context.Context, meta contract.MutationMet
 
 		scope := transitionScope(t)
 		// Reused action: see package doc comment.
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTransitionClose, port.NewAuthorizationScope(scope...)); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTransitionClose, port.NewAuthoritiesAuthorizationScope(scope...)); err != nil {
 			return err
 		}
 		if t.Version() != expectedVersion {
@@ -951,7 +955,7 @@ func (s *TransitionService) Close(ctx context.Context, meta contract.MutationMet
 		facts := domain.TransitionTerminationFacts{
 			SourceCAPublicationEnded: state.PublicationState() == domain.PublicationStateClosed,
 		}
-		next, err := t.Close(facts, now)
+		next, err := t.Close(facts)
 		if err != nil {
 			return contract.FromDomainError(err)
 		}
@@ -975,7 +979,7 @@ func (s *TransitionService) Close(ctx context.Context, meta contract.MutationMet
 			return storeError(err, "transition_audit_failed", "could not record the close audit event")
 		}
 
-		view, err := toTransitionView(ctx, tx, next)
+		view, err := readTransitionView(ctx, tx, next)
 		if err != nil {
 			return err
 		}

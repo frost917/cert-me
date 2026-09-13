@@ -110,45 +110,16 @@ func (s *DistributionService) failInterruptedTransfer(ctx context.Context, deliv
 			return nil
 		}
 
-		certificate, err := tx.PKI().GetCertificate(ctx, delivery.CertificateID())
-		if err != nil {
-			return storeError(err, "recovery_certificate_read_failed", "could not read the interrupted delivery's certificate")
-		}
-		scope, err := leafManagementAuthority(ctx, tx, certificate.ID())
-		if err != nil {
-			return err
-		}
-
-		failedDelivery, err := delivery.Fail(recoveryFailureCode, now)
-		if err != nil {
-			return contract.FromDomainError(err)
-		}
-		if err := tx.Delivery().SaveDelivery(ctx, failedDelivery, delivery.Version()); err != nil {
-			return storeError(err, "recovery_delivery_save_failed", "could not record the interrupted delivery's failure")
-		}
-		if err := tx.Delivery().InvalidatePrivateGrants(ctx, delivery.ID(), now); err != nil {
-			return storeError(err, "recovery_grant_invalidate_failed", "could not invalidate the interrupted delivery's links")
-		}
-
-		// The same reason/source DistributionService uses for a live
-		// transfer failure -- §14.1 confirms both for "잔류 transferring
-		// 복구" too: "기본 reason은 unspecified, source는 cascade로 확정한다."
-		change := RevocationChange{
-			IssuerID:      certificate.IssuerCAKeyGenerationID(),
-			Serial:        certificate.Serial(),
-			CertificateID: certificate.ID(),
-			RevokedAt:     now,
-			Reason:        domain.RevocationReasonUnspecified,
-			Source:        domain.RevocationSourceCascade,
-			AuthorityID:   scope,
-		}
-		revMeta := RevocationMeta{
+		if err := failInterruptedDelivery(ctx, tx, delivery, RevocationMeta{
 			ActorKind: contract.AuditActorSystem,
 			Action:    "distribution.recovery.transfer_failed",
 			Now:       now,
 			IDs:       s.deps.IDs,
-		}
-		if _, err := applyRevocations(ctx, tx, []RevocationChange{change}, revMeta); err != nil {
+		}, transferRecoveryErrors{
+			certificateRead: "recovery_certificate_read_failed",
+			deliverySave:    "recovery_delivery_save_failed",
+			grantInvalidate: "recovery_grant_invalidate_failed",
+		}); err != nil {
 			return err
 		}
 		changed = true
@@ -158,4 +129,51 @@ func (s *DistributionService) failInterruptedTransfer(ctx context.Context, deliv
 		return false, err
 	}
 	return changed, nil
+}
+
+// transferRecoveryErrors preserves each recovery entry point's error codes.
+type transferRecoveryErrors struct {
+	certificateRead string
+	deliverySave    string
+	grantInvalidate string
+}
+
+// failInterruptedDelivery applies the shared recovery mutation to a locked,
+// transferring delivery. The caller owns the transaction, the observation time,
+// and the policy for reporting a failed or uncertain commit.
+func failInterruptedDelivery(ctx context.Context, tx port.TxStores, delivery domain.Delivery, meta RevocationMeta, codes transferRecoveryErrors) error {
+	certificate, err := tx.PKI().GetCertificate(ctx, delivery.CertificateID())
+	if err != nil {
+		return storeError(err, codes.certificateRead, "could not read the interrupted delivery's certificate")
+	}
+	scope, err := leafManagementAuthority(ctx, tx, certificate.ID())
+	if err != nil {
+		return err
+	}
+
+	failedDelivery, err := delivery.Fail(recoveryFailureCode, meta.Now)
+	if err != nil {
+		return contract.FromDomainError(err)
+	}
+	if err := tx.Delivery().SaveDelivery(ctx, failedDelivery, delivery.Version()); err != nil {
+		return storeError(err, codes.deliverySave, "could not record the interrupted delivery's failure")
+	}
+	if err := tx.Delivery().InvalidatePrivateGrants(ctx, delivery.ID(), meta.Now); err != nil {
+		return storeError(err, codes.grantInvalidate, "could not invalidate the interrupted delivery's links")
+	}
+
+	// The same reason/source DistributionService uses for a live
+	// transfer failure -- §14.1 confirms both for "잔류 transferring
+	// 복구" too: "기본 reason은 unspecified, source는 cascade로 확정한다."
+	change := RevocationChange{
+		IssuerID:      certificate.IssuerCAKeyGenerationID(),
+		Serial:        certificate.Serial(),
+		CertificateID: certificate.ID(),
+		RevokedAt:     meta.Now,
+		Reason:        domain.RevocationReasonUnspecified,
+		Source:        domain.RevocationSourceCascade,
+		AuthorityID:   scope,
+	}
+	_, err = applyRevocations(ctx, tx, []RevocationChange{change}, meta)
+	return err
 }

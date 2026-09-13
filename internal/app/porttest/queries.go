@@ -307,16 +307,31 @@ func transitionScopes(t domain.Transition) []domain.AuthorityID {
 	return scopes
 }
 
-func (r queryRepo) ListTransitions(_ context.Context, query contract.TransitionListQuery, scope port.QueryScope) (contract.Page[domain.Transition], error) {
-	var items []domain.Transition
+func (r queryRepo) ListTransitions(_ context.Context, query contract.TransitionListQuery, scope port.QueryScope) (contract.Page[port.QueriedTransition], error) {
+	var transitions []domain.Transition
 	for _, t := range r.s.transitions {
 		if !r.visibleAll(scope, transitionScopes(t)) || !matchesSearch(query.Search, t.Reason()) {
 			continue
 		}
-		items = append(items, t)
+		transitions = append(transitions, t)
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].ID() < items[j].ID() })
-	return paginate(items, query.Page, func(t domain.Transition) string { return string(t.ID()) }), nil
+	sort.Slice(transitions, func(i, j int) bool { return transitions[i].ID() < transitions[j].ID() })
+	page := paginate(transitions, query.Page, func(t domain.Transition) string { return string(t.ID()) })
+	items := make([]port.QueriedTransition, len(page.Items))
+	byID := make(map[domain.TransitionID]int, len(page.Items))
+	for i, t := range page.Items {
+		items[i] = port.QueriedTransition{Transition: t}
+		byID[t.ID()] = i
+	}
+	for key, impact := range r.s.impacts {
+		if i, ok := byID[key.transitionID]; ok {
+			items[i].Impacts = append(items[i].Impacts, impact)
+		}
+	}
+	for i := range items {
+		sort.Slice(items[i].Impacts, func(a, b int) bool { return items[i].Impacts[a].CertificateID() < items[i].Impacts[b].CertificateID() })
+	}
+	return contract.Page[port.QueriedTransition]{Items: items, NextCursor: page.NextCursor}, nil
 }
 
 func (r queryRepo) GetTransition(_ context.Context, id domain.TransitionID, scope port.QueryScope) (port.QueriedTransition, error) {

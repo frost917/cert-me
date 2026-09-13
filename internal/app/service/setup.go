@@ -231,7 +231,7 @@ func (s *SetupService) Complete(ctx context.Context, meta contract.MutationMeta,
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionSetupComplete, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionSetupComplete, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 

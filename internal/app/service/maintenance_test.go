@@ -322,3 +322,60 @@ func seedRestoreOperationalAuthority(t *testing.T, fx distFixture) {
 		t.Fatalf("seed restore operational authority: %v", err)
 	}
 }
+
+func TestMaintenanceRecoverTransfersPreservesOutcomeAndAudit(t *testing.T) {
+	for _, mode := range []string{"success", "rollback", "commit_unknown"} {
+		t.Run(mode, func(t *testing.T) {
+			fx := seedPrivateFixture(t, distTestNow().Add(domain.NewDuration(time.Hour)), domain.DeliveryStateTransferring)
+			if mode != "rollback" {
+				seedCRLStateFor(t, fx.store, fx.issuerID)
+			}
+			svc := newMaintenanceTestService(t, fx.store)
+			if mode == "commit_unknown" {
+				staged := newStagedUoW(fx.store)
+				staged.forceUnknownAt[1] = true
+				svc.deps.UnitOfWork = staged
+			}
+			meta := contract.MutationMeta{RequestMeta: contract.RequestMeta{
+				Principal: mustInternalPrincipal(t, contract.InternalOperationTransferRecovery),
+			}}
+			outcome, err := svc.RecoverTransfers(context.Background(), meta, contract.MaintenanceRecoverTransfersCommand{})
+			if err != nil || outcome.Checked != 1 {
+				t.Fatalf("recovery = %+v, %v", outcome, err)
+			}
+			if mode == "success" {
+				if outcome.Changed != 1 || outcome.Failed != 0 {
+					t.Fatalf("recovery = %+v, want one changed", outcome)
+				}
+				found := false
+				for _, event := range fx.store.AuditEvents() {
+					if event.Action == "maintenance.recover_transfers.interrupted_transfer" {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatal("maintenance recovery audit action was lost")
+				}
+			} else if outcome.Changed != 0 || outcome.Failed != 1 || len(outcome.FailedIDs) != 1 || outcome.FailedIDs[0] != fx.deliverID {
+				t.Fatalf("recovery = %+v, want the failed delivery ID", outcome)
+			}
+			wantState, wantRevocations := domain.DeliveryStateFailed, 1
+			if mode == "rollback" {
+				wantState, wantRevocations = domain.DeliveryStateTransferring, 0
+			}
+			if got := storedDelivery(t, fx.store, fx.deliverID).State(); got != wantState {
+				t.Fatalf("state = %s, want %s", got, wantState)
+			}
+			if got := countRevocations(t, fx.store, fx.issuerID, distSerial(t, "a1")); got != wantRevocations {
+				t.Fatalf("revocations = %d, want %d", got, wantRevocations)
+			}
+			wantClosed := 0
+			if mode == "commit_unknown" {
+				wantClosed = 1
+			}
+			if got := svc.deps.RuntimeGate.(*fakeRuntimeGate).callCount(); got != wantClosed {
+				t.Fatalf("FailClosed calls = %d, want %d", got, wantClosed)
+			}
+		})
+	}
+}

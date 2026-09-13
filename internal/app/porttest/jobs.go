@@ -166,20 +166,6 @@ func (r jobRepo) ListRecoveryRequired(_ context.Context) ([]port.Job, error) {
 	return out, nil
 }
 
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(buf[i:])
-}
-
 // syntheticUUID builds a deterministic, validly-shaped uuid from a counter,
 // so stored job ids are reproducible across a test run while still passing
 // the uuid validation a contract command applies to them.

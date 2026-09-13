@@ -46,7 +46,7 @@ func TestTLSChange_FailedValidationBlocksCommit(t *testing.T) {
 		t.Fatalf("expected phase to remain prepared after failed validation")
 	}
 
-	if _, err := afterValidate.Commit(t0()); err == nil {
+	if _, err := afterValidate.Commit(); err == nil {
 		t.Fatalf("expected commit of an unvalidated candidate to be refused")
 	}
 }
@@ -63,14 +63,14 @@ func TestTLSChange_ValidatedCandidateCanCommitApply(t *testing.T) {
 	if !validated.Validated() {
 		t.Fatalf("expected candidate to be validated")
 	}
-	committed, err := validated.Commit(t0())
+	committed, err := validated.Commit()
 	if err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	if !committed.CanActivate() {
 		t.Fatalf("expected committed change to be activatable")
 	}
-	applied, err := committed.Apply(t0())
+	applied, err := committed.Apply()
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -90,11 +90,11 @@ func TestTLSChange_ApplyFailureRollsBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	committed, err := validated.Commit(t0())
+	committed, err := validated.Commit()
 	if err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	rolledBack, err := committed.RollbackApply("installer_bind_failed", t0())
+	rolledBack, err := committed.RollbackApply("installer_bind_failed")
 	if err != nil {
 		t.Fatalf("rollback: %v", err)
 	}
@@ -117,11 +117,11 @@ func TestTLSChange_UnclearOutcomeRequiresRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	committed, err := validated.Commit(t0())
+	committed, err := validated.Commit()
 	if err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	recovery, err := committed.MarkRecoveryRequired("apply_result_unknown", t0())
+	recovery, err := committed.MarkRecoveryRequired("apply_result_unknown")
 	if err != nil {
 		t.Fatalf("mark recovery required: %v", err)
 	}
@@ -129,11 +129,11 @@ func TestTLSChange_UnclearOutcomeRequiresRecovery(t *testing.T) {
 		t.Fatalf("expected recovery_required phase")
 	}
 	// A terminal change cannot be re-marked for recovery.
-	applied, err := committed.Apply(t0())
+	applied, err := committed.Apply()
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	if _, err := applied.MarkRecoveryRequired("late_signal", t0()); err == nil {
+	if _, err := applied.MarkRecoveryRequired("late_signal"); err == nil {
 		t.Fatalf("expected recovery marker on a terminal (applied) change to be refused")
 	}
 }
@@ -182,11 +182,11 @@ func TestTLSChange_BootstrapCandidateValidatesWithoutServiceAddress(t *testing.T
 		t.Fatalf("expected bootstrap candidate to be validated")
 	}
 
-	committed, err := validated.Commit(t0())
+	committed, err := validated.Commit()
 	if err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	applied, err := committed.Apply(t0())
+	applied, err := committed.Apply()
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -219,7 +219,7 @@ func TestTLSChange_ManagedCandidateStillRequiresServiceAddress(t *testing.T) {
 	if afterValidate.ErrorCode() != "tls_candidate_address_mismatch" {
 		t.Fatalf("expected tls_candidate_address_mismatch, got %q", afterValidate.ErrorCode())
 	}
-	if _, err := afterValidate.Commit(t0()); err == nil {
+	if _, err := afterValidate.Commit(); err == nil {
 		t.Fatalf("expected commit of an unvalidated managed candidate to be refused")
 	}
 }
@@ -267,11 +267,11 @@ func mkRecoveryRequiredChange(t *testing.T, previousSuffix, candidateSuffix byte
 	if err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	committed, err := validated.Commit(t0())
+	committed, err := validated.Commit()
 	if err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	recovery, err := committed.MarkRecoveryRequired("apply_result_unknown", t0())
+	recovery, err := committed.MarkRecoveryRequired("apply_result_unknown")
 	if err != nil {
 		t.Fatalf("mark recovery required: %v", err)
 	}
@@ -285,16 +285,16 @@ func mkRecoveryRequiredChange(t *testing.T, previousSuffix, candidateSuffix byte
 func TestTLSChange_RecoveryRequiredIsADeadEndWithoutReconcile(t *testing.T) {
 	recovery := mkRecoveryRequiredChange(t, '1', '2')
 
-	if _, err := recovery.Apply(t0()); err == nil {
+	if _, err := recovery.Apply(); err == nil {
 		t.Fatalf("expected Apply from recovery_required to be refused")
 	}
-	if _, err := recovery.RollbackApply("x", t0()); err == nil {
+	if _, err := recovery.RollbackApply("x"); err == nil {
 		t.Fatalf("expected RollbackApply from recovery_required to be refused")
 	}
 	if _, err := recovery.ValidateCandidate(passingFacts()); err == nil {
 		t.Fatalf("expected ValidateCandidate from recovery_required to be refused")
 	}
-	if _, err := recovery.Commit(t0()); err == nil {
+	if _, err := recovery.Commit(); err == nil {
 		t.Fatalf("expected Commit from recovery_required to be refused")
 	}
 }
@@ -307,7 +307,7 @@ func TestTLSChange_ReconcileCandidateRevalidatesCompletesApplied(t *testing.T) {
 	resolved, err := recovery.Reconcile(TLSReconcileFacts{
 		CandidateVersionID: recovery.CandidateVersionID(),
 		CandidateFacts:     passingFacts(),
-	}, t0())
+	})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -332,7 +332,7 @@ func TestTLSChange_ReconcileCandidateUnusableRollsBackToPrevious(t *testing.T) {
 		CandidateFacts:     failingCandidate,
 		PreviousVersionID:  recovery.PreviousVersionID(),
 		PreviousFacts:      passingFacts(),
-	}, t0())
+	})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -358,7 +358,7 @@ func TestTLSChange_ReconcileBothUnusableStaysRecoveryRequired(t *testing.T) {
 		CandidateFacts:     failing,
 		PreviousVersionID:  recovery.PreviousVersionID(),
 		PreviousFacts:      failing,
-	}, t0())
+	})
 	if err == nil {
 		t.Fatalf("expected reconcile to report that nothing could be resolved")
 	}
@@ -376,7 +376,7 @@ func TestTLSChange_ReconcileRejectsMismatchedTargetVersion(t *testing.T) {
 	if _, err := recovery.Reconcile(TLSReconcileFacts{
 		CandidateVersionID: wrongVersion,
 		CandidateFacts:     passingFacts(),
-	}, t0()); err == nil {
+	}); err == nil {
 		t.Fatalf("expected reconcile with a mismatched candidate version id to be refused")
 	}
 
@@ -385,7 +385,7 @@ func TestTLSChange_ReconcileRejectsMismatchedTargetVersion(t *testing.T) {
 		CandidateFacts:     func() TLSValidationFacts { f := passingFacts(); f.ChainVerified = false; return f }(),
 		PreviousVersionID:  wrongVersion,
 		PreviousFacts:      passingFacts(),
-	}, t0()); err == nil {
+	}); err == nil {
 		t.Fatalf("expected reconcile with a mismatched previous version id to be refused")
 	}
 }
@@ -400,7 +400,7 @@ func TestTLSChange_ReconcileRefusesPreparedCandidate(t *testing.T) {
 	if _, err := c.Reconcile(TLSReconcileFacts{
 		CandidateVersionID: c.CandidateVersionID(),
 		CandidateFacts:     passingFacts(),
-	}, t0()); err == nil {
+	}); err == nil {
 		t.Fatalf("expected reconcile of a merely prepared change to be refused")
 	}
 
@@ -409,14 +409,14 @@ func TestTLSChange_ReconcileRefusesPreparedCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	committed, err := validated.Commit(t0())
+	committed, err := validated.Commit()
 	if err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	if _, err := committed.Reconcile(TLSReconcileFacts{
 		CandidateVersionID: committed.CandidateVersionID(),
 		CandidateFacts:     passingFacts(),
-	}, t0()); err == nil {
+	}); err == nil {
 		t.Fatalf("expected reconcile of a committed (not recovery_required) change to be refused")
 	}
 }
@@ -440,7 +440,7 @@ func TestTLSChange_PreparedCandidateCannotLaunderThroughRecoveryRequired(t *test
 
 	// Step 2 of the reviewer's repro: mark the still-prepared (never
 	// committed, never validated) candidate as recovery_required directly.
-	if _, err := c.MarkRecoveryRequired("boom", t0()); err == nil {
+	if _, err := c.MarkRecoveryRequired("boom"); err == nil {
 		t.Fatalf("expected MarkRecoveryRequired on a prepared (not committed) change to be refused")
 	}
 
@@ -467,7 +467,7 @@ func TestTLSChange_MarkRecoveryRequiredOnlyFromCommitted(t *testing.T) {
 	// recovery_required -> refused (already recovery_required, re-marking is
 	// not a committed->recovery_required transition).
 	recovery := mkRecoveryRequiredChange(t, '1', '2')
-	if _, err := recovery.MarkRecoveryRequired("again", t0()); err == nil {
+	if _, err := recovery.MarkRecoveryRequired("again"); err == nil {
 		t.Fatalf("expected MarkRecoveryRequired on an already recovery_required change to be refused")
 	}
 
@@ -481,20 +481,20 @@ func TestTLSChange_MarkRecoveryRequiredOnlyFromCommitted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	committed, err := validated.Commit(t0())
+	committed, err := validated.Commit()
 	if err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	rolledBack, err := committed.RollbackApply("installer_bind_failed", t0())
+	rolledBack, err := committed.RollbackApply("installer_bind_failed")
 	if err != nil {
 		t.Fatalf("rollback: %v", err)
 	}
-	if _, err := rolledBack.MarkRecoveryRequired("late_signal", t0()); err == nil {
+	if _, err := rolledBack.MarkRecoveryRequired("late_signal"); err == nil {
 		t.Fatalf("expected MarkRecoveryRequired on a rolled_back change to be refused")
 	}
 
 	// committed -> the only allowed starting phase.
-	if _, err := committed.MarkRecoveryRequired("apply_result_unknown", t0()); err != nil {
+	if _, err := committed.MarkRecoveryRequired("apply_result_unknown"); err != nil {
 		t.Fatalf("expected MarkRecoveryRequired from committed to succeed: %v", err)
 	}
 }
@@ -569,7 +569,7 @@ func TestTLSChange_ValidateCandidateFailureIsNotAnError(t *testing.T) {
 		if err != nil {
 			t.Fatalf("validate: %v", err)
 		}
-		return validated.Commit(t0())
+		return validated.Commit()
 	}()
 	if err != nil {
 		t.Fatalf("commit: %v", err)

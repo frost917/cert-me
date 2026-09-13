@@ -3,9 +3,7 @@
 // Revocation, Transition, Import, Job; ListAudit/ExportAudit; GetCRLStatus;
 // ReadPublicCA.
 //
-// §5 lists Query's only dependencies as "ReadStore, Authorizer" -- both
-// already part of CommonDeps -- so this file needs no dedicated XDeps type,
-// unlike SettingsDeps/etc.
+// Query uses only its read store, authorizer, and clock.
 //
 // Every method here follows §3's "검색·상세마다 권한 재확인": Validate the
 // command, gate on the principal, then inside ONE ReadStore.Read re-check
@@ -34,12 +32,12 @@ import (
 // QueryService implements every method port.QueryRepository backs
 // (docs/backend-implementation.md §3).
 type QueryService struct {
-	deps CommonDeps
+	deps QueryDeps
 }
 
 // NewQueryService constructs the service, failing fast on a missing
 // dependency (§5 "필수 의존성이 nil이면 시작 시 실패한다").
-func NewQueryService(deps CommonDeps) (*QueryService, error) {
+func NewQueryService(deps QueryDeps) (*QueryService, error) {
 	if err := deps.Validate(); err != nil {
 		return nil, err
 	}
@@ -126,7 +124,7 @@ func (s *QueryService) ListAuthorities(ctx context.Context, meta contract.Reques
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryListAuthority, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryListAuthority, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		raw, err := tx.Queries().ListAuthorities(ctx, query, adminScope())
@@ -161,7 +159,7 @@ func (s *QueryService) GetAuthority(ctx context.Context, meta contract.RequestMe
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryGetAuthority, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryGetAuthority, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		a, err := tx.Queries().GetAuthority(ctx, query.AuthorityID, adminScope())
@@ -233,7 +231,7 @@ func (s *QueryService) ListSeries(ctx context.Context, meta contract.RequestMeta
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryListSeries, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryListSeries, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		raw, err := tx.Queries().ListSeries(ctx, query, adminScope())
@@ -265,7 +263,7 @@ func (s *QueryService) GetSeries(ctx context.Context, meta contract.RequestMeta,
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryGetSeries, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryGetSeries, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		snap, err := tx.Queries().GetSeries(ctx, query.SeriesID, adminScope())
@@ -336,7 +334,7 @@ func (s *QueryService) ListCertificates(ctx context.Context, meta contract.Reque
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryListCertificate, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryListCertificate, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		raw, err := tx.Queries().ListCertificates(ctx, query, adminScope())
@@ -369,7 +367,7 @@ func (s *QueryService) GetCertificate(ctx context.Context, meta contract.Request
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryGetCertificate, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryGetCertificate, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		qc, err := tx.Queries().GetCertificate(ctx, query.CertificateID, adminScope())
@@ -443,7 +441,7 @@ func (s *QueryService) ListRevocations(ctx context.Context, meta contract.Reques
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryListRevocation, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryListRevocation, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		raw, err := tx.Queries().ListRevocations(ctx, query, adminScope())
@@ -484,7 +482,7 @@ func (s *QueryService) GetRevocation(ctx context.Context, meta contract.RequestM
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryGetRevocation, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryGetRevocation, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		r, err := tx.Queries().GetRevocation(ctx, query.RevocationID, adminScope())
@@ -520,30 +518,18 @@ func (s *QueryService) ListTransitions(ctx context.Context, meta contract.Reques
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryListTransition, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryListTransition, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		raw, err := tx.Queries().ListTransitions(ctx, query, adminScope())
 		if err != nil {
 			return storeError(err, "query_transitions_list_failed", "could not list transitions")
 		}
-		// The OpenAPI Transition list item is the same full shape as Get's
-		// (both $ref the same Transition schema), so each row needs its own
-		// impacts. port.QueryRepository.ListTransitions does not bundle them
-		// the way QueriedCertificate bundles Revoked/Affected/Delivery for
-		// Certificate -- unlike GetTransition, which returns them for free
-		// via QueriedTransition -- so this is a genuine per-row follow-up
-		// read; toTransitionView (transition.go) already does exactly this
-		// non-locking read and is reused here rather than duplicated.
-		// Flagged for the lead as the same class of gap ListRevocations'
-		// issuerPublishedGeneration works around above.
+		// ListTransitions returns each transition with its impacts, so mapping
+		// the page does not issue per-row follow-up reads.
 		items := make([]contract.TransitionView, len(raw.Items))
 		for i, t := range raw.Items {
-			view, err := toTransitionView(ctx, tx, t)
-			if err != nil {
-				return err
-			}
-			items[i] = view
+			items[i] = toTransitionView(t.Transition, t.Impacts)
 		}
 		page = contract.Page[contract.TransitionView]{Items: items, NextCursor: raw.NextCursor}
 		return nil
@@ -566,7 +552,7 @@ func (s *QueryService) GetTransition(ctx context.Context, meta contract.RequestM
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryGetTransition, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryGetTransition, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		queried, err := tx.Queries().GetTransition(ctx, query.TransitionID, adminScope())
@@ -575,15 +561,7 @@ func (s *QueryService) GetTransition(ctx context.Context, meta contract.RequestM
 		} else if err != nil {
 			return storeError(err, "query_transition_read_failed", "could not read the transition")
 		}
-		// toTransitionView re-reads impacts itself; queried.Impacts is
-		// unused here (a small, harmless double-read within the one
-		// transaction, not a correctness issue) so Get shares its mapping
-		// with List instead of duplicating toTransitionView's logic.
-		v, err := toTransitionView(ctx, tx, queried.Transition)
-		if err != nil {
-			return err
-		}
-		view = v
+		view = toTransitionView(queried.Transition, queried.Impacts)
 		return nil
 	})
 	if err != nil {
@@ -606,7 +584,7 @@ func (s *QueryService) ListImports(ctx context.Context, meta contract.RequestMet
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryListImport, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryListImport, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		raw, err := tx.Queries().ListImports(ctx, query, adminScope())
@@ -645,7 +623,7 @@ func (s *QueryService) GetImport(ctx context.Context, meta contract.RequestMeta,
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryGetImport, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryGetImport, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		b, err := tx.Queries().GetImport(ctx, id, adminScope())
@@ -692,7 +670,7 @@ func (s *QueryService) ListJobs(ctx context.Context, meta contract.RequestMeta, 
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryListJob, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryListJob, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		raw, err := tx.Queries().ListJobs(ctx, query, adminScope())
@@ -724,7 +702,7 @@ func (s *QueryService) GetJob(ctx context.Context, meta contract.RequestMeta, qu
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryGetJob, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryGetJob, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		j, err := tx.Queries().GetJob(ctx, query.JobID, adminScope())
@@ -756,7 +734,7 @@ func (s *QueryService) ListAudit(ctx context.Context, meta contract.RequestMeta,
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryListAudit, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryListAudit, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		// ListAudit already returns contract.AuditEventView (port/queries.go's
@@ -807,7 +785,7 @@ func (s *QueryService) ExportAudit(ctx context.Context, meta contract.RequestMet
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryExportAudit, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryExportAudit, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		it, err := tx.Queries().IterateAudit(ctx, query, adminScope())
@@ -873,7 +851,7 @@ func (s *QueryService) GetCRLStatus(ctx context.Context, meta contract.RequestMe
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryGetCRLStatus, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryGetCRLStatus, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		state, err := tx.Queries().GetCRLStatus(ctx, query.CAKeyGenerationID, adminScope())
@@ -939,7 +917,7 @@ func (s *QueryService) ReadPublicCA(ctx context.Context, meta contract.RequestMe
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryReadPublicCA, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryReadPublicCA, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		c, err := tx.Queries().ReadPublicCA(ctx, query.AuthorityID, publicCAScope(meta.Principal))

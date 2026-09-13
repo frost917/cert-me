@@ -88,12 +88,10 @@ func newQueryFixture(t *testing.T) *queryFixture {
 
 	authorizer := &recordingAuthorizer{}
 	clock := &movableClock{now: now}
-	svc, err := NewQueryService(CommonDeps{
-		UnitOfWork: store,
+	svc, err := NewQueryService(QueryDeps{
 		ReadStore:  store,
 		Authorizer: authorizer,
 		Clock:      clock,
-		IDs:        ids,
 	})
 	if err != nil {
 		t.Fatalf("new query service: %v", err)
@@ -616,6 +614,22 @@ func TestQueryServiceGetUnknownIDIsNotFound(t *testing.T) {
 	}
 }
 
+func TestQueryServiceTransitionsUseBundledImpacts(t *testing.T) {
+	f := newQueryFixture(t)
+	f.svc.deps.ReadStore = noImpactFollowupStore{ReadStore: f.store}
+	view, err := f.svc.GetTransition(context.Background(), f.meta(), contract.TransitionGetQuery{TransitionID: f.transitionID})
+	if err != nil {
+		t.Fatalf("get transition: %v", err)
+	}
+	if len(view.Impacts) != 1 || view.Impacts[0].CertificateID != f.leafCertID {
+		t.Fatalf("unexpected bundled impacts: %+v", view.Impacts)
+	}
+	page, err := f.svc.ListTransitions(context.Background(), f.meta(), contract.TransitionListQuery{})
+	if err != nil || len(page.Items) != 1 || len(page.Items[0].Impacts) != 1 || page.Items[0].Impacts[0].CertificateID != f.leafCertID {
+		t.Fatalf("list lost bundled impacts: %+v, %v", page, err)
+	}
+}
+
 // ---- ReadPublicCA is the one anonymous-reachable method --------------------
 
 func TestQueryServiceReadPublicCAAllowsAnonymousAndAdmin(t *testing.T) {
@@ -986,4 +1000,23 @@ func TestAdminScopeIsAll(t *testing.T) {
 	if scope.Public {
 		t.Fatal("want adminScope().Public = false")
 	}
+}
+
+// Reject extra impact reads without changing the shared store's state.
+type noImpactFollowupStore struct{ port.ReadStore }
+
+func (s noImpactFollowupStore) Read(ctx context.Context, fn func(port.TxStores) error) error {
+	return s.ReadStore.Read(ctx, func(tx port.TxStores) error { return fn(noImpactFollowupTx{tx}) })
+}
+
+type noImpactFollowupTx struct{ port.TxStores }
+
+func (tx noImpactFollowupTx) Transitions() port.TransitionRepository {
+	return noImpactFollowupRepository{tx.TxStores.Transitions()}
+}
+
+type noImpactFollowupRepository struct{ port.TransitionRepository }
+
+func (noImpactFollowupRepository) ListImpacts(context.Context, domain.TransitionID) ([]domain.TransitionImpact, error) {
+	return nil, errors.New("query unexpectedly re-read transition impacts")
 }

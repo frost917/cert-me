@@ -58,49 +58,79 @@ func buildChainDER(ctx context.Context, tx port.TxStores, certificateID domain.C
 		return nil, storeError(err, "chain_certificate_read_failed", "could not read the certificate")
 	}
 
-	chain := make([][]byte, 0, 2)
-	seen := map[domain.CertificateID]struct{}{certificateID: {}}
 	expectedKeyGeneration := certificate.IssuerCAKeyGenerationID()
-	next := leaf.IssuerCACertificateID
-
-	for depth := 0; depth < maxChainDepth; depth++ {
-		if _, cycle := seen[next]; cycle {
-			return nil, chainError("chain_cycle", "the stored issuer chain is cyclic", next)
-		}
-		seen[next] = struct{}{}
-
+	return walkStoredCAChain(leaf.IssuerCACertificateID, certificateID, "chain", func(next domain.CertificateID) ([]byte, domain.CertificateID, error) {
 		record, err := tx.PKI().GetCACertificateRecord(ctx, next)
 		if err != nil {
 			if errors.Is(err, port.ErrNotFound) {
-				return nil, chainError("chain_ca_record_missing",
+				return nil, "", chainError("chain_ca_record_missing",
 					"a certificate in the stored issuer chain has no CA record", next)
 			}
-			return nil, storeError(err, "chain_ca_record_read_failed", "could not read a CA certificate record")
+			return nil, "", storeError(err, "chain_ca_record_read_failed", "could not read a CA certificate record")
 		}
 		if record.CAKeyGenerationID != expectedKeyGeneration {
-			return nil, chainError("chain_issuer_key_mismatch",
+			return nil, "", chainError("chain_issuer_key_mismatch",
 				"the stored issuer certificate does not certify the signing key generation", next)
 		}
 
 		caCertificate, err := tx.PKI().GetCertificate(ctx, next)
 		if err != nil {
 			if errors.Is(err, port.ErrNotFound) {
-				return nil, chainError("chain_certificate_missing",
+				return nil, "", chainError("chain_certificate_missing",
 					"a certificate in the stored issuer chain is missing", next)
 			}
-			return nil, storeError(err, "chain_certificate_read_failed", "could not read a chain certificate")
-		}
-		chain = append(chain, caCertificate.DER())
-
-		if record.IssuerCACertificateID == "" {
-			// A self-signed Root terminates the walk (docs/data-model.md
-			// "self-signed Root는 issuer 인증서 NULL").
-			return chain, nil
+			return nil, "", storeError(err, "chain_certificate_read_failed", "could not read a chain certificate")
 		}
 		expectedKeyGeneration = caCertificate.IssuerCAKeyGenerationID()
-		next = record.IssuerCACertificateID
+		return caCertificate.DER(), record.IssuerCACertificateID, nil
+	})
+}
+
+// existingIssuerChainDER includes the selected stored CA and its ancestors.
+// Import validates their cryptographic linkage through ChainValidator.
+func existingIssuerChainDER(ctx context.Context, tx port.TxStores, certID domain.CertificateID) ([][]byte, error) {
+	return walkStoredCAChain(certID, "", "import_chain", func(next domain.CertificateID) ([]byte, domain.CertificateID, error) {
+		cert, err := tx.PKI().GetCertificate(ctx, next)
+		if err != nil {
+			return nil, "", storeError(err, "import_chain_certificate_read_failed", "could not read a chain certificate")
+		}
+		record, err := tx.PKI().GetCACertificateRecord(ctx, next)
+		if err != nil {
+			return nil, "", storeError(err, "import_chain_record_read_failed", "could not read a CA certificate record")
+		}
+		return cert.DER(), record.IssuerCACertificateID, nil
+	})
+}
+
+// walkStoredCAChain follows historical issuer links with one cycle/depth guard.
+// childID, when present, is excluded from the chain and cannot recur as an issuer.
+// Each caller retains its own row validation and error mapping in readCA.
+func walkStoredCAChain(startID, childID domain.CertificateID, codePrefix string, readCA func(domain.CertificateID) ([]byte, domain.CertificateID, error)) ([][]byte, error) {
+	chain := make([][]byte, 0, 2)
+	seen := make(map[domain.CertificateID]struct{})
+	if childID != "" {
+		seen[childID] = struct{}{}
 	}
-	return nil, chainError("chain_too_deep", "the stored issuer chain is longer than supported", certificateID)
+	next := startID
+	for depth := 0; depth < maxChainDepth; depth++ {
+		if _, cycle := seen[next]; cycle {
+			return nil, chainError(codePrefix+"_cycle", "the stored issuer chain is cyclic", next)
+		}
+		seen[next] = struct{}{}
+		der, issuerID, err := readCA(next)
+		if err != nil {
+			return nil, err
+		}
+		chain = append(chain, der)
+		if issuerID == "" {
+			return chain, nil
+		}
+		next = issuerID
+	}
+	if childID == "" {
+		childID = startID
+	}
+	return nil, chainError(codePrefix+"_too_deep", "the stored issuer chain is longer than supported", childID)
 }
 
 // chainError is the single shape every chain-resolution failure takes. They

@@ -288,7 +288,7 @@ func (c TLSChange) ValidateCandidate(facts TLSValidationFacts) (TLSChange, error
 // of intent to activate, written before the in-memory installer swap
 // (backend-implementation.md §9 "committed 기록/활성 포인터 변경 →
 // Installer.Apply").
-func (c TLSChange) Commit(now Instant) (TLSChange, error) {
+func (c TLSChange) Commit() (TLSChange, error) {
 	if c.phase != TLSChangePhasePrepared {
 		return TLSChange{}, NewPolicyError(ErrInvalidTransition, "tls_change_not_prepared",
 			fmt.Sprintf("tls change is %s, not prepared", c.phase))
@@ -300,13 +300,12 @@ func (c TLSChange) Commit(now Instant) (TLSChange, error) {
 	next := c
 	next.phase = TLSChangePhaseCommitted
 	next.version = c.version.Next()
-	_ = now
 	return next, nil
 }
 
 // Apply records that the installer successfully swapped the live TLS
 // configuration to the candidate.
-func (c TLSChange) Apply(now Instant) (TLSChange, error) {
+func (c TLSChange) Apply() (TLSChange, error) {
 	if c.phase != TLSChangePhaseCommitted {
 		return TLSChange{}, NewPolicyError(ErrInvalidTransition, "tls_change_not_committed",
 			fmt.Sprintf("tls change is %s, not committed", c.phase))
@@ -314,7 +313,6 @@ func (c TLSChange) Apply(now Instant) (TLSChange, error) {
 	next := c
 	next.phase = TLSChangePhaseApplied
 	next.version = c.version.Next()
-	_ = now
 	return next, nil
 }
 
@@ -322,7 +320,7 @@ func (c TLSChange) Apply(now Instant) (TLSChange, error) {
 // in-memory config and the DB active pointer must revert to the previous
 // version (backend-implementation.md §9 "Apply 실패는 DB/메모리 모두
 // 원복한다"), so this candidate never becomes active.
-func (c TLSChange) RollbackApply(errorCode string, now Instant) (TLSChange, error) {
+func (c TLSChange) RollbackApply(errorCode string) (TLSChange, error) {
 	if c.phase != TLSChangePhaseCommitted {
 		return TLSChange{}, NewPolicyError(ErrInvalidTransition, "tls_change_not_committed",
 			fmt.Sprintf("tls change is %s, not committed", c.phase))
@@ -334,7 +332,6 @@ func (c TLSChange) RollbackApply(errorCode string, now Instant) (TLSChange, erro
 	next.phase = TLSChangePhaseRolledBack
 	next.errorCode = errorCode
 	next.version = c.version.Next()
-	_ = now
 	return next, nil
 }
 
@@ -358,7 +355,7 @@ func (c TLSChange) RollbackApply(errorCode string, now Instant) (TLSChange, erro
 // transition must never be usable to skip it), and applied/rolled_back are
 // already terminal. So committed is the only phase this marker may start
 // from.
-func (c TLSChange) MarkRecoveryRequired(errorCode string, now Instant) (TLSChange, error) {
+func (c TLSChange) MarkRecoveryRequired(errorCode string) (TLSChange, error) {
 	if c.phase != TLSChangePhaseCommitted {
 		return TLSChange{}, NewPolicyError(ErrInvalidTransition, "tls_change_not_committed",
 			fmt.Sprintf("tls change is %s, not committed", c.phase))
@@ -370,7 +367,6 @@ func (c TLSChange) MarkRecoveryRequired(errorCode string, now Instant) (TLSChang
 	next.phase = TLSChangePhaseRecoveryRequired
 	next.errorCode = errorCode
 	next.version = c.version.Next()
-	_ = now
 	return next, nil
 }
 
@@ -403,7 +399,7 @@ type TLSReconcileFacts struct {
 //     re-validates -> rolled_back;
 //   - neither re-validates -> the change stays recovery_required
 //     (maintenance) and Reconcile reports that nothing could be resolved.
-func (c TLSChange) Reconcile(facts TLSReconcileFacts, now Instant) (TLSChange, error) {
+func (c TLSChange) Reconcile(facts TLSReconcileFacts) (TLSChange, error) {
 	if c.phase != TLSChangePhaseRecoveryRequired {
 		return TLSChange{}, NewPolicyError(ErrInvalidTransition, "tls_change_not_recovery_required",
 			fmt.Sprintf("tls change is %s, not recovery_required", c.phase))
@@ -423,7 +419,6 @@ func (c TLSChange) Reconcile(facts TLSReconcileFacts, now Instant) (TLSChange, e
 		next.errorCode = ""
 		next.phase = TLSChangePhaseApplied
 		next.version = c.version.Next()
-		_ = now
 		return next, nil
 	}
 
@@ -432,7 +427,6 @@ func (c TLSChange) Reconcile(facts TLSReconcileFacts, now Instant) (TLSChange, e
 		next.phase = TLSChangePhaseRolledBack
 		next.errorCode = "tls_recovery_rolled_back_to_previous"
 		next.version = c.version.Next()
-		_ = now
 		return next, nil
 	}
 

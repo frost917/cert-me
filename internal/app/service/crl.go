@@ -115,7 +115,7 @@ func (s *CRLService) RequestPublication(ctx context.Context, meta contract.Mutat
 		if err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionCRLRequestPublication, port.NewAuthorizationScope(scope)); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionCRLRequestPublication, port.NewAuthoritiesAuthorizationScope(scope)); err != nil {
 			return err
 		}
 

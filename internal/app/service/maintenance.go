@@ -1,29 +1,7 @@
-// maintenance.go implements MaintenanceService (docs/backend-
-// implementation.md §3 table row "MaintenanceService"): Rotate,
-// FinalizeRestore, RecoverTransfers, PruneAudit. It also carries
-// ExpireDeliveries, the once-a-minute receipt-expiry sweep §14.1 names
-// ("delivery_expired") but that no service in this codebase implemented yet
-// -- placed here, not on DistributionService, because this developer's
-// assignment is scoped to maintenance.go/maintenance_test.go only and
-// DistributionService's files (distribution.go, recovery.go) are a
-// different developer's committed work. This placement is also a
-// substantive fit, not just a file-scope accident: contract.
-// InternalOperationDeliveryExpiry already exists (internal/app/contract/
-// meta.go) alongside SecretRotate/RestoreFinalize/AuditPrune/
-// TransferRecovery -- the same family of background/maintenance operations
-// this file's other four methods gate on -- and ExpireDeliveries needs
-// nothing from DistributionDeps (TokenCodec, DeliveryEncoder,
-// PublicCertificateEncoder, OperationalLogger) that MaintenanceDeps does not
-// already have.
-//
-// Every method here is reached only through a verified internal/local
-// Principal (§3: "runtime이 오프라인 허가 또는 제한된 복구 실행 경로로
-// 호출"), never an admin session, so none call requireCurrentAuth (that
-// helper only ever has work to do for an admin principal -- see its own doc
-// comment) and none go through the generic port.Authorizer/
-// AuthorizationScope path: see requireMaintenanceOperation's doc comment
-// for why a direct Principal.Can check is used instead, mirroring crl.go's
-// Publish and tls.go's requireInternalOperation.
+// MaintenanceService handles key rotation, restore finalization, transfer
+// recovery, delivery expiry and audit pruning through verified internal/local
+// principals. Each delivery mutation has its own transaction; unresolved restore
+// CRL requirements keep ordinary service admission closed.
 package service
 
 import (
@@ -91,31 +69,9 @@ const deliveryExpiredFailureCode = "delivery_expired"
 // unexpired pending delivery as expired merely to reach a terminal state.
 const restoreDeliveryFailureCode = "restore_pending"
 
-// requireMaintenanceOperation gates a MaintenanceService entry point to the
-// exact contract.InternalOperation it needs, checked directly against the
-// principal rather than through the generic port.Authorizer/
-// AuthorizationScope path.
-//
-// Reasoning, matching crl.go's Publish and tls.go's requireInternalOperation:
-// every method in this file is process-internal (§3), never an admin
-// session, and there is no AuthorityID scope an AuthorizationScope would add
-// here -- Rotate re-encrypts every stored secret across every CA at once,
-// PruneAudit touches the whole audit log, and RecoverTransfers/
-// ExpireDeliveries sweep every delivery in the store; none of these name a
-// single owning authority the way an Authority/Issuance method's scope does.
-//
-// This does NOT go through port.Action.RequiredInternalOperation() the way
-// tls.go's requireInternalOperation does for ActionTLSBootstrap/
-// ActionTLSReconcile: port/services.go's actionInternalOperations map (the
-// only place that pairing is declared) pairs just those two actions, not
-// any of ActionMaintenanceRotate/FinalizeRestore/RecoverTransfers/
-// PruneAudit -- so calling RequiredInternalOperation for those would always
-// report "not paired" and reject every legitimate caller. Adding that
-// pairing is a port/services.go change, outside this developer's assigned
-// files (maintenance.go/maintenance_test.go only); reported to the lead
-// rather than done here. A direct Principal.Can(op) check, exactly like
-// crl.go's Publish uses for ActionCRLPublish (also unpaired), is what this
-// function does instead.
+// requireMaintenanceOperation accepts only the exact internal capability for
+// an installation-wide maintenance operation; an administrator session alone
+// does not authorize it.
 func requireMaintenanceOperation(principal contract.Principal, op contract.InternalOperation) error {
 	if !principal.IsInternal() || !principal.Can(op) {
 		return contract.NewAppError(contract.ErrorKindForbidden, "maintenance_internal_operation_required",
@@ -309,7 +265,7 @@ func (s *MaintenanceService) Rotate(ctx context.Context, meta contract.MutationM
 // here just as much as it does inline in a request handler.
 //
 // Structure mirrors recovery.go's RecoverInterruptedTransfers exactly, per
-// the lead's brief: a preparation Read lists candidates in
+// the service contract: a preparation Read lists candidates in
 // recoveryBatchSize batches, each row is resolved in its OWN
 // UnitOfWork.Write (so one unresolvable row does not strand the rest), the
 // failure/revocation/CRL-demand/audit trail share one commit through the
@@ -448,38 +404,9 @@ func (s *MaintenanceService) expireOneDelivery(ctx context.Context, deliveryID d
 
 // ---- RecoverTransfers ----
 
-// RecoverTransfers is MaintenanceService's own transferring-delivery sweep
-// (docs/backend-implementation.md §3 "RecoverTransfers() → RecoverySummary"),
-// reachable through the "제한된 복구 실행 경로" §3 names -- an
-// operator-triggered recovery pass, distinct from
-// DistributionService.RecoverInterruptedTransfers (recovery.go), which runs
-// automatically, once, before the runtime opens admission at startup.
-//
-// The two intentionally do the SAME underlying domain operation (fail a
-// transferring delivery, revoke its certificate, record the CRL demand and
-// audit trail -- all in one commit per row) but cannot share an
-// implementation: they are methods on different service types with
-// different dependency sets (DistributionDeps carries TokenCodec/
-// DeliveryEncoder/PublicCertificateEncoder/OperationalLogger that
-// MaintenanceDeps has no use for), this codebase has no precedent anywhere
-// for one service holding another service as a dependency, and recovery.go
-// is a different developer's committed file this developer's brief
-// explicitly must not modify. The per-row helper below (recoverOneTransfer)
-// is therefore this file's own copy of failInterruptedTransfer's logic, but
-// it reuses -- rather than redefines -- every shared building block that
-// already exists at package scope: recoveryBatchSize, recoveryFailureCode,
-// leafManagementAuthority and applyRevocations.
-//
-// Error handling deliberately differs from recovery.go's abort-on-first-
-// failure gate: recovery.go's caller must not open admission after a
-// partial recovery, so ANY row failure aborts the whole run. RecoverySummary
-// (Checked/Changed/Failed counters plus FailedIDs) is shaped for a
-// different contract -- an operator-triggered pass that tolerates
-// individual unresolvable rows and reports exactly which ones need manual
-// attention, rather than an all-or-nothing gate. This is an interpretation
-// of a result shape the docs state tersely ("RecoverySummary는
-// Checked/Changed/Failed 카운터와 비밀 없는 FailedIDs다") without spelling
-// out the per-row failure policy; flagged for the lead in the PR report.
+// RecoverTransfers is an operator-triggered recovery pass. It uses the same
+// per-row mutation as startup recovery, but collects failed IDs and continues
+// processing instead of aborting on the first failed row.
 func (s *MaintenanceService) RecoverTransfers(ctx context.Context, meta contract.MutationMeta, cmd contract.MaintenanceRecoverTransfersCommand) (contract.RecoverySummary, error) {
 	if err := cmd.Validate(); err != nil {
 		return contract.RecoverySummary{}, err
@@ -522,9 +449,8 @@ func (s *MaintenanceService) RecoverTransfers(ctx context.Context, meta contract
 	}
 }
 
-// recoverOneTransfer resolves one delivery in its own transaction, exactly
-// like recovery.go's failInterruptedTransfer (see this file's RecoverTransfers
-// doc comment for why this is a separate copy rather than a shared call).
+// recoverOneTransfer reads the observation time after locking the delivery.
+// A commit with an unknown outcome keeps runtime admission closed.
 func (s *MaintenanceService) recoverOneTransfer(ctx context.Context, deliveryID domain.DeliveryID) (bool, error) {
 	changed := false
 	err := s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
@@ -541,42 +467,16 @@ func (s *MaintenanceService) recoverOneTransfer(ctx context.Context, deliveryID 
 		}
 
 		now := s.deps.Clock.Now()
-		certificate, err := tx.PKI().GetCertificate(ctx, delivery.CertificateID())
-		if err != nil {
-			return storeError(err, "maintenance_recover_transfer_certificate_read_failed", "could not read the interrupted delivery's certificate")
-		}
-		scope, err := leafManagementAuthority(ctx, tx, certificate.ID())
-		if err != nil {
-			return err
-		}
-
-		failedDelivery, err := delivery.Fail(recoveryFailureCode, now)
-		if err != nil {
-			return contract.FromDomainError(err)
-		}
-		if err := tx.Delivery().SaveDelivery(ctx, failedDelivery, delivery.Version()); err != nil {
-			return storeError(err, "maintenance_recover_transfer_save_failed", "could not record the interrupted delivery's failure")
-		}
-		if err := tx.Delivery().InvalidatePrivateGrants(ctx, delivery.ID(), now); err != nil {
-			return storeError(err, "maintenance_recover_transfer_grant_invalidate_failed", "could not invalidate the interrupted delivery's links")
-		}
-
-		change := RevocationChange{
-			IssuerID:      certificate.IssuerCAKeyGenerationID(),
-			Serial:        certificate.Serial(),
-			CertificateID: certificate.ID(),
-			RevokedAt:     now,
-			Reason:        domain.RevocationReasonUnspecified,
-			Source:        domain.RevocationSourceCascade,
-			AuthorityID:   scope,
-		}
-		revMeta := RevocationMeta{
+		if err := failInterruptedDelivery(ctx, tx, delivery, RevocationMeta{
 			ActorKind: contract.AuditActorSystem,
 			Action:    "maintenance.recover_transfers.interrupted_transfer",
 			Now:       now,
 			IDs:       s.deps.IDs,
-		}
-		if _, err := applyRevocations(ctx, tx, []RevocationChange{change}, revMeta); err != nil {
+		}, transferRecoveryErrors{
+			certificateRead: "maintenance_recover_transfer_certificate_read_failed",
+			deliverySave:    "maintenance_recover_transfer_save_failed",
+			grantInvalidate: "maintenance_recover_transfer_grant_invalidate_failed",
+		}); err != nil {
 			return err
 		}
 		changed = true
@@ -772,8 +672,8 @@ func (s *MaintenanceService) startRestoreRun(ctx context.Context, runID domain.J
 // Authorization은 전체 관리자만 허용한다"; settingsScope's own comment,
 // settings_service.go, "현재 MVP 역할 모델에 CA 범위 관리자가 없다"). If a
 // later role model adds more admin accounts, this call stops being
-// "invalidate ALL administrator sessions" -- flagged here rather than
-// silently assumed to still hold.
+// "invalidate ALL administrator sessions"; the bulk invalidation must be
+// extended when multiple administrator accounts are introduced.
 func (s *MaintenanceService) invalidateAllAdminSessions(ctx context.Context) error {
 	err := s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
 		installation, err := tx.Installation().GetForUpdate(ctx)

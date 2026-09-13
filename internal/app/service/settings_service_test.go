@@ -540,11 +540,11 @@ func seedActiveTLSVersion(t *testing.T, store *porttest.Store, ids *seqIDs, vali
 	if err != nil {
 		t.Fatalf("validate candidate: %v", err)
 	}
-	change, err = change.Commit(testNow())
+	change, err = change.Commit()
 	if err != nil {
 		t.Fatalf("commit change: %v", err)
 	}
-	change, err = change.Apply(testNow())
+	change, err = change.Apply()
 	if err != nil {
 		t.Fatalf("apply change: %v", err)
 	}

@@ -17,19 +17,12 @@ import (
 )
 
 // AuthorityDeps is AuthorityService's dependency set: CommonDeps plus the
-// signing dependencies docs/backend-implementation.md §5 names for
-// Authority/Issuance jointly ("KeyEngine, CertificateSigner, SerialGenerator,
-// ProfileValidator"). ProfileValidator is required at construction, matching
-// IssuanceDeps, but never called: a CA certificate carries no profile or
-// SANs (domain.IssuanceRequest.ValidateFor's subordinate-CA branch requires
-// both empty), and port.ProfileValidator's own doc comment says the
-// operator-configurable policy it would check is not specified anywhere yet.
+// signing dependencies required to create an authority.
 type AuthorityDeps struct {
 	CommonDeps
 	KeyEngine         port.KeyEngine
 	CertificateSigner port.CertificateSigner
 	SerialGenerator   port.SerialGenerator
-	ProfileValidator  port.ProfileValidator
 }
 
 // Validate reports the first missing dependency, common or Authority-specific.
@@ -41,7 +34,6 @@ func (d AuthorityDeps) Validate() error {
 		required{"KeyEngine", d.KeyEngine == nil},
 		required{"CertificateSigner", d.CertificateSigner == nil},
 		required{"SerialGenerator", d.SerialGenerator == nil},
-		required{"ProfileValidator", d.ProfileValidator == nil},
 	)
 }
 
@@ -235,7 +227,7 @@ func (s *AuthorityService) Create(ctx context.Context, meta contract.MutationMet
 		scope = []domain.AuthorityID{cmd.ParentAuthorityID}
 	}
 	// §6: admission is checked before any expensive preparation.
-	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionAuthorityCreate, port.NewAuthorizationScope(scope...)); err != nil {
+	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionAuthorityCreate, port.NewAuthoritiesAuthorizationScope(scope...)); err != nil {
 		return contract.AuthorityView{}, err
 	}
 
@@ -297,7 +289,7 @@ func (s *AuthorityService) replayCreateBeforePreparation(
 		if err := requireCurrentAuth(ctx, tx, principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, principal, port.ActionAuthorityCreate, port.NewAuthorizationScope(scope...)); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, principal, port.ActionAuthorityCreate, port.NewAuthoritiesAuthorizationScope(scope...)); err != nil {
 			return err
 		}
 		stored, ok, err := ReplayStoredResult(ctx, tx, reqKey, inputHash)
@@ -548,7 +540,7 @@ func (s *AuthorityService) commitCreate(ctx context.Context, tx port.TxStores, m
 	if prep.kind == domain.AuthorityKindIntermediate {
 		scope = []domain.AuthorityID{prep.parentAuthorityID}
 	}
-	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionAuthorityCreate, port.NewAuthorizationScope(scope...)); err != nil {
+	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionAuthorityCreate, port.NewAuthoritiesAuthorizationScope(scope...)); err != nil {
 		return err
 	}
 
@@ -745,7 +737,7 @@ func (s *AuthorityService) Rename(ctx context.Context, meta contract.MutationMet
 		if err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionAuthorityRename, port.NewAuthorizationScope(scope)); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionAuthorityRename, port.NewAuthoritiesAuthorizationScope(scope)); err != nil {
 			return err
 		}
 		if authority.Version() != expectedVersion {
@@ -834,7 +826,7 @@ func (s *AuthorityService) SetIssuanceState(ctx context.Context, meta contract.M
 		if err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionAuthoritySetIssuanceState, port.NewAuthorizationScope(scope)); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionAuthoritySetIssuanceState, port.NewAuthoritiesAuthorizationScope(scope)); err != nil {
 			return err
 		}
 		if authority.Version() != expectedVersion {
@@ -999,7 +991,7 @@ func (s *AuthorityService) DestroyKey(ctx context.Context, meta contract.Mutatio
 		if err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionAuthorityDestroyKey, port.NewAuthorizationScope(scope)); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionAuthorityDestroyKey, port.NewAuthoritiesAuthorizationScope(scope)); err != nil {
 			return err
 		}
 		if authority.Version() != expectedVersion {
@@ -1032,7 +1024,7 @@ func (s *AuthorityService) DestroyKey(ctx context.Context, meta contract.Mutatio
 		if err != nil {
 			return err
 		}
-		destroyed, err := authority.DestroyKey(closure, now)
+		destroyed, err := authority.DestroyKey(closure)
 		if err != nil {
 			return contract.FromDomainError(err)
 		}
@@ -1112,7 +1104,7 @@ func (s *AuthorityService) Archive(ctx context.Context, meta contract.MutationMe
 		if err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionAuthorityArchive, port.NewAuthorizationScope(scope)); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionAuthorityArchive, port.NewAuthoritiesAuthorizationScope(scope)); err != nil {
 			return err
 		}
 		if authority.Version() != expectedVersion {

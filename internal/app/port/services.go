@@ -14,9 +14,8 @@ import (
 
 // Clock is the only source of the current time app code may observe
 // (docs/backend-implementation.md §1 "domain은 ... 전역 시계를 참조하지
-// 않는다"; §5 lists Clock as a dependency every service shares). Every
-// service call reads now once from this and threads it explicitly into the
-// domain methods that need it, so a test can supply a deterministic clock.
+// 않는다"; §5 lists Clock as a dependency every service shares). Services
+// pass its readings explicitly to domain methods that need them.
 type Clock interface {
 	Now() domain.Instant
 }
@@ -70,17 +69,6 @@ func NewAuthoritiesAuthorizationScope(ids ...domain.AuthorityID) AuthorizationSc
 		unique = append(unique, id)
 	}
 	return AuthorizationScope{kind: AuthorizationScopeAuthorities, authorityIDs: unique}
-}
-
-// NewAuthorizationScope is kept as a compatibility helper for existing
-// service call sites: no ids means installation, one or more ids means
-// authorities. New code may use the explicit constructors when the scope
-// kind itself is part of the intent.
-func NewAuthorizationScope(authorityIDs ...domain.AuthorityID) AuthorizationScope {
-	if len(authorityIDs) == 0 {
-		return NewInstallationAuthorizationScope()
-	}
-	return NewAuthoritiesAuthorizationScope(authorityIDs...)
 }
 
 // Kind returns the scope relation.
@@ -476,23 +464,6 @@ var (
 // bundle format the client asked for.
 type DeliveryEncoder interface {
 	Encode(ctx context.Context, input DeliveryEncodeInput) (EncodedBundle, error)
-}
-
-// ProfileValidator checks a requested certificate profile/SAN/algorithm
-// combination against operator-configured policy beyond the fixed shape
-// rules domain.ValidateSANsForProfile already enforces
-// (docs/backend-implementation.md §5 lists ProfileValidator as an
-// Authority/Issuance dependency, alongside KeyEngine and
-// CertificateSigner). Neither docs/backend-implementation.md nor
-// api/openapi.json's Settings schema currently defines what that
-// operator-configurable policy consists of -- there is no allowed-SAN
-// domain allowlist or per-algorithm enable/disable field anywhere in
-// Settings today. The concrete policy set this interface will check is
-// therefore not yet specified; this comment intentionally does not guess
-// at one so a B05 implementer is not held to product behavior nobody has
-// actually decided on.
-type ProfileValidator interface {
-	Validate(ctx context.Context, profile domain.CertificateProfile, sans []domain.SAN, algorithm domain.KeyAlgorithm) error
 }
 
 // URLValidator checks that a service URL is well-formed and reachable

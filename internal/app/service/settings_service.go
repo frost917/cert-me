@@ -81,7 +81,7 @@ func (s *SettingsService) Get(ctx context.Context, meta contract.RequestMeta, cm
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionSettingsGet, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionSettingsGet, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		settings, err := tx.Installation().GetSettings(ctx)
@@ -150,7 +150,7 @@ func (s *SettingsService) Update(ctx context.Context, meta contract.MutationMeta
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionSettingsUpdate, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionSettingsUpdate, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 

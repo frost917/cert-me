@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -281,4 +282,35 @@ type staleTransferringDeliveries struct {
 
 func (d staleTransferringDeliveries) ListTransferring(context.Context, int) ([]domain.Delivery, error) {
 	return []domain.Delivery{d.delivery}, nil
+}
+
+func TestRecoveryEntryPointsPreserveObservationTime(t *testing.T) {
+	for _, maintenance := range []bool{false, true} {
+		t.Run(fmt.Sprintf("maintenance=%t", maintenance), func(t *testing.T) {
+			start := distTestNow()
+			later := start.Add(domain.NewDuration(time.Minute))
+			fx := seedPrivateFixture(t, start.Add(domain.NewDuration(time.Hour)), domain.DeliveryStateTransferring)
+			seedCRLStateFor(t, fx.store, fx.issuerID)
+			clock := &movableClock{now: start}
+			uow := &mutateOnceUoW{inner: fx.store, mutate: func() { clock.now = later }}
+			var err error
+			want := start
+			if maintenance {
+				svc := newMaintenanceTestService(t, fx.store)
+				svc.deps.Clock, svc.deps.UnitOfWork = clock, uow
+				_, err = svc.recoverOneTransfer(context.Background(), fx.deliverID)
+				want = later
+			} else {
+				svc := recoveryService(t, fx.store)
+				svc.deps.Clock, svc.deps.UnitOfWork = clock, uow
+				_, err = svc.RecoverInterruptedTransfers(context.Background())
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := storedDelivery(t, fx.store, fx.deliverID).FinishedAt(); !got.Equal(want) {
+				t.Fatalf("finished_at = %v, want %v", got, want)
+			}
+		})
+	}
 }

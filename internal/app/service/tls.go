@@ -296,7 +296,7 @@ func (s *TLSService) Status(ctx context.Context, meta contract.RequestMeta, cmd 
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTLSStatus, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTLSStatus, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		installation, err := tx.Installation().GetForUpdate(ctx)
@@ -387,7 +387,7 @@ func (s *TLSService) uploadCandidate(ctx context.Context, meta contract.Mutation
 	}
 	if !admitted {
 		// §6/§8: admission is checked before any expensive parsing/import work.
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, action, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, action, port.NewInstallationAuthorizationScope()); err != nil {
 			return contract.TLSVersionView{}, err
 		}
 		if err := ctx.Err(); err != nil {
@@ -535,7 +535,7 @@ func (s *TLSService) uploadCandidate(ctx context.Context, meta contract.Mutation
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, action, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, action, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 		if err := tx.PKI().InsertKeyMaterial(ctx, port.KeyMaterial{ID: keyMaterialID, PublicKey: generated.PublicKey, Origin: "imported"}); err != nil {
@@ -584,7 +584,7 @@ func (s *TLSService) Reload(ctx context.Context, meta contract.MutationMeta, cmd
 		return contract.TLSVersionView{}, contract.NewAppError(contract.ErrorKindForbidden, "tls_requires_admin",
 			"reloading a TLS candidate requires an administrator session")
 	}
-	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTLSReload, port.NewAuthorizationScope()); err != nil {
+	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTLSReload, port.NewInstallationAuthorizationScope()); err != nil {
 		return contract.TLSVersionView{}, err
 	}
 	if err := s.deps.ReadStore.Read(ctx, func(tx port.TxStores) error {
@@ -1064,7 +1064,7 @@ func (s *TLSService) Bootstrap(ctx context.Context, meta contract.MutationMeta, 
 		if err != nil {
 			return contract.FromDomainError(err)
 		}
-		committed, err := change.Commit(now)
+		committed, err := change.Commit()
 		if err != nil {
 			return contract.FromDomainError(err)
 		}
@@ -1113,7 +1113,7 @@ func (s *TLSService) Bootstrap(ctx context.Context, meta contract.MutationMeta, 
 	}
 
 	now := s.deps.Clock.Now()
-	applied, err := outcome.change.Apply(now)
+	applied, err := outcome.change.Apply()
 	if err != nil {
 		s.deps.RuntimeGate.FailClosed("tls_bootstrap_applied_record_failed")
 		_ = s.markRecoveryRequired(ctx, outcome.change, "tls_bootstrap_applied_record_failed")
@@ -1270,7 +1270,7 @@ func (s *TLSService) IssueCandidate(ctx context.Context, meta contract.MutationM
 
 	authorityID := cmd.AuthorityID
 	// §6: admission is checked before any expensive preparation.
-	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTLSIssueCandidate, port.NewAuthorizationScope(authorityID)); err != nil {
+	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTLSIssueCandidate, port.NewAuthoritiesAuthorizationScope(authorityID)); err != nil {
 		return contract.TLSVersionView{}, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -1317,7 +1317,7 @@ func (s *TLSService) replayIssueCandidateBeforePreparation(ctx context.Context, 
 		if err := requireCurrentAuth(ctx, tx, principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, principal, port.ActionTLSIssueCandidate, port.NewAuthorizationScope(authorityID)); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, principal, port.ActionTLSIssueCandidate, port.NewAuthoritiesAuthorizationScope(authorityID)); err != nil {
 			return err
 		}
 		stored, ok, err := ReplayStoredResult(ctx, tx, reqKey, inputHash)
@@ -1454,7 +1454,7 @@ func (s *TLSService) commitIssueCandidate(ctx context.Context, tx port.TxStores,
 	if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 		return err
 	}
-	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTLSIssueCandidate, port.NewAuthorizationScope(authorityID)); err != nil {
+	if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTLSIssueCandidate, port.NewAuthoritiesAuthorizationScope(authorityID)); err != nil {
 		return err
 	}
 	if stored, found, err := ReplayStoredResult(ctx, tx, reqKey, inputHash); err != nil {
@@ -1672,7 +1672,7 @@ func (s *TLSService) Activate(ctx context.Context, meta contract.MutationMeta, c
 		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
 			return err
 		}
-		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTLSActivate, port.NewAuthorizationScope()); err != nil {
+		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionTLSActivate, port.NewInstallationAuthorizationScope()); err != nil {
 			return err
 		}
 
@@ -1748,7 +1748,7 @@ func (s *TLSService) Activate(ctx context.Context, meta contract.MutationMeta, c
 			return nil
 		}
 
-		committed, err := change.Commit(now)
+		committed, err := change.Commit()
 		if err != nil {
 			return contract.FromDomainError(err)
 		}
@@ -1802,6 +1802,7 @@ func (s *TLSService) Activate(ctx context.Context, meta contract.MutationMeta, c
 	// (§13 "성공 후 defer된 Discard는 활성 설정을 지우지 않는다").
 	defer s.deps.TLSInstaller.Discard(prepared)
 
+	appliedNow := s.deps.Clock.Now()
 	if err := s.deps.TLSInstaller.Apply(ctx, prepared); err != nil {
 		// §9 "Apply 실패는 DB/메모리 모두 원복한다": the in-memory half is
 		// TLSInstaller's own contract (a failed Apply leaves the previous
@@ -1813,8 +1814,7 @@ func (s *TLSService) Activate(ctx context.Context, meta contract.MutationMeta, c
 			"could not apply the TLS candidate", err)
 	}
 
-	appliedNow := s.deps.Clock.Now()
-	applied, err := outcome.change.Apply(appliedNow)
+	applied, err := outcome.change.Apply()
 	if err != nil {
 		// Unreachable in practice (outcome.change is always committed on
 		// this path), but treated as the same ambiguous-recording case
@@ -1905,7 +1905,7 @@ func deleteBootstrapSecrets(ctx context.Context, tx port.TxStores) error {
 func (s *TLSService) rollbackActivation(ctx context.Context, meta contract.MutationMeta, outcome tlsActivationOutcome, errorCode string) error {
 	now := s.deps.Clock.Now()
 	return s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
-		rolledBack, err := outcome.change.RollbackApply(errorCode, now)
+		rolledBack, err := outcome.change.RollbackApply(errorCode)
 		if err != nil {
 			return err
 		}
@@ -1939,9 +1939,8 @@ func (s *TLSService) rollbackActivation(ctx context.Context, meta contract.Mutat
 // "committed" (which would look, to a later Activate, like a resumable
 // normal attempt rather than the maintenance condition it actually is).
 func (s *TLSService) markRecoveryRequired(ctx context.Context, committed domain.TLSChange, errorCode string) error {
-	now := s.deps.Clock.Now()
 	return s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
-		recovery, err := committed.MarkRecoveryRequired(errorCode, now)
+		recovery, err := committed.MarkRecoveryRequired(errorCode)
 		if err != nil {
 			return err
 		}
@@ -2042,8 +2041,7 @@ func (s *TLSService) Reconcile(ctx context.Context, meta contract.MutationMeta, 
 			// here before Apply or before the applied record, so move it into
 			// the explicit recovery state before evaluating the stored
 			// candidate/previous snapshots.
-			now := s.deps.Clock.Now()
-			recovery, err := active.MarkRecoveryRequired("tls_reconcile_committed", now)
+			recovery, err := active.MarkRecoveryRequired("tls_reconcile_committed")
 			if err != nil {
 				failureCode = "tls_reconcile_committed_marker_failed"
 				return contract.WrapAppError(contract.ErrorKindUnavailable, failureCode,
@@ -2093,7 +2091,7 @@ func (s *TLSService) Reconcile(ctx context.Context, meta contract.MutationMeta, 
 			facts.PreviousVersionID = active.PreviousVersionID()
 		}
 
-		reconciled, recErr := active.Reconcile(facts, now)
+		reconciled, recErr := active.Reconcile(facts)
 		if recErr != nil {
 			failureCode = "tls_recovery_unresolved"
 			return contract.WrapAppError(contract.ErrorKindUnavailable, failureCode,

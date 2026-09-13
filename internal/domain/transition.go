@@ -160,7 +160,7 @@ func (t Transition) IsClosed() bool { return t.state == TransitionStateClosed }
 // without a target (emergency report before a replacement CA exists) can
 // adopt one later, and it is rejected once the transition has moved past
 // in_progress (Complete/Close already run).
-func (t Transition) SetTarget(targetAuthorityID AuthorityID, now Instant) (Transition, error) {
+func (t Transition) SetTarget(targetAuthorityID AuthorityID) (Transition, error) {
 	if !t.IsInProgress() {
 		return Transition{}, NewPolicyError(ErrInvalidTransition, "transition_not_in_progress",
 			"transition is no longer in_progress")
@@ -171,12 +171,6 @@ func (t Transition) SetTarget(targetAuthorityID AuthorityID, now Instant) (Trans
 	next := t
 	next.targetAuthorityID = targetAuthorityID
 	next.version = t.version.Next()
-	// now is accepted for signature uniformity with every other domain
-	// transition, but ca_transitions stores no timestamp beyond reported_at
-	// (data-model.md), so there is nothing here to stamp. This is a schema
-	// fact, not an oversight: if a closed_at/completed_at column is ever
-	// added, the value is already threaded in.
-	_ = now
 	return next, nil
 }
 
@@ -188,17 +182,11 @@ func (t Transition) SetTarget(targetAuthorityID AuthorityID, now Instant) (Trans
 // (backend-implementation.md §2 "수동 확인 보존"). Confirmations only make
 // sense while the transition is still in_progress; once Complete has run the
 // external deployment has already been confirmed and closed off.
-func (t Transition) ConfirmDeployment(now Instant) error {
+func (t Transition) ConfirmDeployment() error {
 	if !t.IsInProgress() {
 		return NewPolicyError(ErrInvalidTransition, "transition_not_in_progress",
 			"transition is no longer in_progress")
 	}
-	// now is accepted for signature uniformity with every other domain
-	// transition, but ca_transitions stores no timestamp beyond reported_at
-	// (data-model.md), so there is nothing here to stamp. This is a schema
-	// fact, not an oversight: if a closed_at/completed_at column is ever
-	// added, the value is already threaded in.
-	_ = now
 	return nil
 }
 
@@ -224,7 +212,7 @@ type TransitionClosureFacts struct {
 // externally_completed is NOT the same as closed -- reaching closed also
 // requires the source CA's publication-termination condition, checked
 // separately by Close, and must never be inferred from Complete alone.
-func (t Transition) Complete(facts TransitionClosureFacts, now Instant) (Transition, error) {
+func (t Transition) Complete(facts TransitionClosureFacts) (Transition, error) {
 	if !t.IsInProgress() {
 		return Transition{}, NewPolicyError(ErrInvalidTransition, "transition_not_in_progress",
 			"transition is no longer in_progress")
@@ -249,7 +237,6 @@ func (t Transition) Complete(facts TransitionClosureFacts, now Instant) (Transit
 	// (data-model.md), so there is nothing here to stamp. This is a schema
 	// fact, not an oversight: if a closed_at/completed_at column is ever
 	// added, the value is already threaded in.
-	_ = now
 	return next, nil
 }
 
@@ -271,7 +258,7 @@ type TransitionTerminationFacts struct {
 // from Complete: closed must never be assumed just because the external
 // deployment was confirmed (B02 ruling, same citation as
 // TransitionTerminationFacts above).
-func (t Transition) Close(facts TransitionTerminationFacts, now Instant) (Transition, error) {
+func (t Transition) Close(facts TransitionTerminationFacts) (Transition, error) {
 	if t.IsInProgress() {
 		return Transition{}, NewPolicyError(ErrInvalidTransition, "transition_not_externally_completed",
 			"transition must be externally_completed before it can be closed")
@@ -292,7 +279,6 @@ func (t Transition) Close(facts TransitionTerminationFacts, now Instant) (Transi
 	// (data-model.md), so there is nothing here to stamp. This is a schema
 	// fact, not an oversight: if a closed_at/completed_at column is ever
 	// added, the value is already threaded in.
-	_ = now
 	return next, nil
 }
 
