@@ -95,6 +95,8 @@ func (p *tlsFakePKIParser) ParseCRL(context.Context, port.CRLInput) (port.Parsed
 	return port.ParsedCRLFacts{}, errors.New("tlsFakePKIParser: ParseCRL not supported")
 }
 
+func (*tlsFakePKIParser) PreflightCAKeys(context.Context, []port.CAKeyInput) error { return nil }
+
 func (p *tlsFakePKIParser) ParseCAKey(context.Context, port.CAKeyInput) (port.ValidatedCAKeyInput, error) {
 	return port.ValidatedCAKeyInput{}, errors.New("tlsFakePKIParser: ParseCAKey not supported")
 }

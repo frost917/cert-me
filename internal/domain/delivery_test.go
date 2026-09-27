@@ -43,6 +43,15 @@ func mkGrantID(t *testing.T, suffix byte) GrantID {
 	return id
 }
 
+func mkGrantAccountID(t *testing.T) AccountID {
+	t.Helper()
+	id, err := ParseAccountID("00000000-0000-4000-8000-000000000099")
+	if err != nil {
+		t.Fatalf("account id: %v", err)
+	}
+	return id
+}
+
 func mkDeliveryIDN(t *testing.T) DeliveryID { return mkDeliveryID(t) }
 
 func t0() Instant                                { return NewInstant(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)) }
@@ -192,6 +201,7 @@ func newPublicGrant(t *testing.T, expiresAt Instant) DownloadGrant {
 		TokenHash:     mkTokenHash(t, 1),
 		Purpose:       GrantPurposeLeafPublic,
 		CertificateID: mkCertID(t),
+		CreatedBy:     mkGrantAccountID(t),
 		ExpiresAt:     expiresAt,
 	})
 	if err != nil {
@@ -208,6 +218,7 @@ func newPrivateGrant(t *testing.T, deliveryID DeliveryID, expiresAt Instant) Dow
 		Purpose:       GrantPurposeLeafPrivate,
 		CertificateID: mkCertID(t),
 		DeliveryID:    deliveryID,
+		CreatedBy:     mkGrantAccountID(t),
 		ExpiresAt:     expiresAt,
 	})
 	if err != nil {
@@ -221,13 +232,13 @@ func newPrivateGrant(t *testing.T, deliveryID DeliveryID, expiresAt Instant) Dow
 func TestNewDownloadGrant_PurposeDeliveryBinding(t *testing.T) {
 	if _, err := NewDownloadGrant(DownloadGrantFacts{
 		ID: mkGrantID(t, '3'), TokenHash: mkTokenHash(t, 3), Purpose: GrantPurposeLeafPrivate,
-		CertificateID: mkCertID(t), ExpiresAt: plus(t0(), time.Hour),
+		CertificateID: mkCertID(t), CreatedBy: mkGrantAccountID(t), ExpiresAt: plus(t0(), time.Hour),
 	}); err == nil {
 		t.Fatalf("expected error: private grant without delivery id")
 	}
 	if _, err := NewDownloadGrant(DownloadGrantFacts{
 		ID: mkGrantID(t, '4'), TokenHash: mkTokenHash(t, 4), Purpose: GrantPurposeLeafPublic,
-		CertificateID: mkCertID(t), DeliveryID: mkDeliveryID(t), ExpiresAt: plus(t0(), time.Hour),
+		CertificateID: mkCertID(t), DeliveryID: mkDeliveryID(t), CreatedBy: mkGrantAccountID(t), ExpiresAt: plus(t0(), time.Hour),
 	}); err == nil {
 		t.Fatalf("expected error: public grant carrying a delivery id")
 	}

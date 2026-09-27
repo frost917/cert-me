@@ -206,14 +206,28 @@ func (s *IdentityService) Login(ctx context.Context, meta contract.MutationMeta,
 	var (
 		rawSession  *secret.Input
 		sessionHash domain.TokenHash
+		rawCSRF     *secret.Input
+		csrfHash    domain.TokenHash
 	)
+	sessionTransferred, csrfTransferred := false, false
+	defer func() {
+		if !sessionTransferred {
+			rawSession.Close()
+		}
+		if !csrfTransferred {
+			rawCSRF.Close()
+		}
+	}()
 	if facts.found && verified {
 		rawSession, sessionHash, err = s.deps.TokenCodec.NewToken(ctx)
 		if err != nil {
 			return contract.LoginView{}, storeError(err, "identity_session_token_failed", "could not mint a session token")
 		}
+		rawCSRF, csrfHash, err = s.deps.TokenCodec.NewToken(ctx)
+		if err != nil {
+			return contract.LoginView{}, storeError(err, "identity_csrf_token_failed", "could not mint a csrf token")
+		}
 	}
-	defer rawSession.Close()
 
 	// rejected carries a rejection that must still commit a side effect
 	// (the failure counter): §4 requires the callback below to return nil
@@ -264,6 +278,7 @@ func (s *IdentityService) Login(ctx context.Context, meta contract.MutationMeta,
 			ID:                sessionID,
 			AccountID:         account.ID(),
 			TokenHash:         sessionHash,
+			CSRFSecretHash:    csrfHash,
 			AuthEpoch:         account.AuthEpoch(),
 			LastSeenAt:        now,
 			AbsoluteExpiresAt: policy.AbsoluteExpiresAt(now),
@@ -280,22 +295,12 @@ func (s *IdentityService) Login(ctx context.Context, meta contract.MutationMeta,
 			return err
 		}
 
-		// CSRF is minted last, once nothing else in this commit can still
-		// fail: contract.LoginView has no field to persist its hash against
-		// (no domain.SessionState field, no port method for one -- see the
-		// report), so it can only ever be minted and handed back, never
-		// verified server-side later. Minting it last means a failure
-		// anywhere above never leaves an unused CSRF secret to clean up.
-		csrfRaw, _, err := s.deps.TokenCodec.NewToken(ctx)
-		if err != nil {
-			return storeError(err, "identity_csrf_token_failed", "could not mint a csrf token")
-		}
-
 		result = contract.LoginView{
 			Account:           toAccountView(account),
 			IdleExpiresAt:     now.Add(policy.IdleTimeout()),
 			AbsoluteExpiresAt: session.AbsoluteExpiresAt(),
-			CSRFToken:         csrfRaw,
+			SessionToken:      rawSession,
+			CSRFToken:         rawCSRF,
 		}
 		return nil
 	})
@@ -305,6 +310,7 @@ func (s *IdentityService) Login(ctx context.Context, meta contract.MutationMeta,
 	if rejected != nil {
 		return contract.LoginView{}, rejected
 	}
+	sessionTransferred, csrfTransferred = true, true
 	return result, nil
 }
 
@@ -796,33 +802,50 @@ func (s *IdentityService) CompleteReset(ctx context.Context, meta contract.Mutat
 // IssueCSRF mints a fresh anti-CSRF bearer token (docs/backend-
 // implementation.md §3 "IssueCSRF → CSRF"; api/openapi.json "/api/v1/auth/
 // csrf" get: "security": [], "may use current session or pre-auth nonce
-// cookie. Never grants setup authorization"). It performs no store write at
-// all: there is nowhere to persist the token's hash for later verification
-// -- domain.SessionState carries no CSRF field and no port method exists
-// for one, the same gap noted on Login's CSRFToken field -- so this can
-// only mint and hand back a value, exactly as far as the existing contract
-// supports. See the report.
+// cookie. Never grants setup authorization"). For an authenticated admin it
+// replaces the session's stored CSRF hash in a write transaction; the
+// anonymous pre-auth path returns a one-use token for the HTTP layer to bind
+// to its pre-auth nonce.
 func (s *IdentityService) IssueCSRF(ctx context.Context, meta contract.RequestMeta, cmd contract.IdentityIssueCSRFCommand) (contract.CSRFView, error) {
 	if err := cmd.Validate(); err != nil {
 		return contract.CSRFView{}, err
 	}
-	if meta.Principal.IsAdmin() {
-		// A caller presenting an existing admin session still needs it to
-		// be live; an anonymous caller (pre-auth nonce case) has nothing to
-		// re-check here at all. There is no Write on either path, so this
-		// probe is the final answer, not preparation for a later commit --
-		// legitimate because, unlike every mutating method in this package,
-		// issuing a CSRF token has no persisted effect for a second check
-		// to guard.
-		if err := s.deps.ReadStore.Read(ctx, func(tx port.TxStores) error {
-			return requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock)
-		}); err != nil {
-			return contract.CSRFView{}, err
-		}
-	}
-	raw, _, err := s.deps.TokenCodec.NewToken(ctx)
+	raw, hash, err := s.deps.TokenCodec.NewToken(ctx)
 	if err != nil {
 		return contract.CSRFView{}, storeError(err, "identity_csrf_token_failed", "could not mint a csrf token")
 	}
+	owned := true
+	defer func() {
+		if owned {
+			raw.Close()
+		}
+	}()
+	if !meta.Principal.IsAdmin() {
+		owned = false
+		return contract.CSRFView{CSRFToken: raw}, nil
+	}
+	err = s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
+		if err := requireCurrentAuth(ctx, tx, meta.Principal, s.deps.Clock); err != nil {
+			return err
+		}
+		session, err := tx.Accounts().GetSessionForUpdate(ctx, meta.Principal.SessionID())
+		if err != nil {
+			return storeError(err, "identity_session_read_failed", "could not read the current session")
+		}
+		next, err := session.WithCSRFSecretHash(hash)
+		if err != nil {
+			return contract.FromDomainError(err)
+		}
+		if err := tx.Accounts().SaveSession(ctx, next); err != nil {
+			return storeError(err, "identity_csrf_store_failed", "could not store the new CSRF credential")
+		}
+		return nil
+	})
+	if err != nil {
+		return contract.CSRFView{}, err
+	}
+	// Ownership of the one-shot response secret moves to the returned view.
+	// The local deferred Close is disabled only after the write commits.
+	owned = false
 	return contract.CSRFView{CSRFToken: raw}, nil
 }

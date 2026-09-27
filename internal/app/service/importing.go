@@ -276,6 +276,8 @@ func (s *ImportService) prepareImportKeys(ctx context.Context, files []parsedImp
 		if err != nil {
 			return storeError(err, "import_ca_certificates_lookup_failed", "could not list stored CA certificates")
 		}
+		candidatesByFile := make(map[string][]importedKeyCandidate)
+		preflightInputs := make([]port.CAKeyInput, 0)
 		for _, file := range files {
 			if file.Kind != contract.ImportFileKindCAKey {
 				continue
@@ -288,6 +290,26 @@ func (s *ImportService) prepareImportKeys(ctx context.Context, files []parsedImp
 				return contract.NewAppError(contract.ErrorKindConflict, "import_ca_key_target_unresolved",
 					"the CA key could not be matched to a bundled or stored CA certificate").WithField("file_name", file.FileName)
 			}
+			candidatesByFile[file.FileName] = candidates
+			for _, candidate := range candidates {
+				preflightInputs = append(preflightInputs, port.CAKeyInput{
+					Data: file.KeyData, Passphrase: file.Passphrase,
+					ExpectedPublicKey: candidate.Certificate.PublicKey,
+				})
+			}
+		}
+		if len(preflightInputs) > 0 {
+			if err := s.deps.PKIParser.PreflightCAKeys(ctx, preflightInputs); err != nil {
+				return contract.WrapAppError(contract.ErrorKindValidation, "import_ca_key_invalid",
+					"the imported CA key set exceeds the supported format or work limits", err)
+			}
+		}
+
+		for _, file := range files {
+			if file.Kind != contract.ImportFileKindCAKey {
+				continue
+			}
+			candidates := candidatesByFile[file.FileName]
 
 			var selected port.ValidatedCAKeyInput
 			var selectedCandidate importedKeyCandidate
@@ -2143,17 +2165,25 @@ func (s *ImportService) insertImportedLeaf(ctx context.Context, tx port.TxStores
 	if err != nil {
 		return "", "", "", contract.FromDomainError(err)
 	}
-	series, err := domain.NewLeafSeries(domain.LeafSeriesFacts{
-		ID:                     seriesID,
-		Name:                   certificate.Subject().CommonName(),
-		Purpose:                domain.SeriesPurposeDistributed,
-		ManagementAuthorityID:  authorityID,
-		CurrentCertificateID:   certificateID,
-		CurrentKeyGenerationID: leafGenerationID,
-		Policy:                 policy,
-	})
+	seriesFacts := domain.LeafSeriesFacts{
+		ID:                    seriesID,
+		Name:                  certificate.Subject().CommonName(),
+		Purpose:               domain.SeriesPurposeDistributed,
+		ManagementAuthorityID: authorityID,
+		Policy:                policy,
+	}
+	series, err := domain.NewLeafSeries(seriesFacts)
 	if err != nil {
 		return "", "", "", contract.FromDomainError(err)
+	}
+	seriesFacts.CurrentCertificateID = certificateID
+	seriesFacts.CurrentKeyGenerationID = leafGenerationID
+	linkedSeries, err := domain.NewLeafSeries(seriesFacts)
+	if err != nil {
+		return "", "", "", contract.FromDomainError(err)
+	}
+	if err := tx.PKI().InsertSeries(ctx, series); err != nil {
+		return "", "", "", storeError(err, "import_leaf_series_store_failed", "could not store the imported leaf series")
 	}
 	if err := tx.PKI().InsertLeafKeyGeneration(ctx, leafGeneration); err != nil {
 		return "", "", "", storeError(err, "import_leaf_key_generation_store_failed", "could not store the imported leaf key generation")
@@ -2176,8 +2206,8 @@ func (s *ImportService) insertImportedLeaf(ctx context.Context, tx port.TxStores
 	}); err != nil {
 		return "", "", "", storeError(err, "import_leaf_certificate_record_store_failed", "could not store the imported leaf certificate record")
 	}
-	if err := tx.PKI().InsertSeries(ctx, series); err != nil {
-		return "", "", "", storeError(err, "import_leaf_series_store_failed", "could not store the imported leaf series")
+	if err := tx.PKI().SaveSeries(ctx, linkedSeries, series.Version()); err != nil {
+		return "", "", "", storeError(err, "import_leaf_series_link_failed", "could not link the imported certificate to its series")
 	}
 	return certificateID, authorityID, issuerGenerationID, nil
 }
@@ -2513,6 +2543,25 @@ func (s *ImportService) insertImportedAuthority(
 			}
 		}
 	}
+	pendingAuthority, err := domain.NewAuthority(domain.AuthorityFacts{
+		ID:                 authorityID,
+		Kind:               kind,
+		Name:               r.Cert.Subject.CommonName(),
+		ManagementParentID: managementParentID,
+		IssuanceState:      domain.IssuanceStateStopped,
+		KeyGenerationID:    keyGenerationID,
+		KeyAvailable:       hasPreparedKey,
+		PendingTakeover:    takeover != nil,
+	})
+	if err != nil {
+		return "", "", "", contract.FromDomainError(err)
+	}
+	// Insert the authority parent before its CA generation. Its nullable
+	// issuance-certificate pointer is linked only after the certificate and
+	// CA subtype rows exist, within this import transaction.
+	if err := tx.PKI().InsertAuthority(ctx, pendingAuthority); err != nil {
+		return "", "", "", storeError(err, "import_authority_store_failed", "could not store the imported authority")
+	}
 	if err := tx.PKI().InsertKeyGeneration(ctx, port.CAKeyGeneration{
 		ID:            keyGenerationID,
 		AuthorityID:   authorityID,
@@ -2564,8 +2613,8 @@ func (s *ImportService) insertImportedAuthority(
 	if err != nil {
 		return "", "", "", contract.FromDomainError(err)
 	}
-	if err := tx.PKI().InsertAuthority(ctx, authority); err != nil {
-		return "", "", "", storeError(err, "import_authority_store_failed", "could not store the imported authority")
+	if err := tx.PKI().SaveAuthority(ctx, authority, pendingAuthority.Version()); err != nil {
+		return "", "", "", storeError(err, "import_authority_certificate_link_failed", "could not link the imported CA certificate to its authority")
 	}
 	if hasPreparedKey {
 		if err := tx.Secrets().InsertEncrypted(ctx, preparedKey.Generated.EncryptedSecret); err != nil {

@@ -402,7 +402,7 @@ func (s *AuthorityService) prepareCreate(ctx context.Context, meta contract.Muta
 		return authorityCreatePrepared{}, err
 	}
 
-	window, err := prep.validity.Window(prep.now)
+	window, err := prep.validity.Window(x509NotBefore(prep.now))
 	if err != nil {
 		return authorityCreatePrepared{}, contract.FromDomainError(err)
 	}
@@ -608,6 +608,26 @@ func (s *AuthorityService) commitCreate(ctx context.Context, tx port.TxStores, m
 	if err := tx.PKI().InsertKeyMaterial(ctx, port.KeyMaterial{ID: prep.keyMaterialID, PublicKey: prep.publicKey, Origin: "generated"}); err != nil {
 		return storeError(err, "authority_key_material_store_failed", "could not store the new key material")
 	}
+	// Insert the authority before its key generation. The key-generation row
+	// references authorities, while the authority's issuance-certificate
+	// pointer references the certificate created below; insert the parent with
+	// that nullable pointer empty and complete it after the CA certificate
+	// subtype exists, all inside this Write.
+	pendingAuthority, err := domain.NewAuthority(domain.AuthorityFacts{
+		ID:                 prep.authorityID,
+		Kind:               prep.kind,
+		Name:               cmd.Name,
+		ManagementParentID: prep.parentAuthorityID,
+		IssuanceState:      domain.IssuanceStateInventory,
+		KeyGenerationID:    prep.keyGenerationID,
+		KeyAvailable:       true,
+	})
+	if err != nil {
+		return contract.FromDomainError(err)
+	}
+	if err := tx.PKI().InsertAuthority(ctx, pendingAuthority); err != nil {
+		return storeError(err, "authority_store_failed", "could not store the authority")
+	}
 	// The CA signing secret has no one-shot delivery: unlike a fresh Leaf
 	// key, a CA key is never handed to a client (docs/certificate-
 	// lifecycle.md "Root·Intermediate 모두 다운로드 기능 및 API를 제공하지
@@ -658,8 +678,8 @@ func (s *AuthorityService) commitCreate(ctx context.Context, tx port.TxStores, m
 	if err != nil {
 		return contract.FromDomainError(err)
 	}
-	if err := tx.PKI().InsertAuthority(ctx, authority); err != nil {
-		return storeError(err, "authority_store_failed", "could not store the authority")
+	if err := tx.PKI().SaveAuthority(ctx, authority, pendingAuthority.Version()); err != nil {
+		return storeError(err, "authority_certificate_link_failed", "could not link the CA certificate to its authority")
 	}
 
 	// data-model.md "아직 crl_states가 없는 CA는 동일 생성 트랜잭션에서 먼저

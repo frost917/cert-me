@@ -72,6 +72,8 @@ func (p *fakePKIParser) ParseCRL(_ context.Context, input port.CRLInput) (port.P
 	return crl, nil
 }
 
+func (*fakePKIParser) PreflightCAKeys(context.Context, []port.CAKeyInput) error { return nil }
+
 func (p *fakePKIParser) ParseCAKey(_ context.Context, input port.CAKeyInput) (port.ValidatedCAKeyInput, error) {
 	publicKey, ok := p.caKeys[string(input.Data)]
 	if !ok || !publicKey.Equal(input.ExpectedPublicKey) {

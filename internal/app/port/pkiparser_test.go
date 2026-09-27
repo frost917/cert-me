@@ -43,6 +43,8 @@ func (fakeParser) ParseCRL(ctx context.Context, input port.CRLInput) (port.Parse
 	return port.ParsedCRLFacts{DER: input.Data}, nil
 }
 
+func (fakeParser) PreflightCAKeys(context.Context, []port.CAKeyInput) error { return nil }
+
 // derivedPublicKeyFor stands in for actually deriving a public key from key
 // material; the fake just treats Data itself as if it encoded the public
 // key, so the test can control match/mismatch by choosing Data and
@@ -102,10 +104,11 @@ var _ port.PKIParser = fakeParser{}
 // method a caller could misuse to reach a leaf-key import path.
 func TestPKIParser_FourKindsAreSeparatelyExpressible(t *testing.T) {
 	iface := reflect.TypeOf((*port.PKIParser)(nil)).Elem()
-	if got, want := iface.NumMethod(), 4; got != want {
+	if got, want := iface.NumMethod(), 5; got != want {
 		t.Fatalf("PKIParser has %d methods, want exactly %d (certificate bundle, CRL, CA key, internal TLS key)", got, want)
 	}
 	want := map[string]bool{
+		"PreflightCAKeys":        true,
 		"ParseCertificateBundle": true,
 		"ParseCRL":               true,
 		"ParseCAKey":             true,

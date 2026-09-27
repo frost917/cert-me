@@ -265,6 +265,22 @@ func (s *CRLService) reserveSnapshot(ctx context.Context, caKeyGenerationID doma
 		if err != nil {
 			return err
 		}
+		issuerCertificateID := state.SigningCACertificateID()
+		if issuerCertificateID == "" {
+			return contract.NewAppError(contract.ErrorKindUnavailable, "crl_signing_certificate_missing",
+				"the CA certificate required to sign a CRL is not configured")
+		}
+		issuerCertificate, err := tx.PKI().GetCertificate(ctx, issuerCertificateID)
+		if errors.Is(err, port.ErrNotFound) {
+			return contract.NewAppError(contract.ErrorKindUnavailable, "crl_signing_certificate_missing",
+				"the CA certificate required to sign a CRL could not be found")
+		} else if err != nil {
+			return storeError(err, "crl_signing_certificate_read_failed", "could not read the CA certificate required to sign a CRL")
+		}
+		if issuerCertificate.Kind() != domain.CertificateKindCA || issuerCertificate.KeyMaterialID() != generation.KeyMaterialID {
+			return contract.NewAppError(contract.ErrorKindUnavailable, "crl_signing_certificate_mismatch",
+				"the configured CA certificate does not match the signing key generation")
+		}
 
 		settings, err := tx.Installation().GetSettings(ctx)
 		if errors.Is(err, port.ErrNotFound) {
@@ -288,13 +304,15 @@ func (s *CRLService) reserveSnapshot(ctx context.Context, caKeyGenerationID doma
 			return storeError(err, "crl_state_reserve_failed", "could not reserve the next CRL number")
 		}
 
-		thisUpdate := now
+		thisUpdate := domain.NewInstant(now.Time().Truncate(time.Second))
 		nextUpdate := thisUpdate.Add(domain.NewDuration(time.Duration(settingsV1.CRLValiditySeconds) * time.Second))
-		nextPublishAt := thisUpdate.Add(domain.NewDuration(time.Duration(settingsV1.CRLIntervalSeconds) * time.Second))
+		nextPublishAt := now.Add(domain.NewDuration(time.Duration(settingsV1.CRLIntervalSeconds) * time.Second))
 
 		reservation = crlReservation{
 			snapshot: port.CRLSnapshot{
 				CAKeyGenerationID: caKeyGenerationID,
+				CAKeyMaterialID:   generation.KeyMaterialID,
+				IssuerCertificate: issuerCertificate,
 				Number:            number,
 				ThisUpdate:        thisUpdate,
 				NextUpdate:        nextUpdate,

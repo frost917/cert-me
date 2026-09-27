@@ -376,6 +376,7 @@ func distGrant(t *testing.T, n int, purpose domain.GrantPurpose, certID domain.C
 		Purpose:       purpose,
 		CertificateID: certID,
 		DeliveryID:    deliveryID,
+		CreatedBy:     distAccountID(t),
 		ExpiresAt:     expiresAt,
 		Version:       1,
 	})
@@ -383,6 +384,15 @@ func distGrant(t *testing.T, n int, purpose domain.GrantPurpose, certID domain.C
 		t.Fatalf("new grant: %v", err)
 	}
 	return g
+}
+
+func distAccountID(t *testing.T) domain.AccountID {
+	t.Helper()
+	id, err := domain.ParseAccountID(distID36('c', 1))
+	if err != nil {
+		t.Fatalf("account id: %v", err)
+	}
+	return id
 }
 
 func distDelivery(t *testing.T, n int, leafKeyGenN int, certID domain.CertificateID, expiresAt domain.Instant) domain.Delivery {
