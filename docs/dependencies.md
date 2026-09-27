@@ -21,12 +21,12 @@
 ## 생성된 실행 아티팩트
 
 - [OpenAPI JSON](../api/openapi.json): 51개 경로, 59개 작업. 관리 API뿐 아니라 토큰 다운로드·고정 CA/CRL·복구 화면 포함. 사용자 입력 객체의 알 수 없는 필드는 거부한다. 버전형 공개 스냅샷만 확장 필드를 허용한다.
-- [마이그레이션 manifest](../internal/storage/migrations/manifest.json): 4개 dialect × 8개 파일, 38개 테이블(메타데이터 포함). 000은 journal 생성, 001~007은 업무 스키마다. SQLite는 CREATE에 FK 포함, 나머지는 007에서 FK 추가.
+- [마이그레이션 manifest](../internal/storage/migrations/manifest.json): 4개 dialect × 11개 SQL 파일, 38개 테이블(메타데이터 포함). 000은 journal 생성, 001~007은 초기 업무 스키마, 008~009는 감사 scope_kind 백필·제약, 010은 폐기 검토 상태 필드 추가다. SQLite는 CREATE에 FK 포함, 나머지는 007에서 FK 추가.
 - [스키마 테스트](../internal/storage/migrations/schema_test.go): 전용 빈 DB에 SQL 전체 실행, 중복·FK·상태 제약·rollback 검사. [PKI 제약 테스트](../internal/storage/migrations/pki_constraints_test.go)는 공개키 재사용 갱신·일련번호·수령·인증서 없는 폐기 항목을 검사한다.
 - [암호화 형식 테스트](../internal/cryptoformats/compatibility_test.go): P-256의 PBES2/PBKDF2-HMAC-SHA256/AES-256-CBC PKCS#8과 Modern2023 PKCS#12 왕복·잘못된 암호 거부. 전체 지원 알고리즘과 OpenSSL 독립 fixture 검증은 아직 아니다.
 - [CI](../.github/workflows/contracts.yml): SQLite/OpenAPI와 PostgreSQL·MySQL·MariaDB의 개별 초기 스키마 테스트. 컨테이너는 확인한 공식 manifest digest에 고정했다.
 
-현재 로컬에서 OpenAPI 검증, SQLite 3.53.4 스키마·제약, 암호화 형식 검사가 통과했다. 외부 DB 세 개는 서버·Docker가 없어 로컬 실행하지 못했으며 DSN 미설정으로 skip된다. CI 파일 작성과 CI 실제 통과는 다르다. 초기 스키마 실행 테스트는 운영 마이그레이션 실행기의 crash recovery·체크섬 journal 동작이나 업무 서비스의 동시성 검증을 대신하지 않는다.
+현재 로컬에서 OpenAPI 검증, SQLite 3.53.4 스키마·제약, 암호화 형식 검사가 통과했다. 외부 DB 세 개는 서버·Docker가 없어 로컬 실행하지 못했으며 DSN 미설정으로 skip된다. CI 파일 작성과 CI 실제 통과는 다르다. 스키마 실행 테스트는 운영 마이그레이션 실행기의 crash recovery·체크섬 journal 동작이나 업무 서비스의 동시성 검증을 대신하지 않는다.
 
 ## 재현 방법
 

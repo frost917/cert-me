@@ -62,11 +62,12 @@ func testMeta(ids port.IDGenerator) RevocationMeta {
 
 // seedCRLState creates the issuer's crl_states row, the serialization point
 // applyRevocations locks.
-func seedCRLState(t *testing.T, store *porttest.Store, issuer domain.CAKeyGenerationID) {
+func seedCRLState(t *testing.T, store *porttest.Store, issuer domain.CAKeyGenerationID, signingCertificate ...domain.CertificateID) {
 	t.Helper()
 	state, err := domain.NewCRLState(domain.CRLStateFacts{
-		CAKeyGenerationID: issuer,
-		PublicationState:  domain.PublicationStateActive,
+		CAKeyGenerationID:      issuer,
+		PublicationState:       domain.PublicationStateActive,
+		SigningCACertificateID: firstCRLSigningCertificate(signingCertificate),
 	})
 	if err != nil {
 		t.Fatalf("new crl state: %v", err)
@@ -88,6 +89,13 @@ func seedCRLState(t *testing.T, store *porttest.Store, issuer domain.CAKeyGenera
 	}); err != nil {
 		t.Fatalf("seed crl state: %v", err)
 	}
+}
+
+func firstCRLSigningCertificate(ids []domain.CertificateID) domain.CertificateID {
+	if len(ids) == 0 {
+		return ""
+	}
+	return ids[0]
 }
 
 func change(issuer domain.CAKeyGenerationID, s domain.SerialNumber, reason domain.RevocationReason) RevocationChange {

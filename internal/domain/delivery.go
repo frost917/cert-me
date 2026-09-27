@@ -218,6 +218,7 @@ type DownloadGrant struct {
 	purpose       GrantPurpose
 	certificateID CertificateID
 	deliveryID    DeliveryID // zero for GrantPurposeLeafPublic
+	createdBy     AccountID
 	expiresAt     Instant
 	consumedAt    Instant
 	invalidatedAt Instant
@@ -232,6 +233,7 @@ type DownloadGrantFacts struct {
 	Purpose       GrantPurpose
 	CertificateID CertificateID
 	DeliveryID    DeliveryID
+	CreatedBy     AccountID
 	ExpiresAt     Instant
 	ConsumedAt    Instant
 	InvalidatedAt Instant
@@ -251,6 +253,9 @@ func NewDownloadGrant(facts DownloadGrantFacts) (DownloadGrant, error) {
 		return DownloadGrant{}, err
 	}
 	if _, err := ParseCertificateID(string(facts.CertificateID)); err != nil {
+		return DownloadGrant{}, err
+	}
+	if _, err := ParseAccountID(string(facts.CreatedBy)); err != nil {
 		return DownloadGrant{}, err
 	}
 	switch facts.Purpose {
@@ -275,6 +280,7 @@ func NewDownloadGrant(facts DownloadGrantFacts) (DownloadGrant, error) {
 		purpose:       facts.Purpose,
 		certificateID: facts.CertificateID,
 		deliveryID:    facts.DeliveryID,
+		createdBy:     facts.CreatedBy,
 		expiresAt:     facts.ExpiresAt,
 		consumedAt:    facts.ConsumedAt,
 		invalidatedAt: facts.InvalidatedAt,
@@ -282,15 +288,16 @@ func NewDownloadGrant(facts DownloadGrantFacts) (DownloadGrant, error) {
 	}, nil
 }
 
-func (g DownloadGrant) ID() GrantID                  { return g.id }
-func (g DownloadGrant) TokenHash() TokenHash         { return g.tokenHash }
-func (g DownloadGrant) Purpose() GrantPurpose        { return g.purpose }
-func (g DownloadGrant) CertificateID() CertificateID { return g.certificateID }
-func (g DownloadGrant) DeliveryID() DeliveryID       { return g.deliveryID }
-func (g DownloadGrant) ExpiresAt() Instant           { return g.expiresAt }
-func (g DownloadGrant) ConsumedAt() Instant          { return g.consumedAt }
-func (g DownloadGrant) InvalidatedAt() Instant       { return g.invalidatedAt }
-func (g DownloadGrant) Version() Version             { return g.version }
+func (g DownloadGrant) ID() GrantID                   { return g.id }
+func (g DownloadGrant) TokenHash() TokenHash          { return g.tokenHash }
+func (g DownloadGrant) Purpose() GrantPurpose         { return g.purpose }
+func (g DownloadGrant) CertificateID() CertificateID  { return g.certificateID }
+func (g DownloadGrant) DeliveryID() DeliveryID        { return g.deliveryID }
+func (g DownloadGrant) CreatedByAccountID() AccountID { return g.createdBy }
+func (g DownloadGrant) ExpiresAt() Instant            { return g.expiresAt }
+func (g DownloadGrant) ConsumedAt() Instant           { return g.consumedAt }
+func (g DownloadGrant) InvalidatedAt() Instant        { return g.invalidatedAt }
+func (g DownloadGrant) Version() Version              { return g.version }
 
 func (g DownloadGrant) isConsumed() bool    { return !g.consumedAt.IsZero() }
 func (g DownloadGrant) isInvalidated() bool { return !g.invalidatedAt.IsZero() }

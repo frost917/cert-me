@@ -47,7 +47,9 @@ type SecretRepository interface {
 	// confirm an injected decryption key is the right one even on a database
 	// with no private keys stored yet (docs/data-model.md "개인키가 없는 DB도
 	// 주입 키 인증 복호화를 검사"). It returns ErrNotFound before the first
-	// verifier has ever been written.
+	// verifier has ever been written. The returned EncryptedSecret uses
+	// domain.StoreVerifierOwnerKeyID as its AAD owner because the singleton
+	// verifier is not a key_materials row.
 	GetVerifier(ctx context.Context) (domain.EncryptedSecret, error)
 
 	// SaveVerifier writes the verifier row (insert on first use, replace on

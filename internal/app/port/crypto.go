@@ -118,6 +118,8 @@ type CertificateSigner interface {
 // 목록을 같은 순간의 상태로 캡처한다").
 type CRLSnapshot struct {
 	CAKeyGenerationID domain.CAKeyGenerationID
+	CAKeyMaterialID   domain.KeyMaterialID
+	IssuerCertificate domain.Certificate
 	Number            domain.CRLNumber
 	ThisUpdate        domain.Instant
 	NextUpdate        domain.Instant

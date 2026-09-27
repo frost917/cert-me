@@ -20,6 +20,7 @@ type LoginView struct {
 	Account           AccountView
 	IdleExpiresAt     domain.Instant
 	AbsoluteExpiresAt domain.Instant
+	SessionToken      *secret.Input `json:"-"`
 	CSRFToken         *secret.Input
 }
 

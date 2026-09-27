@@ -559,28 +559,37 @@ func leafCRLDistributionPoints(serviceURL string, issuerCertificateID domain.Cer
 	return []string{base + "/pki/ca-certificates/" + string(issuerCertificateID) + "/crl.der"}, nil
 }
 
+// insertGeneratedKeyMaterial persists the public identity before dependent
+// key-generation and certificate rows are inserted. SQLite and the external
+// SQL schemas enforce these foreign keys immediately.
+func insertGeneratedKeyMaterial(ctx context.Context, tx port.TxStores, keyMaterialID domain.KeyMaterialID, publicKey domain.PublicKey) error {
+	if err := tx.PKI().InsertKeyMaterial(ctx, port.KeyMaterial{
+		ID:        keyMaterialID,
+		PublicKey: publicKey,
+		Origin:    "generated",
+	}); err != nil {
+		return storeError(err, "issuance_key_material_store_failed", "could not store the new key material")
+	}
+	return nil
+}
+
 // storeFreshKeyAndDelivery persists a freshly generated key's ciphertext and
-// creates its one-shot pending delivery row, the commit-side counterpart of
-// a Fresh signingKeyRef (docs/backend-implementation.md §8 "계보·인증서·
-// 암호문·delivery·요청 결과·감사").
+// creates its one-shot pending delivery row after its PKI parent rows exist
+// (docs/backend-implementation.md §8 "계보·인증서·암호문·delivery·요청 결과·감사").
 func storeFreshKeyAndDelivery(
 	ctx context.Context,
 	tx port.TxStores,
 	ids port.IDGenerator,
 	now domain.Instant,
 	keyMaterialID domain.KeyMaterialID,
-	publicKey domain.PublicKey,
 	secret domain.EncryptedSecret,
 	leafKeyGenerationID domain.LeafKeyGenerationID,
 	certificateID domain.CertificateID,
 	deliverySeconds int,
 ) (domain.Delivery, error) {
-	if err := tx.PKI().InsertKeyMaterial(ctx, port.KeyMaterial{
-		ID:        keyMaterialID,
-		PublicKey: publicKey,
-		Origin:    "generated",
-	}); err != nil {
-		return domain.Delivery{}, storeError(err, "issuance_key_material_store_failed", "could not store the new key material")
+	if secret.OwnerKeyID() != keyMaterialID || secret.Purpose() != domain.SecretPurposeLeafDelivery {
+		return domain.Delivery{}, contract.NewAppError(contract.ErrorKindUnavailable, "issuance_generated_secret_mismatch",
+			"the generated private key does not match the new leaf key material")
 	}
 	if err := tx.Secrets().InsertEncrypted(ctx, secret); err != nil {
 		return domain.Delivery{}, storeError(err, "issuance_secret_store_failed", "could not store the encrypted private key")
@@ -904,7 +913,7 @@ func (s *IssuanceService) prepareIssue(ctx context.Context, meta contract.Mutati
 	if err := prep.policy.Validate(); err != nil {
 		return issuePrepared{}, contract.FromDomainError(err)
 	}
-	window, err := domain.PlanLeafWindow(prep.policy, prep.now)
+	window, err := domain.PlanLeafWindow(prep.policy, x509NotBefore(prep.now))
 	if err != nil {
 		return issuePrepared{}, contract.FromDomainError(err)
 	}
@@ -1046,19 +1055,34 @@ func (s *IssuanceService) commitIssue(ctx context.Context, tx port.TxStores, met
 	if err != nil {
 		return contract.FromDomainError(err)
 	}
-	series, err := domain.NewLeafSeries(domain.LeafSeriesFacts{
-		ID:                     seriesID,
-		Name:                   cmd.Name,
-		Purpose:                domain.SeriesPurposeDistributed,
-		ManagementAuthorityID:  authorityID,
-		CurrentCertificateID:   cert.ID(),
-		CurrentKeyGenerationID: leafKeyGenID,
-		Policy:                 prep.policy,
-	})
+	seriesFacts := domain.LeafSeriesFacts{
+		ID:                    seriesID,
+		Name:                  cmd.Name,
+		Purpose:               domain.SeriesPurposeDistributed,
+		ManagementAuthorityID: authorityID,
+		Policy:                prep.policy,
+	}
+	// Insert the series without its cyclic current pointers first. The SQL
+	// schema enforces these foreign keys immediately; after the key generation,
+	// certificate, and subtype rows exist, SaveSeries installs the pointers in
+	// this same transaction.
+	emptySeries, err := domain.NewLeafSeries(seriesFacts)
+	if err != nil {
+		return contract.FromDomainError(err)
+	}
+	seriesFacts.CurrentCertificateID = cert.ID()
+	seriesFacts.CurrentKeyGenerationID = leafKeyGenID
+	series, err := domain.NewLeafSeries(seriesFacts)
 	if err != nil {
 		return contract.FromDomainError(err)
 	}
 
+	if err := tx.PKI().InsertSeries(ctx, emptySeries); err != nil {
+		return storeError(err, "issuance_series_store_failed", "could not store the series")
+	}
+	if err := insertGeneratedKeyMaterial(ctx, tx, prep.keyMaterialID, prep.publicKey); err != nil {
+		return err
+	}
 	if err := tx.PKI().InsertLeafKeyGeneration(ctx, leafKeyGen); err != nil {
 		return storeError(err, "issuance_leaf_key_generation_store_failed", "could not store the leaf key generation")
 	}
@@ -1083,14 +1107,14 @@ func (s *IssuanceService) commitIssue(ctx context.Context, tx port.TxStores, met
 	}); err != nil {
 		return storeError(err, "issuance_leaf_certificate_record_store_failed", "could not store the leaf certificate record")
 	}
-	if err := tx.PKI().InsertSeries(ctx, series); err != nil {
-		return storeError(err, "issuance_series_store_failed", "could not store the series")
+	if err := tx.PKI().SaveSeries(ctx, series, emptySeries.Version()); err != nil {
+		return storeError(err, "issuance_series_link_failed", "could not link the first certificate to the series")
 	}
 	if prep.generatedSecret == nil {
 		return contract.NewAppError(contract.ErrorKindUnavailable, "issuance_missing_generated_secret",
 			"a fresh issuance did not produce a key to store")
 	}
-	delivery, err := storeFreshKeyAndDelivery(ctx, tx, s.deps.IDs, commitNow, prep.keyMaterialID, prep.publicKey, *prep.generatedSecret, leafKeyGenID, cert.ID(), prep.defaults.PrivateDeliverySeconds)
+	delivery, err := storeFreshKeyAndDelivery(ctx, tx, s.deps.IDs, commitNow, prep.keyMaterialID, *prep.generatedSecret, leafKeyGenID, cert.ID(), prep.defaults.PrivateDeliverySeconds)
 	if err != nil {
 		return err
 	}
@@ -1348,7 +1372,7 @@ func (s *IssuanceService) prepareRenew(ctx context.Context, meta contract.Mutati
 			"series has moved on since expected_version was read")
 	}
 
-	policyWindow, err := prep.snapshot.Series.Policy().PlanWindow(prep.now)
+	policyWindow, err := prep.snapshot.Series.Policy().PlanWindow(x509NotBefore(prep.now))
 	if err != nil {
 		return renewPrepared{}, contract.FromDomainError(err)
 	}
@@ -1570,6 +1594,15 @@ func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, met
 	}
 
 	cert := prep.certificate
+	if prep.keyRotated {
+		if prep.generatedSecret == nil {
+			return contract.NewAppError(contract.ErrorKindUnavailable, "issuance_missing_generated_secret",
+				"a key rotation did not produce a key to store")
+		}
+		if err := insertGeneratedKeyMaterial(ctx, tx, prep.keyMaterialID, prep.publicKey); err != nil {
+			return err
+		}
+	}
 	if err := tx.PKI().InsertCertificate(ctx, cert); err != nil {
 		return storeError(err, "issuance_certificate_store_failed", "could not store the renewed certificate")
 	}
@@ -1596,15 +1629,6 @@ func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, met
 			return storeError(err, "issuance_leaf_key_generation_store_failed", "could not store the rotated leaf key generation")
 		}
 		leafKeyGenID = newGenID
-		if prep.generatedSecret == nil {
-			return contract.NewAppError(contract.ErrorKindUnavailable, "issuance_missing_generated_secret",
-				"a key rotation did not produce a key to store")
-		}
-		delivery, err := storeFreshKeyAndDelivery(ctx, tx, s.deps.IDs, commitNow, prep.keyMaterialID, prep.publicKey, *prep.generatedSecret, newGenID, cert.ID(), prep.deliverySeconds)
-		if err != nil {
-			return err
-		}
-		deliveryID = delivery.ID()
 	} else {
 		leafKeyGenID = prep.renewalPlan.KeyGenerationID
 		updatedGen, err := domain.NewLeafKeyGeneration(domain.LeafKeyGenerationFacts{
@@ -1622,23 +1646,6 @@ func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, met
 		if err := tx.PKI().SaveLeafKeyGeneration(ctx, updatedGen); err != nil {
 			return storeError(err, "issuance_leaf_key_generation_save_failed", "could not update the leaf key generation")
 		}
-	}
-
-	updatedSeries, err := domain.NewLeafSeries(domain.LeafSeriesFacts{
-		ID:                     snapshot.Series.ID(),
-		Name:                   snapshot.Series.Name(),
-		Purpose:                snapshot.Series.Purpose(),
-		ManagementAuthorityID:  snapshot.Series.ManagementAuthorityID(),
-		CurrentCertificateID:   cert.ID(),
-		CurrentKeyGenerationID: leafKeyGenID,
-		Policy:                 snapshot.Series.Policy(),
-		Version:                snapshot.Series.Version().Next(),
-	})
-	if err != nil {
-		return contract.FromDomainError(err)
-	}
-	if err := tx.PKI().SaveSeries(ctx, updatedSeries, expectedVersion); err != nil {
-		return storeError(err, "issuance_series_save_failed", "could not update the series")
 	}
 
 	// §14.2/§14.4: the leaf_certificates subtype row, in the same Write as
@@ -1668,6 +1675,30 @@ func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, met
 		PolicySnapshotJSON:    policySnapshot,
 	}); err != nil {
 		return storeError(err, "issuance_leaf_certificate_record_store_failed", "could not store the leaf certificate record")
+	}
+	updatedSeries, err := domain.NewLeafSeries(domain.LeafSeriesFacts{
+		ID:                     snapshot.Series.ID(),
+		Name:                   snapshot.Series.Name(),
+		Purpose:                snapshot.Series.Purpose(),
+		ManagementAuthorityID:  snapshot.Series.ManagementAuthorityID(),
+		CurrentCertificateID:   cert.ID(),
+		CurrentKeyGenerationID: leafKeyGenID,
+		Policy:                 snapshot.Series.Policy(),
+		Version:                snapshot.Series.Version().Next(),
+		ArchivedAt:             snapshot.Series.ArchivedAt(),
+	})
+	if err != nil {
+		return contract.FromDomainError(err)
+	}
+	if err := tx.PKI().SaveSeries(ctx, updatedSeries, expectedVersion); err != nil {
+		return storeError(err, "issuance_series_save_failed", "could not update the series")
+	}
+	if prep.keyRotated {
+		delivery, err := storeFreshKeyAndDelivery(ctx, tx, s.deps.IDs, commitNow, prep.keyMaterialID, *prep.generatedSecret, leafKeyGenID, cert.ID(), prep.deliverySeconds)
+		if err != nil {
+			return err
+		}
+		deliveryID = delivery.ID()
 	}
 
 	view := storedIssuanceResult{

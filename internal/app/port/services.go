@@ -622,6 +622,12 @@ type TLSKeyInput struct {
 // no method on this interface to call; there is no third, purpose-parameterized
 // method whose argument could be misused to reach a leaf import path.
 type PKIParser interface {
+	// PreflightCAKeys checks the supported encodings, individual and aggregate
+	// PBKDF2 work limits for every candidate decryption attempt before the
+	// caller starts any KDF. Repeated inputs represent repeated candidate
+	// attempts and count repeatedly toward the aggregate budget.
+	PreflightCAKeys(ctx context.Context, inputs []CAKeyInput) error
+
 	// ParseCertificateBundle parses every certificate in input.Data.
 	ParseCertificateBundle(ctx context.Context, input CertificateBundleInput) (CertificateBundleFacts, error)
 

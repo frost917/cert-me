@@ -605,6 +605,7 @@ func (s *TLSService) Reload(ctx context.Context, meta contract.MutationMeta, cmd
 	if input.Passphrase != nil {
 		defer input.Passphrase.Close()
 	}
+	defer clear(input.Key)
 	return s.uploadCandidate(ctx, meta, contract.TLSUploadCandidateCommand{
 		Certificate: input.Certificate,
 		Chain:       input.Chain,
@@ -787,7 +788,7 @@ func (s *TLSService) prepareBootstrap(ctx context.Context, existing *domain.Auth
 	if err != nil {
 		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
 	}
-	window, err := validity.Window(now)
+	window, err := validity.Window(x509NotBefore(now))
 	if err != nil {
 		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
 	}
@@ -999,6 +1000,30 @@ func (s *TLSService) Bootstrap(ctx context.Context, meta contract.MutationMeta, 
 		if err := tx.Secrets().InsertEncrypted(ctx, prepared.rootSecret); err != nil {
 			return storeError(err, "tls_bootstrap_root_secret_store_failed", "could not store the bootstrap root secret")
 		}
+		var pendingAuthority domain.Authority
+		if !prepared.hasExisting {
+			pendingAuthority, err = domain.NewAuthority(domain.AuthorityFacts{
+				ID:                 prepared.authority.ID(),
+				Kind:               prepared.authority.Kind(),
+				Name:               prepared.authority.Name(),
+				ManagementParentID: prepared.authority.ManagementParentID(),
+				IssuanceState:      prepared.authority.IssuanceState(),
+				KeyGenerationID:    prepared.authority.KeyGenerationID(),
+				KeyAvailable:       prepared.authority.KeyAvailable(),
+				Affected:           prepared.authority.Affected(),
+				PendingTakeover:    prepared.authority.PendingTakeover(),
+				Version:            prepared.authority.Version(),
+			})
+			if err != nil {
+				return contract.FromDomainError(err)
+			}
+			// A new bootstrap Authority must exist before its CA key-generation
+			// row. Leave the issuance-certificate pointer empty until the Root
+			// certificate and subtype rows have been inserted below.
+			if err := tx.PKI().InsertAuthority(ctx, pendingAuthority); err != nil {
+				return storeError(err, "tls_bootstrap_authority_store_failed", "could not store the bootstrap authority")
+			}
+		}
 		if err := tx.PKI().InsertKeyGeneration(ctx, prepared.rootGeneration); err != nil {
 			return storeError(err, "tls_bootstrap_root_generation_store_failed", "could not store the bootstrap root key generation")
 		}
@@ -1022,14 +1047,28 @@ func (s *TLSService) Bootstrap(ctx context.Context, meta contract.MutationMeta, 
 			if err := tx.PKI().SaveAuthority(ctx, prepared.authority, prepared.existingVersion); err != nil {
 				return storeError(err, "tls_bootstrap_authority_store_failed", "could not update the bootstrap authority")
 			}
-		} else if err := tx.PKI().InsertAuthority(ctx, prepared.authority); err != nil {
-			return storeError(err, "tls_bootstrap_authority_store_failed", "could not store the bootstrap authority")
+		} else if err := tx.PKI().SaveAuthority(ctx, prepared.authority, pendingAuthority.Version()); err != nil {
+			return storeError(err, "tls_bootstrap_authority_link_failed", "could not link the bootstrap Root certificate to its authority")
 		}
 		if err := tx.CRLs().SaveState(ctx, prepared.crlState, 0); err != nil {
 			return storeError(err, "tls_bootstrap_crl_state_store_failed", "could not store the bootstrap CRL state")
 		}
 		if err := tx.PKI().InsertKeyMaterial(ctx, prepared.leafKeyMaterial); err != nil {
 			return storeError(err, "tls_bootstrap_leaf_key_material_store_failed", "could not store the bootstrap leaf public key")
+		}
+		emptySeries, err := domain.NewLeafSeries(domain.LeafSeriesFacts{
+			ID:                    prepared.series.ID(),
+			Name:                  prepared.series.Name(),
+			Purpose:               prepared.series.Purpose(),
+			ManagementAuthorityID: prepared.series.ManagementAuthorityID(),
+			Policy:                prepared.series.Policy(),
+			Version:               prepared.series.Version(),
+		})
+		if err != nil {
+			return contract.FromDomainError(err)
+		}
+		if err := tx.PKI().InsertSeries(ctx, emptySeries); err != nil {
+			return storeError(err, "tls_bootstrap_series_store_failed", "could not store the bootstrap TLS series")
 		}
 		if err := tx.Secrets().InsertEncrypted(ctx, prepared.leafSecret); err != nil {
 			return storeError(err, "tls_bootstrap_leaf_secret_store_failed", "could not store the bootstrap TLS secret")
@@ -1043,8 +1082,8 @@ func (s *TLSService) Bootstrap(ctx context.Context, meta contract.MutationMeta, 
 		if err := tx.PKI().InsertLeafCertificateRecord(ctx, prepared.leafRecord); err != nil {
 			return storeError(err, "tls_bootstrap_leaf_record_store_failed", "could not store the bootstrap leaf certificate record")
 		}
-		if err := tx.PKI().InsertSeries(ctx, prepared.series); err != nil {
-			return storeError(err, "tls_bootstrap_series_store_failed", "could not store the bootstrap TLS series")
+		if err := tx.PKI().SaveSeries(ctx, prepared.series, emptySeries.Version()); err != nil {
+			return storeError(err, "tls_bootstrap_series_link_failed", "could not link the bootstrap certificate to its series")
 		}
 		if err := tx.TLS().InsertVersion(ctx, prepared.version); err != nil {
 			return storeError(err, "tls_bootstrap_version_store_failed", "could not store the bootstrap TLS version")
@@ -1400,7 +1439,7 @@ func (s *TLSService) prepareIssueCandidate(ctx context.Context, meta contract.Mu
 		return tlsIssueCandidatePrepared{}, err
 	}
 
-	window, err := prep.validity.Window(prep.now)
+	window, err := prep.validity.Window(x509NotBefore(prep.now))
 	if err != nil {
 		return tlsIssueCandidatePrepared{}, contract.FromDomainError(err)
 	}
@@ -1513,9 +1552,6 @@ func (s *TLSService) commitIssueCandidate(ctx context.Context, tx port.TxStores,
 	if err := tx.Secrets().InsertEncrypted(ctx, *prep.generatedSecret); err != nil {
 		return storeError(err, "tls_secret_store_failed", "could not store the encrypted TLS key")
 	}
-	if err := tx.PKI().InsertCertificate(ctx, cert); err != nil {
-		return storeError(err, "tls_certificate_store_failed", "could not store the certificate")
-	}
 
 	seriesID, err := domain.ParseSeriesID(s.deps.IDs.NewUUID())
 	if err != nil {
@@ -1524,6 +1560,27 @@ func (s *TLSService) commitIssueCandidate(ctx context.Context, tx port.TxStores,
 	leafKeyGenID, err := domain.ParseLeafKeyGenerationID(s.deps.IDs.NewUUID())
 	if err != nil {
 		return contract.FromDomainError(err)
+	}
+	policy := domain.SeriesPolicy{RotateEvery: 3, CertificateValidity: prep.validity} // 3: data-model.md's documented rotate_every default; TLS candidates do not use rotation, only the storage shape requires a policy
+	if err := policy.Validate(); err != nil {
+		return contract.FromDomainError(err)
+	}
+	seriesFacts := domain.LeafSeriesFacts{
+		ID: seriesID, Name: "internal_tls_" + string(cert.ID()), Purpose: domain.SeriesPurposeInternalTLS,
+		ManagementAuthorityID: authorityID, Policy: policy,
+	}
+	emptySeries, err := domain.NewLeafSeries(seriesFacts)
+	if err != nil {
+		return contract.FromDomainError(err)
+	}
+	seriesFacts.CurrentCertificateID = cert.ID()
+	seriesFacts.CurrentKeyGenerationID = leafKeyGenID
+	series, err := domain.NewLeafSeries(seriesFacts)
+	if err != nil {
+		return contract.FromDomainError(err)
+	}
+	if err := tx.PKI().InsertSeries(ctx, emptySeries); err != nil {
+		return storeError(err, "tls_series_store_failed", "could not store the series")
 	}
 	leafKeyGen, err := domain.NewLeafKeyGeneration(domain.LeafKeyGenerationFacts{
 		ID: leafKeyGenID, SeriesID: seriesID, KeyMaterialID: prep.keyMaterialID,
@@ -1535,10 +1592,8 @@ func (s *TLSService) commitIssueCandidate(ctx context.Context, tx port.TxStores,
 	if err := tx.PKI().InsertLeafKeyGeneration(ctx, leafKeyGen); err != nil {
 		return storeError(err, "tls_leaf_key_generation_store_failed", "could not store the leaf key generation")
 	}
-
-	policy := domain.SeriesPolicy{RotateEvery: 3, CertificateValidity: prep.validity} // 3: data-model.md's documented rotate_every default; TLS candidates do not use rotation, only the storage shape requires a policy
-	if err := policy.Validate(); err != nil {
-		return contract.FromDomainError(err)
+	if err := tx.PKI().InsertCertificate(ctx, cert); err != nil {
+		return storeError(err, "tls_certificate_store_failed", "could not store the certificate")
 	}
 	policySnapshot, err := leafPolicySnapshotJSON(cert, policy)
 	if err != nil {
@@ -1552,15 +1607,8 @@ func (s *TLSService) commitIssueCandidate(ctx context.Context, tx port.TxStores,
 		return storeError(err, "tls_leaf_certificate_record_store_failed", "could not store the leaf certificate record")
 	}
 
-	series, err := domain.NewLeafSeries(domain.LeafSeriesFacts{
-		ID: seriesID, Name: "internal_tls_" + string(cert.ID()), Purpose: domain.SeriesPurposeInternalTLS,
-		ManagementAuthorityID: authorityID, CurrentCertificateID: cert.ID(), CurrentKeyGenerationID: leafKeyGenID, Policy: policy,
-	})
-	if err != nil {
-		return contract.FromDomainError(err)
-	}
-	if err := tx.PKI().InsertSeries(ctx, series); err != nil {
-		return storeError(err, "tls_series_store_failed", "could not store the series")
+	if err := tx.PKI().SaveSeries(ctx, series, emptySeries.Version()); err != nil {
+		return storeError(err, "tls_series_link_failed", "could not link the TLS certificate to its series")
 	}
 
 	chainDER, err := buildChainDER(ctx, tx, cert.ID())

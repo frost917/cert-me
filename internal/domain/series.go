@@ -227,6 +227,7 @@ func (s LeafSeries) CurrentKeyGenerationID() LeafKeyGenerationID { return s.curr
 func (s LeafSeries) Policy() SeriesPolicy                        { return s.policy }
 func (s LeafSeries) Version() Version                            { return s.version }
 func (s LeafSeries) IsArchived() bool                            { return !s.archivedAt.IsZero() }
+func (s LeafSeries) ArchivedAt() Instant                         { return s.archivedAt }
 
 // ChangePolicy returns a copy of the series with an updated rotation cadence
 // and/or default validity. It never touches renewal_count itself: the

@@ -270,6 +270,7 @@ type SessionState struct {
 	id                SessionID
 	accountID         AccountID
 	tokenHash         TokenHash
+	csrfSecretHash    TokenHash
 	authEpoch         AuthEpoch
 	lastSeenAt        Instant
 	absoluteExpiresAt Instant
@@ -280,6 +281,7 @@ type SessionStateFacts struct {
 	ID                SessionID
 	AccountID         AccountID
 	TokenHash         TokenHash
+	CSRFSecretHash    TokenHash
 	AuthEpoch         AuthEpoch
 	LastSeenAt        Instant
 	AbsoluteExpiresAt Instant
@@ -311,6 +313,7 @@ func NewSessionState(facts SessionStateFacts) (SessionState, error) {
 		id:                facts.ID,
 		accountID:         facts.AccountID,
 		tokenHash:         facts.TokenHash,
+		csrfSecretHash:    facts.CSRFSecretHash,
 		authEpoch:         facts.AuthEpoch,
 		lastSeenAt:        facts.LastSeenAt,
 		absoluteExpiresAt: facts.AbsoluteExpiresAt,
@@ -322,6 +325,18 @@ func (s SessionState) ID() SessionID { return s.id }
 func (s SessionState) AccountID() AccountID { return s.accountID }
 
 func (s SessionState) TokenHash() TokenHash { return s.tokenHash }
+
+func (s SessionState) CSRFSecretHash() TokenHash { return s.csrfSecretHash }
+
+// WithCSRFSecretHash returns the session with a newly issued CSRF secret
+// hash. The raw secret never enters the domain or a repository.
+func (s SessionState) WithCSRFSecretHash(hash TokenHash) (SessionState, error) {
+	if hash.IsZero() {
+		return SessionState{}, NewPolicyError(ErrInvalidValue, "invalid_session_csrf_hash", "session must have a CSRF secret hash")
+	}
+	s.csrfSecretHash = hash
+	return s, nil
+}
 
 func (s SessionState) AuthEpoch() AuthEpoch { return s.authEpoch }
 

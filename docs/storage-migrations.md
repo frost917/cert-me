@@ -72,8 +72,13 @@ MVP 마이그레이션은 다음 논리 묶음으로 작성한다. `installation
 | 005 revocation | import_batches, revocations, revocation_revisions, ca_takeovers, crl_states, crl_documents |
 | 006 operations | ca_transitions, transition_impacts, deployment_confirmations, tls_versions, tls_changes, maintenance_runs, maintenance_crl_requirements, jobs |
 | 007 installation_audit | installation, audit_events, audit_event_scopes, 미완성 FK·조회 인덱스·전체 무결성 검사 |
+| 008 audit_scope_backfill | nullable `audit_events.scope_kind` 추가 및 안전한 기존 행 분류 |
+| 009 audit_scope_enforcement | `scope_kind` NOT NULL·허용 값 제약. 미분류 행이 있으면 적용 중지 |
+| 010 revocation_review | `revocations.needs_review` 추가. 기존 행은 검토 불필요로 초기화 |
 
-위 버전은 애플리케이션 릴리스 버전과 별개다. 모두 완료돼야 MVP 스키마로 서비스 가능하다. schema_migrations는 실행기가 먼저 생성한다. 빈 DB 스키마 생성만으로 관리자나 Root를 만들지 않는다. 저장 키 verifier·installation·기본 설정 데이터는 모든 스키마가 준비된 뒤 별도 원자적 초기화로 만든다.
+위 버전은 애플리케이션 릴리스 버전과 별개다. 모두 완료돼야 MVP 스키마로 서비스 가능하다. 000~007의 배포 SQL/checksum은 유지하고 후속 변경은 새 버전으로 추가한다. schema_migrations는 실행기가 먼저 생성한다. 빈 DB 스키마 생성만으로 관리자나 Root를 만들지 않는다. 저장 키 verifier·installation·기본 설정 데이터는 모든 스키마가 준비된 뒤 별도 원자적 초기화로 만든다.
+
+008은 기존 `audit_event_scopes` 행이 있는 이벤트를 `authorities`로 분류한다. scope 행이 없는 이벤트는 `setup.create_admin`, `setup.complete`, `identity.login`, `identity.logout`, `identity.begin_reset`, `identity.complete_reset`, `settings.update`, `maintenance.rotate`, `maintenance.finalize_restore`, `tls.upload_candidate`, `tls.reload`, `tls.activate`, `tls.activate.rejected`, `tls.activate.rolled_back`, `tls.reconcile` 중 하나일 때만 `installation`으로 분류한다. 전역 Action에 scope 행이 있거나, scope 행 없는 Action이 이 목록에 없으면 자동 분류하지 않고 NULL로 남긴다. 009는 NULL이 남아 있으면 실패한다. 운영자는 해당 이력을 확인해 scope를 분류한 뒤 `resume`해야 하며 미분류 행을 임의 전역으로 바꾸지 않는다.
 
 ### 순환 FK 처리
 
@@ -127,9 +132,13 @@ SQL 파일 경로는 `internal/storage/migrations/{sqlite,postgres,mysql,mariadb
 
 임의 SQL 파일 실행, 특정 버전 건너뛰기, checksum 강제 덮어쓰기, 성공 상태 강제 지정, down 명령은 제공하지 않는다. `resume` 대상이 없고 스키마가 최신이면 무변경 성공이며 정상적인 pending 버전만 있으면 migrate를 안내한다.
 
-DB 명령은 DB 설정만 요구한다. schema-only 마이그레이션과 status에 저장 암호화 키를 불필요하게 요구하지 않는다. 서버 구동·rotate·키 데이터 변환 작업에는 기존 저장 키 검증을 적용한다. 향후 키를 읽는 마이그레이션은 단계 명세에 requires_encryption_key를 선언하고 변경 시작 전에 검증해야 한다. 초기 000~007은 모두 해당하지 않는다.
+DB 명령은 DB 설정만 요구한다. schema-only 마이그레이션과 status에 저장 암호화 키를 불필요하게 요구하지 않는다. 서버 구동·rotate·키 데이터 변환 작업에는 기존 저장 키 검증을 적용한다. 향후 키를 읽는 마이그레이션은 단계 명세에 requires_encryption_key를 선언하고 변경 시작 전에 검증해야 한다. 초기 및 후속 000~010 마이그레이션은 모두 해당하지 않는다.
 
 외부 DB 연결 정보는 기존 env/file 규칙으로 읽으며 명령행에 비밀번호·DSN·저장 키 원문을 받지 않는다. SQLite는 로컬 파일 하나, 외부 DB는 전용 데이터베이스 하나를 사용한다. 여러 cert-me가 같은 DB의 다른 테이블 접두사나 PostgreSQL schema를 나눠 쓰는 구성은 지원하지 않는다. PostgreSQL 업무 테이블은 public schema로 고정한다.
+
+설정 입력 이름과 충돌 규칙은 다음과 같다. `CERT_ME_DB_KIND`는 `sqlite`, `postgres`, `mysql`, `mariadb` 중 하나이며 기본값은 없다. SQLite에는 `CERT_ME_DB_PATH`가 필요하고 외부 DB 필드는 함께 지정할 수 없다. 외부 DB는 `CERT_ME_DB_HOST`, `CERT_ME_DB_NAME`, `CERT_ME_DB_USER`가 필요하며 `CERT_ME_DB_PORT`는 생략 시 PostgreSQL 5432, MySQL/MariaDB 3306을 쓴다. `CERT_ME_DB_PASSWORD`는 선택 사항이다.
+
+동일한 연결 설정은 `CERT_ME_DB_CONFIG_FILE`이 가리키는 JSON 객체로 제공할 수 있다. 객체 필드는 `kind`, `path`, `host`, `port`, `database`, `username`, `password`로 제한하며, 중복 필드·알 수 없는 필드는 거부한다. JSON 파일 설정과 개별 `CERT_ME_DB_*` 변수를 섞지 않는다. 저장 키는 DB 접속 설정과 별개로 `CERT_ME_ENCRYPTION_KEY` 또는 `CERT_ME_ENCRYPTION_KEY_FILE` 중 하나를 사용한다. 둘 다 무작위 32바이트 키의 Base64 입력이며, 누락·동시 지정·잘못된 길이는 서버 시작 오류다. `db status`, `db migrate`, `db resume`는 저장 키 없이 실행할 수 있다.
 
 기본 연결 제한 시간은 10초, 잠금 획득은 대기 없이 한 번 시도한다. SQL 단계 제한 시간은 기본 120초이며 운영자가 `--step-timeout`으로 1초~1시간 안에서 지정할 수 있다. 시간 초과가 서버의 DDL 미반영을 보장하지 않으므로 자동 재실행하지 않는다. 상태를 실패/미확정으로 남기고 resume에서 실제 결과를 판정한다.
 
@@ -141,7 +150,7 @@ DB 명령은 DB 설정만 요구한다. schema-only 마이그레이션과 status
   "database_kind": "mysql",
   "state": "resume_required",
   "current_version": 2,
-  "target_version": 7,
+  "target_version": 10,
   "incomplete_version": 3,
   "last_verified_step": 4,
   "snapshot_consistent": true,
@@ -217,7 +226,7 @@ applied 행의 SQL checksum·버전·last_step은 일반 실행에서 수정하�
 
 ### DB별 적용과 재개
 
-PostgreSQL/SQLite의 초기 001~007은 버전별 단일 트랜잭션으로 처리한다. applying 행을 먼저 별도 커밋하고, DDL·단계 진행 값·applied 전환은 같은 버전 트랜잭션 안에서 커밋한다. 트랜잭션이 중단되면 실제 스키마는 버전 시작 상태이고 applying 행만 남을 수 있다. resume는 이를 확인한 뒤 전체 버전을 재실행한다. 외부에 완료 상태를 먼저 알리지 않는다.
+PostgreSQL/SQLite의 001~010은 버전별 단일 트랜잭션으로 처리한다. applying 행을 먼저 별도 커밋하고, DDL·단계 진행 값·applied 전환은 같은 버전 트랜잭션 안에서 커밋한다. 트랜잭션이 중단되면 실제 스키마는 버전 시작 상태이고 applying 행만 남을 수 있다. resume는 이를 확인한 뒤 전체 버전을 재실행한다. 외부에 완료 상태를 먼저 알리지 않는다.
 
 MySQL/MariaDB는 applying 행을 먼저 커밋하고 각 단계마다 다음 순서로 진행한다.
 

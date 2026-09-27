@@ -32,4 +32,4 @@ with tempfile.TemporaryDirectory(prefix='certme-artifacts-') as tmp:
         if file.is_file():
             relative=file.relative_to(target)
             assert file.read_bytes()==(ROOT/relative).read_bytes(),f'generated drift: {relative}'
-print('PASS: 32 SQL checksums, generation reproducibility and documentation links')
+print(f"PASS: {len(manifest['files'])} SQL checksums, generation reproducibility and documentation links")

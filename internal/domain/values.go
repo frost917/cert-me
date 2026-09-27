@@ -535,6 +535,11 @@ const (
 	SecretPurposeStoreVerifier SecretPurpose = "store_verifier"
 )
 
+// StoreVerifierOwnerKeyID is the reserved AAD owner for the singleton
+// encryption verifier. It is deliberately not a key_materials row; the
+// verifier is stored separately from user/CA/TLS key material.
+const StoreVerifierOwnerKeyID KeyMaterialID = "00000000-0000-4000-8000-000000000001"
+
 func (p SecretPurpose) Validate() error {
 	switch p {
 	case SecretPurposeCASigning, SecretPurposeBootstrapCA, SecretPurposeLeafDelivery,

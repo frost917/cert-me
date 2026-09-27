@@ -2,11 +2,25 @@ package service
 
 import (
 	"context"
+	"time"
 
 	"cert-me/internal/app/contract"
 	"cert-me/internal/app/port"
 	"cert-me/internal/domain"
 )
+
+// x509NotBefore rounds the application clock upward to the certificate
+// timestamp precision. X.509 validity fields carry whole seconds; using the
+// next representable second avoids making a certificate valid earlier than
+// the requested instant while keeping plan and DER facts identical.
+func x509NotBefore(now domain.Instant) domain.Instant {
+	timestamp := now.Time()
+	rounded := timestamp.Truncate(time.Second)
+	if rounded.Before(timestamp) {
+		rounded = rounded.Add(time.Second)
+	}
+	return domain.NewInstant(rounded)
+}
 
 // signingKeyRef selects which key pair a signing attempt uses: either a
 // fresh key prepareCertificate must generate first, or an already-stored one

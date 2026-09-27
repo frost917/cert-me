@@ -62,6 +62,8 @@ MVP에서는 최초 전체 관리자 한 명만 생성한다. 미래 역할 테�
 | `private_key_secrets` | `key_material_id` PK/FK, `purpose`, `encryption_generation_id` FK, `format_version`, `nonce`, `ciphertext` | purpose=`ca_signing/leaf_delivery/internal_tls/bootstrap_ca`. 인증 태그 포함 암호문 |
 | `encryption_verifier` | 고정 PK=1, `encryption_generation_id` FK, `format_version`, `nonce`, `ciphertext` | 개인키가 없는 DB도 주입 키 인증 복호화를 검사 |
 
+`encryption_verifier`의 AAD 소유자 ID는 예약값 `00000000-0000-4000-8000-000000000001`이다. 이 ID는 `key_materials` 행이 아니며 `store_verifier` 용도에서만 사용한다.
+
 AAD에는 테이블 구분·레코드 ID·용도·형식 버전을 모호하지 않은 고정 직렬화로 포함한다. rotate 시 모든 secret과 verifier를 새 nonce로 재암호화하고 세대 포인터를 같은 트랜잭션에서 변경한다.
 
 키 하나의 저장 목적은 하나다. 일반 수령용 Leaf를 내부 HTTPS 보관용으로 전환해 수령 제한을 우회할 수 없다. 내부 HTTPS 발급은 시작부터 별도 계보·보관 목적을 사용한다. CA 키 파기나 수령 완료는 secret 행을 삭제하되 key_material·인증서·계보는 보존한다.
@@ -110,7 +112,7 @@ authority의 issuance_certificate_id는 신규 발급에 선택한 자신의 CA 
 
 | 테이블 | 주요 필드·제약 | 의미 |
 | --- | --- | --- |
-| `revocations` | `issuer_ca_key_generation_id` FK, `serial_hex`, 두 필드 UQ, `certificate_id` FK nullable, `revoked_at`, `reason`, `source`, `change_generation` | 인증서 없는 CRL 항목도 보존. certificate 연결 시 발급 키·일련번호 일치 필수 |
+| `revocations` | `issuer_ca_key_generation_id` FK, `serial_hex`, 두 필드 UQ, `certificate_id` FK nullable, `revoked_at`, `reason`, `source`, `change_generation`, `needs_review` | 인증서 없는 CRL 항목도 보존. certificate 연결 시 발급 키·일련번호 일치 필수. 미래 시각·충돌 등 검토 대상 여부를 명시 저장 |
 | `revocation_revisions` | `revocation_id` FK, `revision_no`, 두 필드 UQ, `previous_values_json`, `new_values_json`, `justification`, `actor_id` FK nullable, `source_import_id` FK nullable | 폐기 정정 근거를 감사 보존 기간과 무관하게 보존. 폐기 해제 불가 |
 | `crl_states` | `ca_key_generation_id` PK/FK, `max_reserved_number_hex`, `revocation_generation`, `published_crl_id` FK nullable, `next_publish_at`, `publication_state`, `signing_ca_certificate_id` FK nullable, `version` | 번호 상한에는 import·운영자 복원 상한 포함. publication_state=`inactive/active/closed` |
 | `crl_documents` | `ca_key_generation_id` FK, `number_hex` nullable, `der_sha256` UQ, `der`, `this_update`, `next_update` nullable, `covered_generation` nullable, `origin`, `source_import_id` FK nullable | 서명된 불변 CRL 원본. origin=`generated/imported`. 생성본은 번호·nextUpdate·covered_generation 필수 |

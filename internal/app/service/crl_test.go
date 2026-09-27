@@ -103,7 +103,7 @@ func seedCRLTestCA(t *testing.T, store *porttest.Store, ids port.IDGenerator, no
 	}); err != nil {
 		t.Fatalf("seed crl test ca: %v", err)
 	}
-	seedCRLState(t, store, keyGenID)
+	seedCRLState(t, store, keyGenID, certID)
 	return crlCA{authorityID: authorityID, keyGenID: keyGenID}
 }
 

@@ -29,7 +29,7 @@ func TestManifest(t *testing.T) {
 	if err = json.Unmarshal(raw, &manifest); err != nil {
 		t.Fatal(err)
 	}
-	if manifest.SchemaVersion != 7 || len(manifest.Files) != 32 {
+	if manifest.SchemaVersion != 10 || len(manifest.Files) != 44 {
 		t.Fatal("unexpected migration set")
 	}
 	for path, want := range manifest.Files {
@@ -82,9 +82,10 @@ func TestSchema(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				// Initial SQL has no procedure bodies or semicolons inside literals.
-				// The production runner needs a reviewed statement manifest.
-				for _, statement := range strings.Split(string(data), ";") {
+				// Schema fixtures execute generated DDL directly. Strip whole-line
+				// migration comments before splitting; follow-up migration notes may
+				// contain punctuation that is not SQL.
+				for _, statement := range splitSchemaStatements(data) {
 					if strings.TrimSpace(statement) == "" {
 						continue
 					}
@@ -154,4 +155,16 @@ func TestSchema(t *testing.T) {
 			}
 		})
 	}
+}
+
+func splitSchemaStatements(data []byte) []string {
+	var sqlText strings.Builder
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "--") {
+			continue
+		}
+		sqlText.WriteString(line)
+		sqlText.WriteByte('\n')
+	}
+	return strings.Split(sqlText.String(), ";")
 }

@@ -1,5 +1,5 @@
 {
-  "schema_version": 7,
+  "schema_version": 10,
   "files": {
     "internal/storage/migrations/sqlite/000_metadata.sql": "50396820a02345d9a2ca4d09017248d56e48a0154e0b01c7a618844b7e716dad",
     "internal/storage/migrations/sqlite/001_identity.sql": "5d750b48d2f55255f24cbcfd499fda31c0943906322ca23b64ab363269c49704",
@@ -9,6 +9,9 @@
     "internal/storage/migrations/sqlite/005_revocation.sql": "547ceaa5b9805fee0bcc2e87774d1fa0625e52d15968c19cb2e938f37de3066b",
     "internal/storage/migrations/sqlite/006_operations.sql": "8f6c062c60964eb7e690b23107cb7c2a6ace4fa161b76023a249414e8a44786a",
     "internal/storage/migrations/sqlite/007_installation_audit.sql": "d8e199fe015d92443fdb4d58b28aa7c07cbb6e7f7ebf801a11ef28d416f77a02",
+    "internal/storage/migrations/sqlite/008_audit_scope_kind.sql": "39d7f6eb723c8cbf34bdfa843320c1cca522d96992b67f636a4b46ba2a2d9472",
+    "internal/storage/migrations/sqlite/009_audit_scope_kind_required.sql": "e0364ccfaa943e7eb4a2a2931c8dd2fd1b377301ac4f21b6668ed39eca93574e",
+    "internal/storage/migrations/sqlite/010_revocation_needs_review.sql": "491a08c68e4994d8e3a62d2824bc192f666b5f6aca2db6545c7de5603ca2c340",
     "internal/storage/migrations/postgres/000_metadata.sql": "a5447ab8febda4a442617684e4d01bc5decd4af4344995e34a7c7c68abd09d10",
     "internal/storage/migrations/postgres/001_identity.sql": "26d76883d947509378dd5afc0ef14e5685c25181ec5b5c63885dd133daf3f810",
     "internal/storage/migrations/postgres/002_keys.sql": "ca6264dce328872b5e70f26485eac1ff0fd1f6327853ec6fecb4fa216ce189ae",
@@ -17,6 +20,9 @@
     "internal/storage/migrations/postgres/005_revocation.sql": "9a4dd85fd206797a87f05fbc617eb83a01943fff8f8d30283565ef465ffda04a",
     "internal/storage/migrations/postgres/006_operations.sql": "4ba5c6906bccb9391b7aa2651638f2e27f0462b767d7276abc3e97d9ee2669bd",
     "internal/storage/migrations/postgres/007_installation_audit.sql": "f74a1f98f6953c4c7335a077824014f296204bb50e00718455f9f650d31a1f60",
+    "internal/storage/migrations/postgres/008_audit_scope_kind.sql": "bb02747e042376ed633371100820d18161011131ecfe7d0cad64c2b48ad5333f",
+    "internal/storage/migrations/postgres/009_audit_scope_kind_required.sql": "e0364ccfaa943e7eb4a2a2931c8dd2fd1b377301ac4f21b6668ed39eca93574e",
+    "internal/storage/migrations/postgres/010_revocation_needs_review.sql": "cae605ece351462ad4eadd5861665821fec1a09491462355c134eadaf00b5aa6",
     "internal/storage/migrations/mysql/000_metadata.sql": "7e165b6a1cfe87dab4d13f6c8d3d813a20c1a9e436cf2979e18fcf0af8d75254",
     "internal/storage/migrations/mysql/001_identity.sql": "e9f42ab5778d9be6576984f08f6712f3e2124eb0b61950d23208d2444a1ec603",
     "internal/storage/migrations/mysql/002_keys.sql": "e9ff7a44be4be5ee967c88f41aa4fdfe44d77e9c39253f0be4330b63949c9780",
@@ -25,6 +31,9 @@
     "internal/storage/migrations/mysql/005_revocation.sql": "ee9ae5aeb991737a3e2167ec48d60e4e9eae276b233c7f9c4b4100984c6384ca",
     "internal/storage/migrations/mysql/006_operations.sql": "d484d245d45efad26dc14a486d6b392c47603fbca6d5e918bdea6ba3e8b3139c",
     "internal/storage/migrations/mysql/007_installation_audit.sql": "4523b1023cc4816429196bd6352456009abb7fd12b922e905d4cff79d7683f60",
+    "internal/storage/migrations/mysql/008_audit_scope_kind.sql": "1d50437f009472c7574cc041b93a876a9fe83cb14f198baae0b603d1358467da",
+    "internal/storage/migrations/mysql/009_audit_scope_kind_required.sql": "9b52d14babf950952d625b7abc13a89deeb8fa76b8e548529b14b0302e9fe2b3",
+    "internal/storage/migrations/mysql/010_revocation_needs_review.sql": "cae605ece351462ad4eadd5861665821fec1a09491462355c134eadaf00b5aa6",
     "internal/storage/migrations/mariadb/000_metadata.sql": "7e165b6a1cfe87dab4d13f6c8d3d813a20c1a9e436cf2979e18fcf0af8d75254",
     "internal/storage/migrations/mariadb/001_identity.sql": "e9f42ab5778d9be6576984f08f6712f3e2124eb0b61950d23208d2444a1ec603",
     "internal/storage/migrations/mariadb/002_keys.sql": "e9ff7a44be4be5ee967c88f41aa4fdfe44d77e9c39253f0be4330b63949c9780",
@@ -32,6 +41,9 @@
     "internal/storage/migrations/mariadb/004_delivery.sql": "993da38e07eea4e72b110cc68bd2ecd59c45e499f9cbd311bcd0ecfa15c60d65",
     "internal/storage/migrations/mariadb/005_revocation.sql": "ee9ae5aeb991737a3e2167ec48d60e4e9eae276b233c7f9c4b4100984c6384ca",
     "internal/storage/migrations/mariadb/006_operations.sql": "d484d245d45efad26dc14a486d6b392c47603fbca6d5e918bdea6ba3e8b3139c",
-    "internal/storage/migrations/mariadb/007_installation_audit.sql": "4523b1023cc4816429196bd6352456009abb7fd12b922e905d4cff79d7683f60"
+    "internal/storage/migrations/mariadb/007_installation_audit.sql": "4523b1023cc4816429196bd6352456009abb7fd12b922e905d4cff79d7683f60",
+    "internal/storage/migrations/mariadb/008_audit_scope_kind.sql": "1d50437f009472c7574cc041b93a876a9fe83cb14f198baae0b603d1358467da",
+    "internal/storage/migrations/mariadb/009_audit_scope_kind_required.sql": "9b52d14babf950952d625b7abc13a89deeb8fa76b8e548529b14b0302e9fe2b3",
+    "internal/storage/migrations/mariadb/010_revocation_needs_review.sql": "cae605ece351462ad4eadd5861665821fec1a09491462355c134eadaf00b5aa6"
   }
 }
