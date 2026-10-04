@@ -96,7 +96,20 @@
         "tags": [
           "auth"
         ],
-        "parameters": [],
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "preauth",
+                "session"
+              ]
+            }
+          }
+        ],
         "responses": {
           "400": {
             "$ref": "#/components/responses/Error400"
@@ -160,7 +173,7 @@
           }
         },
         "security": [],
-        "description": "Same-origin only; may use current session or pre-auth nonce cookie. Never grants setup authorization."
+        "description": "Same-origin only. If mode is omitted, use a valid session when present or the pre-auth nonce cookie otherwise. mode=preauth forces the pre-auth flow; mode=session requires a valid session. Never grants setup authorization."
       }
     },
     "/api/v1/setup/admin": {

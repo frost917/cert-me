@@ -1,6 +1,6 @@
 # MVP API 계약
 
-[데이터 모델](./data-model.md)의 업무 작업을 HTTP에 매핑한 설계다. 경로·필드·상태 코드와 실패 동작을 정의하며 [실제 OpenAPI 파일](../api/openapi.json)을 작성했고 핸들러는 아직 구현하지 않았다. HTML/HTMX 화면과 JSON API는 같은 서비스 계층을 호출한다.
+[데이터 모델](./data-model.md)의 업무 작업을 HTTP에 매핑한 설계다. 경로·필드·상태 코드와 실패 동작을 정의한다. [OpenAPI 파일](../api/openapi.json)을 기준 계약으로 사용하며 HTTP handler 구현은 B06 단계별로 진행 중이다. HTML/HTMX 화면과 JSON API는 같은 서비스 계층을 호출한다.
 
 ## 공통 규칙
 
@@ -49,7 +49,7 @@
 | 메서드·경로 | 입력 / 결과 |
 | --- | --- |
 | GET `/setup` | 공개 setup_stage와 임시 HTTPS 여부만 반환 |
-| GET `/auth/csrf` | pre-auth 또는 현재 세션의 CSRF 토큰. 동일 출처 화면 전용 |
+| GET `/auth/csrf` | pre-auth 또는 현재 세션의 CSRF 토큰. 동일 출처 화면 전용. `mode=preauth`는 세션 쿠키가 있어도 비로그인 화면용 토큰을 발급하며, `mode=session`은 유효 세션을 요구한다. 생략하면 유효 세션이 있을 때 session, 없으면 pre-auth를 선택한다. |
 | POST `/setup/admin` | login_name, password → 최초 계정 생성, 자동 로그인하지 않음 |
 | POST `/auth/login` | login_name, password → 세션 쿠키·CSRF 토큰·계정 |
 | POST `/auth/logout` | 현재 세션 삭제, 쿠키 제거 |
@@ -157,7 +157,7 @@ import 요청의 중복 방지 해시는 인증서/CRL 지문·제공한 CA 키�
 ## 확정 HTTP 보안 규칙
 
 - 상태 변경의 Origin은 HTTPS origin(스킴·정규화 호스트·유효 포트)으로 파싱하고 현재 설정 service_url의 origin과 정확히 비교한다. null·복수·잘못된 Origin은 거부한다. service_url의 userinfo/fragment는 금지한다. X-Forwarded-Host/Proto는 비교 기준이 아니다. 설정 이전에는 직접 받은 HTTPS 요청 authority와 Origin의 일치를 요구하며 pre-auth nonce를 그 origin에 결합한다. 이는 최초 설정 승인 수단이 아니므로 [제한된 초기 노출](./architecture.md)의 운영 전제가 적용된다. 설정 후 이전 출처의 pre-auth 토큰은 거부한다.
-- pre-auth 쿠키는 `__Host-certme_preauth`, Secure·HttpOnly·SameSite=Strict·Path=/·Max-Age=600이다. 32바이트 난수 nonce와 서명 토큰의 만료·origin·목적(pre-auth)을 함께 검증한다. 서명 키는 프로세스 시작마다 생성하는 메모리 전용 난수 키이며 재시작 시 기존 pre-auth가 무효화된다. 세션 CSRF와 pre-auth는 대체할 수 없다. `/auth/csrf` GET은 Sec-Fetch-Site가 있으면 반드시 same-origin이어야 하며 Origin 또는 Referer 중 존재하는 출처 값은 모두 기준 origin과 일치해야 한다. Sec-Fetch-Site도 없으면 검증된 Origin/Referer 중 하나가 필요하고 아무 증거도 없으면 403이다.
+- pre-auth 쿠키는 `__Host-certme_preauth`, Secure·HttpOnly·SameSite=Strict·Path=/·Max-Age=600이다. 32바이트 난수 nonce와 서명 토큰의 만료·origin·목적(pre-auth)을 함께 검증한다. 서명 키는 프로세스 시작마다 생성하는 메모리 전용 난수 키이며 재시작 시 기존 pre-auth가 무효화된다. 세션 CSRF와 pre-auth는 대체할 수 없다. 비밀번호 재설정 화면은 `mode=preauth`를 사용해 다른 로그인 세션이 열려 있어도 재설정 토큰과 별개의 pre-auth CSRF를 받는다. `/auth/csrf` GET은 Sec-Fetch-Site가 있으면 반드시 same-origin이어야 하며 Origin 또는 Referer 중 존재하는 출처 값은 모두 기준 origin과 일치해야 한다. Sec-Fetch-Site도 없으면 검증된 Origin/Referer 중 하나가 필요하고 아무 증거도 없으면 403이다.
 - 전체 HTML 응답에 `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'`를 적용한다. unsafe-inline/unsafe-eval은 허용하지 않는다. JS/CSS는 embed한 동일 출처 파일만 사용하고 inline handler를 쓰지 않는다. HTMX의 allowEval=false, allowScriptTags=false, includeIndicatorStyles=false를 초기화한 뒤 처리하며 필요한 indicator CSS는 로컬 파일로 제공한다.
 - 신뢰되지 않은 Subject·SAN·이름·파일명·오류는 html/template의 문맥별 escape를 유지한다. 외부 값을 template.HTML/JS/URL 등 안전 타입으로 승격하지 않는다. HTMX 조각도 같은 템플릿 규칙을 따른다. 전체 응답에 nosniff와 no-referrer, HTML에 X-Frame-Options: DENY를 적용한다. TLS 최소 버전은 1.2이며 암호군은 고정 Go toolchain의 안전 기본값을 사용하고 레거시 추가는 허용하지 않는다. HSTS는 MVP 기본 비활성화, preload/includeSubDomains는 발행하지 않는다.
 - 재설정 페이지는 링크 토큰을 메모리로 옮기고 최초 로드 시 history.replaceState로 현재 주소를 `/`로 바꾼다. 토큰을 local/sessionStorage·hidden HTML·URL에 다시 저장하지 않는다. 제출 시 메모리 토큰을 기존 재설정 POST 본문에 넣는다. 새로고침으로 메모리 토큰이 사라지면 원래 링크를 다시 열도록 안내한다. GET만으로 토큰을 소비하지 않는다. 이 조치는 이미 남은 외부 로그를 삭제하지 않는다.

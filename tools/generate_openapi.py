@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the initial OpenAPI contract. Handlers are not implemented by this file."""
+"""Build the canonical OpenAPI contract; HTTP handlers are implemented separately."""
 import copy
 import json
 from pathlib import Path
@@ -137,7 +137,8 @@ def endpoint(method,path,operation,out=None,body=None,status=200,public=False,ma
  return op
 
 endpoint('get','/setup','getSetup','Setup',public=True)
-endpoint('get','/auth/csrf','getCSRF','CSRF',public=True,description='Same-origin only; may use current session or pre-auth nonce cookie. Never grants setup authorization.')
+csrf=endpoint('get','/auth/csrf','getCSRF','CSRF',public=True,description='Same-origin only. If mode is omitted, use a valid session when present or the pre-auth nonce cookie otherwise. mode=preauth forces the pre-auth flow; mode=session requires a valid session. Never grants setup authorization.')
+csrf['parameters'].insert(0,param('mode',enum('preauth','session')))
 endpoint('post','/setup/admin','createFirstAdmin','Account','Credentials',201,public=True)
 login=endpoint('post','/auth/login','login','Login','Credentials',public=True)
 login['responses']['200']['headers']['Set-Cookie']={'schema':string(),'description':'__Host-certme_session; Secure; HttpOnly; SameSite=Strict; Path=/'}

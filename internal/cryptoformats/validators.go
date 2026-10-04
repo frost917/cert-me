@@ -176,7 +176,7 @@ func (URLValidator) Validate(ctx context.Context, raw string) error {
 	}
 	u, err := url.Parse(raw)
 	if err != nil || !u.IsAbs() || u.Scheme != "https" || u.Opaque != "" || u.Host == "" ||
-		u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.HasSuffix(u.Host, ":") {
 		return errors.New("cryptoformats: service URL must be an absolute HTTPS URL without userinfo, query, or fragment")
 	}
 	host := u.Hostname()

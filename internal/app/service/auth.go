@@ -84,6 +84,9 @@ func requireCurrentAuth(ctx context.Context, tx port.TxStores, principal contrac
 	}); err != nil {
 		return authError(err)
 	}
+	if principal.HasCSRFProof() && !principal.MatchesCSRFProof(session.CSRFSecretHash()) {
+		return contract.NewAppError(contract.ErrorKindForbidden, "csrf_failed", "the request could not be verified")
+	}
 	return nil
 }
 

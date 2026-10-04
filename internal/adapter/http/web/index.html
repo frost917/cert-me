@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="htmx-config" content='{"allowEval":false,"allowScriptTags":false,"includeIndicatorStyles":false}'>
+  <title>cert-me</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <script defer src="/assets/htmx.min.js"></script>
+  <script defer src="/assets/app.js"></script>
+</head>
+<body data-page="{{.Page}}">
+  <main class="shell">
+    <header class="topbar">
+      <a class="brand" href="/">cert-me</a>
+      <button id="logout-button" class="quiet" type="button" hidden>로그아웃</button>
+    </header>
+
+    <section class="card status-card" aria-live="polite">
+      <h1>PKI 관리</h1>
+      <div id="setup-stage" hx-get="/ui/setup-status" hx-trigger="load" hx-swap="innerHTML">
+        설치 상태를 불러오는 중입니다.
+      </div>
+      <p id="bootstrap-note" class="notice" hidden>임시 HTTPS 인증서를 사용 중입니다. 브라우저에서 인증서 지문을 확인하세요.</p>
+    </section>
+
+    <section id="setup-panel" class="card" hidden>
+      <h2>첫 관리자 만들기</h2>
+      <p>첫 관리자 계정은 설치를 시작할 때 한 번만 만들 수 있습니다.</p>
+      <form id="admin-form">
+        <label>로그인 이름<input name="login_name" minlength="3" maxlength="64" autocomplete="username" required></label>
+        <label>비밀번호<input name="password" type="password" minlength="12" maxlength="128" autocomplete="new-password" required></label>
+        <button type="submit">관리자 만들기</button>
+      </form>
+    </section>
+
+    <section id="login-panel" class="card" hidden>
+      <h2>로그인</h2>
+      <form id="login-form">
+        <label>로그인 이름<input name="login_name" minlength="3" maxlength="64" autocomplete="username" required></label>
+        <label>비밀번호<input name="password" type="password" minlength="12" maxlength="128" autocomplete="current-password" required></label>
+        <button type="submit">로그인</button>
+      </form>
+    </section>
+
+    <section id="dashboard-panel" class="card" hidden>
+      <h2>설정</h2>
+      <p id="account-label"></p>
+      <div id="settings-unavailable" class="notice" hidden></div>
+      <form id="settings-form" hidden>
+        <label>서비스 URL<input name="service_url" type="url" autocomplete="url" required></label>
+        <fieldset>
+          <legend>Leaf 유효기간</legend>
+          <label>값<input name="leaf_validity_value" type="number" min="1" required></label>
+          <label>단위<select name="leaf_validity_unit"><option value="years">년</option><option value="months">개월</option><option value="days">일</option></select></label>
+        </fieldset>
+        <fieldset>
+          <legend>Root 유효기간</legend>
+          <label>값<input name="root_validity_value" type="number" min="1" required></label>
+          <label>단위<select name="root_validity_unit"><option value="years">년</option><option value="months">개월</option><option value="days">일</option></select></label>
+        </fieldset>
+        <fieldset>
+          <legend>Intermediate 유효기간</legend>
+          <label>값<input name="intermediate_validity_value" type="number" min="1" required></label>
+          <label>단위<select name="intermediate_validity_unit"><option value="years">년</option><option value="months">개월</option><option value="days">일</option></select></label>
+        </fieldset>
+        <label>키 교체 주기<input name="rotate_every" type="number" min="1" max="100" required></label>
+        <label>개인키 수령 유효기간(초)<input name="private_delivery_seconds" type="number" min="300" max="86400" required></label>
+        <label>공개 링크 유효기간(초)<input name="public_link_seconds" type="number" min="60" max="10800" required></label>
+        <label>CRL 발행 간격(초)<input name="crl_interval_seconds" type="number" min="300" max="86400" required></label>
+        <label>CRL 유효기간(초)<input name="crl_validity_seconds" type="number" min="600" max="604800" required></label>
+        <label>감사 기록 보존(일)<input name="audit_retention_days" type="number" min="30" max="3650" required></label>
+        <button type="submit">변경 저장</button>
+      </form>
+      <p id="settings-result" role="status" aria-live="polite"></p>
+      <section id="setup-complete-panel" hidden>
+        <h3>초기 설정 완료</h3>
+        <p>Root CA와 서비스 설정을 확인한 뒤 설치를 완료할 수 있습니다.</p>
+        <button id="setup-complete-button" type="button">설치 완료</button>
+      </section>
+    </section>
+
+    <section id="reset-panel" class="card" hidden>
+      <h2>비밀번호 재설정</h2>
+      <p>새 비밀번호를 입력하세요. 재설정이 끝나면 새 비밀번호로 다시 로그인해야 합니다.</p>
+      <form id="reset-form">
+        <label>새 비밀번호<input name="new_password" type="password" minlength="12" maxlength="128" autocomplete="new-password" required></label>
+        <button type="submit">비밀번호 변경</button>
+      </form>
+    </section>
+
+    <p id="feedback" class="feedback" role="status" aria-live="polite"></p>
+  </main>
+</body>
+</html>
