@@ -470,11 +470,30 @@ func TestComplete_SettingsVersionMismatchIsConflict(t *testing.T) {
 	}
 }
 
+func TestComplete_RequiresRootAuthority(t *testing.T) {
+	f := newSetupFixture(t)
+	seedInstallation(t, f.store, port.SetupStagePKIRequired)
+	meta := seedAdminSession(t, f.store, testNow())
+	seedDefaultSettings(t, f.store)
+	zero := domain.Version(0)
+	meta.ExpectedVersion = &zero
+
+	_, err := f.svc.Complete(context.Background(), meta, contract.SetupCompleteCommand{})
+	if err == nil {
+		t.Fatal("complete succeeded without a Root authority")
+	}
+	var appErr *contract.AppError
+	if !errors.As(err, &appErr) || appErr.Code() != "setup_root_required" {
+		t.Fatalf("err = %v, want setup_root_required", err)
+	}
+}
+
 func TestComplete_AdvancesStageAndIsIdempotent(t *testing.T) {
 	f := newSetupFixture(t)
 	seedInstallation(t, f.store, port.SetupStagePKIRequired)
 	meta := seedAdminSession(t, f.store, testNow())
 	seedDefaultSettings(t, f.store)
+	seedIssuableRoot(t, f.store, f.ids, testNow())
 	zero := domain.Version(0)
 	meta.ExpectedVersion = &zero
 
