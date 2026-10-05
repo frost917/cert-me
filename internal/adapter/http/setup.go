@@ -54,6 +54,10 @@ type SetupHandlerConfig struct {
 	Service           SetupApplication
 	Identity          IdentityApplication
 	Settings          SettingsApplication
+	Authorities       AuthorityApplication
+	PKIQueries        PKIQueryApplication
+	Issuance          IssuanceApplication
+	LeafQueries       LeafQueryApplication
 	ServiceURL        string
 	ServiceURLVersion int64
 	TrustedProxies    []netip.Prefix
@@ -68,6 +72,10 @@ type setupHandler struct {
 	service        SetupApplication
 	identity       IdentityApplication
 	settings       SettingsApplication
+	authorities    AuthorityApplication
+	pkiQueries     PKIQueryApplication
+	issuance       IssuanceApplication
+	leafQueries    LeafQueryApplication
 	serviceURL     atomic.Pointer[serviceURLSnapshot]
 	trustedProxies []netip.Prefix
 	preAuthKey     [32]byte
@@ -112,6 +120,10 @@ func NewSetupHandler(config SetupHandlerConfig) (http.Handler, error) {
 		service:        config.Service,
 		identity:       config.Identity,
 		settings:       config.Settings,
+		authorities:    config.Authorities,
+		pkiQueries:     config.PKIQueries,
+		issuance:       config.Issuance,
+		leafQueries:    config.LeafQueries,
 		trustedProxies: append([]netip.Prefix(nil), config.TrustedProxies...),
 	}
 	h.setServiceURL(config.ServiceURLVersion, config.ServiceURL)
@@ -363,8 +375,12 @@ func writeApplicationError(w http.ResponseWriter, err error, requestID string) {
 		status = http.StatusTooManyRequests
 		w.Header().Set("Retry-After", retryAfterHeader(fields))
 		delete(fields, "retry_after_unix_micro")
-	case "settings_version_conflict", "setup_settings_version_mismatch":
+	case "settings_version_conflict", "setup_settings_version_mismatch", "authority_version_conflict", "series_version_conflict", "version_mismatch", "version_conflict":
 		status = http.StatusPreconditionFailed
+	case "not_found", "authority_not_found", "series_not_found", "leaf_series_not_found", "certificate_not_found", "source_certificate_not_found":
+		status = http.StatusNotFound
+	case "malformed_request", "idempotency_key_invalid":
+		status = http.StatusBadRequest
 	default:
 		switch appErr.Kind() {
 		case contract.ErrorKindValidation:

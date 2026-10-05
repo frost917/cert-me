@@ -6,12 +6,9 @@ import (
 
 // AuthorityView is the OpenAPI Authority data object.
 //
-// The schema also carries a "crl" field ($ref CRLStatus), but no CRLStatus
-// Go type exists yet anywhere in internal/app/contract -- views.go (owned by
-// another developer, out of this file's scope) has no CRLStatusView, and
-// CRLStatus is shared across Authority and the CRL/Query services' own
-// tables, so it is not this file's call to add one. The field is omitted
-// here rather than guessed at; see the round's report for the escalation.
+// CRL is the read-side publication state when available. Replayed is internal
+// response metadata used to choose 200 for an idempotent replay; it is never
+// part of the public response body or a persisted operation result.
 type AuthorityView struct {
 	ID                    domain.AuthorityID
 	Kind                  domain.AuthorityKind
@@ -26,6 +23,8 @@ type AuthorityView struct {
 	ArchivedAt            *domain.Instant
 	Version               domain.Version
 	CreatedAt             domain.Instant
+	CRL                   *CRLStatusView
+	Replayed              bool `json:"-"`
 }
 
 // AuthorityCreateCommand is the JSON decode target for the OpenAPI
