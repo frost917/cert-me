@@ -70,7 +70,7 @@
         <label>CRL 발행 간격(초)<input name="crl_interval_seconds" type="number" min="300" max="86400" required></label>
         <label>CRL 유효기간(초)<input name="crl_validity_seconds" type="number" min="600" max="604800" required></label>
         <label>감사 기록 보존(일)<input name="audit_retention_days" type="number" min="30" max="3650" required></label>
-        <button type="submit">변경 저장</button>
+        <button id="settings-save-button" type="submit">변경 저장</button>
       </form>
       <p id="settings-result" role="status" aria-live="polite"></p>
       <section id="setup-complete-panel" hidden>

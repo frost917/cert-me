@@ -85,7 +85,15 @@
       byID("setup-complete-panel").hidden = true;
       notice.hidden = false;
       if (response.status === 409) {
-        notice.textContent = "서비스 설정이 아직 생성되지 않았습니다. 최초 service_url 입력 경로는 PR에서 결정할 예정입니다.";
+        const body = await response.json();
+        if (body.error?.code !== "settings_not_configured" || installationStage !== "pki_required") {
+          throw new Error(body.error?.message || "설정을 불러오지 못했습니다.");
+        }
+        settingsSnapshot = null;
+        settingsETag = "";
+        notice.textContent = "서비스 URL과 기본 설정을 입력하세요. 서비스 URL은 HTTPS 주소를 직접 지정해야 합니다.";
+        byID("settings-save-button").textContent = "초기 설정 저장";
+        form.hidden = false;
         return;
       }
       throw new Error(await responseMessage(response));
@@ -96,6 +104,7 @@
     fillSettings(settingsSnapshot);
     notice.hidden = true;
     form.hidden = false;
+    byID("settings-save-button").textContent = "변경 저장";
     byID("setup-complete-panel").hidden = installationStage !== "pki_required";
   }
 
@@ -232,6 +241,17 @@
     event.preventDefault();
     const form = event.currentTarget;
     try {
+      if (settingsSnapshot === null) {
+        const response = await sendJSON("/api/v1/setup/settings", "POST", currentSettings(form), true);
+        settingsSnapshot = (await response.json()).data;
+        settingsETag = response.headers.get("ETag") || "";
+        fillSettings(settingsSnapshot);
+        byID("settings-unavailable").hidden = true;
+        byID("settings-save-button").textContent = "변경 저장";
+        byID("setup-complete-panel").hidden = installationStage !== "pki_required";
+        byID("settings-result").textContent = `초기 설정을 저장했습니다. 서비스 주소 ${settingsSnapshot.service_url}에서 계속 진행하세요.`;
+        return;
+      }
       const patch = settingsPatch(currentSettings(form), settingsSnapshot);
       if (Object.keys(patch).length === 0) {
         byID("settings-result").textContent = "변경된 설정이 없습니다.";
