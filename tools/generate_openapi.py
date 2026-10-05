@@ -150,7 +150,8 @@ endpoint('get','/settings','getSettings','Settings')
 endpoint('patch','/settings','updateSettings','Settings','SettingsPatch',match=True)
 initial=endpoint('post','/setup/settings','initializeSettings','Settings','SettingsInitialize',201,description='Administrator session and CSRF required. Create the initial settings only during pki_required, with every field explicitly supplied. Existing settings return 409; after a lost response use GET /settings. No Host-derived URL or implicit PATCH upsert. Bootstrap TLS may have no operational URL binding; operational TLS must match service_url.')
 initial['responses']['201']['headers']['Location']={'schema':string(),'description':'/api/v1/settings'}
-endpoint('post','/setup/complete','completeSetup','Setup','Empty',match=True)
+complete=endpoint('post','/setup/complete','completeSetup','Setup','Empty',match=True)
+complete['requestBody']['required']=False
 endpoint('get','/authorities','listAuthorities','Authority',listing=True)
 endpoint('post','/authorities','createAuthority','Authority','AuthorityCreate',201,idem=True)
 endpoint('get','/authorities/{id}','getAuthority','Authority')
