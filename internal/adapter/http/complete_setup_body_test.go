@@ -2,7 +2,9 @@ package httpadapter
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -56,6 +58,7 @@ func TestCompleteSetupRejectsBodyContentBeforeCallingService(t *testing.T) {
 		{name: "array", body: `[]`, wantStatus: http.StatusBadRequest, wantCode: "malformed_request"},
 		{name: "null", body: `null`, wantStatus: http.StatusBadRequest, wantCode: "malformed_request"},
 		{name: "trailing JSON", body: `{} {}`, wantStatus: http.StatusBadRequest, wantCode: "malformed_request"},
+		{name: "oversized body", body: strings.Repeat(" ", maxSetupJSONBytes+1), wantStatus: http.StatusRequestEntityTooLarge, wantCode: "payload_too_large"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -77,4 +80,91 @@ func TestCompleteSetupRejectsBodyContentBeforeCallingService(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCompleteSetupAcceptsChunkedEmptyBody(t *testing.T) {
+	h := newHTTPTestHarness(t, httpTestServiceURL)
+	request := httptest.NewRequest(http.MethodPost, "http://cert.example/api/v1/setup/complete", httpTestEmptyBodyReader{})
+	request.ContentLength = -1
+	request.TransferEncoding = []string{"chunked"}
+	request.RemoteAddr = "192.0.2.10:1234"
+	request.Header.Set("Origin", httpTestServiceURL)
+	request.Header.Set("X-CSRF-Token", httpTestSessionCSRF)
+	request.Header.Set("If-Match", `"v7"`)
+	request.AddCookie(httpTestSessionCookie())
+	response := httptest.NewRecorder()
+	h.handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("chunked-empty setup completion status = %d; want %d", response.Code, http.StatusOK)
+	}
+	if calls, version := h.setup.completeResult(); calls != 1 || version != 7 {
+		t.Fatalf("Complete received calls=%d settings version=%d; want 1 and 7", calls, version)
+	}
+}
+
+func TestCompleteSetupBodyValidationPreservesAuthenticationAndVersionPrecedence(t *testing.T) {
+	t.Run("authentication is checked before body", func(t *testing.T) {
+		h := newHTTPTestHarness(t, httpTestServiceURL)
+		response := h.request(http.MethodPost, "/api/v1/setup/complete", `[]`, httpTestAdminHeaders(httpTestServiceURL))
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("unauthenticated completion status = %d; want %d", response.Code, http.StatusUnauthorized)
+		}
+		if calls, _ := h.setup.completeResult(); calls != 0 {
+			t.Fatalf("Complete ran %d times without a session", calls)
+		}
+	})
+
+	t.Run("If-Match is checked before body", func(t *testing.T) {
+		h := newHTTPTestHarness(t, httpTestServiceURL)
+		response := h.request(http.MethodPost, "/api/v1/setup/complete", `[]`, httpTestAdminHeaders(httpTestServiceURL), httpTestSessionCookie())
+		if response.Code != http.StatusPreconditionRequired {
+			t.Fatalf("completion without If-Match status = %d; want %d", response.Code, http.StatusPreconditionRequired)
+		}
+		if calls, _ := h.setup.completeResult(); calls != 0 {
+			t.Fatalf("Complete ran %d times without If-Match", calls)
+		}
+	})
+}
+
+func TestCompleteSetupKeepsCloserWhenPeekingUnknownLengthBody(t *testing.T) {
+	h := newHTTPTestHarness(t, httpTestServiceURL)
+	body := &httpTestTrackingReadCloser{Reader: strings.NewReader(`{"unexpected":true}`)}
+	request := httptest.NewRequest(http.MethodPost, "http://cert.example/api/v1/setup/complete", nil)
+	request.Body = body
+	request.ContentLength = -1
+	request.TransferEncoding = []string{"chunked"}
+	request.RemoteAddr = "192.0.2.10:1234"
+	request.Header.Set("Origin", httpTestServiceURL)
+	request.Header.Set("X-CSRF-Token", httpTestSessionCSRF)
+	request.Header.Set("If-Match", `"v7"`)
+	request.Header.Set("Content-Type", "application/json")
+	request.AddCookie(httpTestSessionCookie())
+	response := httptest.NewRecorder()
+	h.handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("unknown-length JSON body status = %d; want %d", response.Code, http.StatusUnprocessableEntity)
+	}
+	if body.closed {
+		t.Fatal("handler closed the original request body before the server cleanup")
+	}
+	if err := request.Body.Close(); err != nil {
+		t.Fatalf("closing request body returned an error: %v", err)
+	}
+	if !body.closed {
+		t.Fatal("buffered request body did not preserve the original closer")
+	}
+}
+
+type httpTestEmptyBodyReader struct{}
+
+func (httpTestEmptyBodyReader) Read([]byte) (int, error) { return 0, io.EOF }
+
+type httpTestTrackingReadCloser struct {
+	*strings.Reader
+	closed bool
+}
+
+func (body *httpTestTrackingReadCloser) Close() error {
+	body.closed = true
+	return nil
 }

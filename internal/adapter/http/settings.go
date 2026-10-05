@@ -1,6 +1,7 @@
 package httpadapter
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"io"
@@ -114,6 +115,12 @@ func (h *setupHandler) postCompleteSetup(w http.ResponseWriter, r *http.Request)
 		writeSetupError(w, status, code, message, meta.RequestID, nil)
 		return
 	}
+	fields, status, code, message := decodeOptionalEmptyJSONObject(w, r)
+	if status != 0 {
+		writeSetupError(w, status, code, message, meta.RequestID, nil)
+		return
+	}
+	defer clearJSONFields(fields)
 	authenticated.ExpectedVersion = &version
 	view, err := h.service.Complete(r.Context(), authenticated, contract.SetupCompleteCommand{})
 	if err != nil {
@@ -123,6 +130,30 @@ func (h *setupHandler) postCompleteSetup(w http.ResponseWriter, r *http.Request)
 	writeSetupJSON(w, http.StatusOK, struct {
 		Data setupStatusResponse `json:"data"`
 	}{Data: setupStatusResponse{SetupStage: string(view.SetupStage), BootstrapHTTPS: view.BootstrapHTTPS}})
+}
+
+func decodeOptionalEmptyJSONObject(w http.ResponseWriter, r *http.Request) (map[string]json.RawMessage, int, string, string) {
+	if r.Body == nil || r.ContentLength == 0 {
+		return nil, 0, "", ""
+	}
+	if r.ContentLength > maxSetupJSONBytes {
+		return nil, http.StatusRequestEntityTooLarge, "payload_too_large", "The request body is too large."
+	}
+
+	body := r.Body
+	buffered := bufio.NewReader(body)
+	if _, err := buffered.Peek(1); err != nil {
+		if errors.Is(err, io.EOF) && r.ContentLength <= 0 {
+			return nil, 0, "", ""
+		}
+		status, code, message := malformedBodyStatus(err)
+		return nil, status, code, message
+	}
+	r.Body = struct {
+		io.Reader
+		io.Closer
+	}{Reader: buffered, Closer: body}
+	return decodeJSONObject(w, r, nil)
 }
 
 func expectedVersion(r *http.Request) (domain.Version, int, string, string) {
