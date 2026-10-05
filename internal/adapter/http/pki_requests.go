@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"cert-me/internal/app/contract"
 )
@@ -72,9 +73,31 @@ func decodePKICommand(w http.ResponseWriter, r *http.Request, dest any, allowed 
 			return false
 		}
 		if children, exists := nested[name]; exists && strings.TrimSpace(string(raw)) != "null" {
-			if err := validateJSONObjectRaw(raw, children); err != nil {
+			required := children
+			if name == "subject" {
+				required = []string{"common_name"}
+			}
+			if err := validateJSONObjectRawRequired(raw, children, required); err != nil {
 				writeSetupError(w, http.StatusUnprocessableEntity, "invalid_request", "The nested object is invalid.", requestID, nil)
 				return false
+			}
+			if name == "subject" {
+				var subject map[string]json.RawMessage
+				if err := json.Unmarshal(raw, &subject); err != nil {
+					return false
+				}
+				valid := true
+				for field, value := range subject {
+					var text string
+					if err := json.Unmarshal(value, &text); err != nil || utf8.RuneCountInString(text) < 1 || utf8.RuneCountInString(text) > 255 || (field == "country" && (len(text) != 2 || text[0] < 'A' || text[0] > 'Z' || text[1] < 'A' || text[1] > 'Z')) {
+						valid = false
+					}
+				}
+				clearJSONFields(subject)
+				if !valid {
+					writeSetupError(w, http.StatusUnprocessableEntity, "invalid_subject", "The subject is invalid.", requestID, nil)
+					return false
+				}
 			}
 		}
 	}

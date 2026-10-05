@@ -217,6 +217,10 @@ func toSettingsResponse(view contract.SettingsView) settingsResponse {
 }
 
 func validateJSONObjectRaw(raw json.RawMessage, allowed []string) error {
+	return validateJSONObjectRawRequired(raw, allowed, allowed)
+}
+
+func validateJSONObjectRawRequired(raw json.RawMessage, allowed, required []string) error {
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
 	first, err := decoder.Token()
 	if err != nil || first != json.Delim('{') {
@@ -247,11 +251,20 @@ func validateJSONObjectRaw(raw json.RawMessage, allowed []string) error {
 		if err := decoder.Decode(&value); err != nil {
 			return err
 		}
+		if strings.TrimSpace(string(value)) == "null" {
+			zeroBytes(value)
+			return errInvalidJSONShape
+		}
 		zeroBytes(value)
 	}
 	closing, err := decoder.Token()
-	if err != nil || closing != json.Delim('}') || len(seen) != 2 {
+	if err != nil || closing != json.Delim('}') {
 		return errInvalidJSONShape
+	}
+	for _, field := range required {
+		if _, exists := seen[field]; !exists {
+			return errInvalidJSONShape
+		}
 	}
 	var trailing json.RawMessage
 	if err := decoder.Decode(&trailing); err != io.EOF {
