@@ -146,6 +146,28 @@ func TestExternalMigrationCatalogPrefixDiagnostic(t *testing.T) {
 					t.Errorf("close disposable database: %v", err)
 				}
 			}()
+			if kind == config.MariaDB {
+				rows, err := handle.ReadDB().QueryContext(ctx, `SELECT column_name FROM information_schema.columns
+					WHERE table_schema='information_schema' AND table_name='check_constraints' ORDER BY ordinal_position`)
+				if err != nil {
+					t.Fatalf("read MariaDB CHECK_CONSTRAINTS columns: %v", err)
+				}
+				var columns []string
+				for rows.Next() {
+					var column string
+					if err := rows.Scan(&column); err != nil {
+						rows.Close()
+						t.Fatalf("scan MariaDB CHECK_CONSTRAINTS column: %v", err)
+					}
+					columns = append(columns, column)
+				}
+				if err := rows.Err(); err != nil {
+					rows.Close()
+					t.Fatalf("iterate MariaDB CHECK_CONSTRAINTS columns: %v", err)
+				}
+				rows.Close()
+				t.Logf("MariaDB CHECK_CONSTRAINTS columns=%v", columns)
+			}
 
 			plan, err := loadPlan(kind)
 			if err != nil {
@@ -201,6 +223,47 @@ func TestExternalMigrationCatalogPrefixDiagnostic(t *testing.T) {
 				t.Logf("closest catalog phase=%s differences=%v", phase, catalogDifferences(actual, expected, kind))
 			}
 		})
+	}
+}
+
+func TestExternalPostgresCatalogExcludesIntrinsicNotNullConstraints(t *testing.T) {
+	databaseName := os.Getenv("CERTME_CATALOG_TEST_POSTGRES_DATABASE")
+	if databaseName == "" {
+		t.Skip("dedicated PostgreSQL catalog database is not configured")
+	}
+	database, ok := migrationDiagnosticDatabase(t, config.Postgres)
+	if !ok {
+		t.Skip("disposable PostgreSQL database connection is not configured")
+	}
+	defer database.Password.Close()
+	database.DatabaseName = databaseName
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	handle, err := connection.Open(ctx, database, connection.Options{})
+	if err != nil {
+		t.Fatal("could not open dedicated PostgreSQL catalog database")
+	}
+	defer func() {
+		if err := handle.Close(); err != nil {
+			t.Errorf("close dedicated PostgreSQL catalog database: %v", err)
+		}
+	}()
+
+	actual, err := readCatalog(ctx, handle.ReadDB(), config.Postgres)
+	if err != nil {
+		t.Fatalf("read dedicated PostgreSQL catalog: %v", err)
+	}
+	plan, err := loadPlan(config.Postgres)
+	if err != nil {
+		t.Fatalf("load PostgreSQL migration plan: %v", err)
+	}
+	got, ok := actual.tables["schema_migrations"]
+	if !ok {
+		t.Fatal("dedicated PostgreSQL catalog has no schema_migrations table")
+	}
+	want := plan.full[0].tables["schema_migrations"]
+	if !sameTable(got, want, config.Postgres) {
+		t.Fatalf("intrinsic NOT NULL constraints changed the reviewed schema_migrations shape: got %d constraints, want %d", len(got.constraints), len(want.constraints))
 	}
 }
 
