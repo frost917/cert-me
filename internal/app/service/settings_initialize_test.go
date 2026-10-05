@@ -149,8 +149,8 @@ func TestSettingsServiceInitializeCreatesCompleteVersionOneSnapshotAndAudit(t *t
 		t.Fatalf("URL validation calls = %v, want exactly the supplied service_url", validated)
 	}
 	events := f.store.AuditEvents()
-	if len(events) != 1 || events[0].Action != "settings.initialize" || events[0].TargetType != "settings" || events[0].TargetID != "" {
-		t.Fatalf("audit events = %+v, want one settings.initialize event", events)
+	if len(events) != 1 || events[0].Action != "settings.update" || events[0].Details.Fields["operation"] != "initialize" || events[0].TargetType != "settings" || events[0].TargetID != "" {
+		t.Fatal("initial settings must use the compatible installation audit action with explicit initialization metadata")
 	}
 	scopes := f.store.AuditScopes()
 	if len(scopes) != 1 || scopes[0].Kind() != port.AuditScopeInstallation {
