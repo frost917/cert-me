@@ -8,9 +8,16 @@ import (
 
 func TestMySQLCatalogCheckNormalizationMatchesRoundTrippedExpression(t *testing.T) {
 	want := normalizeCheck("state IN ('applying','applied','failed')", config.MySQL)
-	got := normalizeCheck("((`state` IN (_utf8mb4'applying',_utf8mb4'applied',_utf8mb4'failed'))) ", config.MySQL)
-	if got != want {
-		t.Fatalf("normalized MySQL check differs: got %q, want %q", got, want)
+	for name, expression := range map[string]string{
+		"charset introducers":    "((`state` IN (_utf8mb4'applying',_utf8mb4'applied',_utf8mb4'failed'))) ",
+		"escaped catalog quotes": "((`state` IN (_utf8mb4\\'applying\\',_utf8mb4\\'applied\\',_utf8mb4\\'failed\\'))) ",
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := normalizeCheck(expression, config.MySQL)
+			if got != want {
+				t.Fatalf("normalized MySQL check differs: got %q, want %q", got, want)
+			}
+		})
 	}
 }
 
