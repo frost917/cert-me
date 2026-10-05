@@ -20,7 +20,7 @@ const response = (status, data, headers = {}) => ({
 });
 const settle = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
 
-function browserFixture({ reset = false, exists = false, failCreate = false, loseCreate = false, concurrentCreate = false } = {}) {
+function browserFixture({ reset = false, exists = false, failCreate = false, loseCreate = false, concurrentCreate = false, loseBody = false } = {}) {
   const nodes = new Map();
   const node = id => {
     if (!nodes.has(id)) nodes.set(id, { hidden: true, textContent: "", value: "", events: {}, elements: {},
@@ -46,6 +46,7 @@ function browserFixture({ reset = false, exists = false, failCreate = false, los
       exists = true;
       if (loseCreate) throw new TypeError("Disposable test connection interrupted.");
       if (concurrentCreate) return response(409, { error: { code: "settings_already_configured", message: "Existing settings." } });
+      if (loseBody) return { ...response(201, null), json: async () => { throw new TypeError("Disposable truncated response."); } };
       return response(201, { data: { ...settings, version: 1 } }, { ETag: '"v1"' });
     }
     if (url === "/api/v1/settings" && options.method === "PATCH") {
@@ -101,6 +102,11 @@ export async function verifyStage3UI() {
   await settle();
   await concurrent.form.events.submit({ preventDefault() {}, currentTarget: concurrent.form });
   assert.equal(concurrent.node("setup-complete-panel").hidden, false, "concurrent creation must recover through GET");
+
+  const partial = browserFixture({ loseBody: true });
+  await settle();
+  await partial.form.events.submit({ preventDefault() {}, currentTarget: partial.form });
+  assert.equal(partial.node("setup-complete-panel").hidden, false, "interrupted creation body must recover through GET");
 
   const reset = browserFixture({ reset: true });
   await settle();
