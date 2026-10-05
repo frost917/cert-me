@@ -20,7 +20,7 @@ const response = (status, data, headers = {}) => ({
 });
 const settle = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
 
-function browserFixture({ reset = false, exists = false, failCreate = false } = {}) {
+function browserFixture({ reset = false, exists = false, failCreate = false, loseCreate = false } = {}) {
   const nodes = new Map();
   const node = id => {
     if (!nodes.has(id)) nodes.set(id, { hidden: true, textContent: "", value: "", events: {}, elements: {},
@@ -41,9 +41,10 @@ function browserFixture({ reset = false, exists = false, failCreate = false } = 
     if (url === "/api/v1/setup") return response(200, { data: { setup_stage: "pki_required", bootstrap_https: true } });
     if (url === "/api/v1/auth/me") return response(200, { data: { account: { login_name: "operator" } } });
     if (url.startsWith("/api/v1/auth/csrf")) return response(200, { data: { csrf_token: "unit-test-csrf" } });
-    if (url === "/api/v1/setup/settings") {
+	    if (url === "/api/v1/setup/settings") {
       if (failCreate) return response(422, { error: { code: "invalid_service_url", message: "Invalid service address." } });
       exists = true;
+      if (loseCreate) throw new TypeError("Disposable test connection interrupted.");
       return response(201, { data: { ...settings, version: 1 } }, { ETag: '"v1"' });
     }
     if (url === "/api/v1/settings" && options.method === "PATCH") {
@@ -57,7 +58,7 @@ function browserFixture({ reset = false, exists = false, failCreate = false } = 
   const window = { location: { pathname: reset ? "/reset-password/disposable-test-token" : "/" },
     history: { replaceState: (_state, _title, url) => history.push(url) },
     htmx: { config: {} } };
-  runInNewContext(script, { window, document: { body: { dataset: { page: reset ? "reset" : "app" } }, getElementById: node }, fetch, console });
+  runInNewContext(script, { window, document: { body: { dataset: { page: reset ? "reset" : "app" } }, getElementById: node }, fetch, console, TypeError });
   return { node, calls, history, window, form };
 }
 
@@ -85,6 +86,15 @@ export async function verifyStage3UI() {
   await failed.form.events.submit({ preventDefault() {}, currentTarget: failed.form });
   assert.equal(failed.node("setup-complete-panel").hidden, true);
   assert.equal(failed.node("settings-result").textContent, "Invalid service address.");
+
+  const lost = browserFixture({ loseCreate: true });
+  await settle();
+  await lost.form.events.submit({ preventDefault() {}, currentTarget: lost.form });
+  assert.equal(lost.node("setup-complete-panel").hidden, false, "lost creation response must recover the committed settings through GET");
+  assert.equal(lost.calls.filter(call => call.url === "/api/v1/setup/settings").length, 1);
+  lost.form.elements.rotate_every.value = "4";
+  await lost.form.events.submit({ preventDefault() {}, currentTarget: lost.form });
+  assert.ok(lost.calls.some(call => call.method === "PATCH" && call.headers["If-Match"] === '"v1"'));
 
   const reset = browserFixture({ reset: true });
   await settle();
