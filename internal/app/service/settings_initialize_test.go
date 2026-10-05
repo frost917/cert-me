@@ -149,7 +149,7 @@ func TestSettingsServiceInitializeCreatesCompleteVersionOneSnapshotAndAudit(t *t
 		t.Fatalf("URL validation calls = %v, want exactly the supplied service_url", validated)
 	}
 	events := f.store.AuditEvents()
-	if len(events) != 1 || events[0].Action != "settings.initialize" || events[0].TargetID != settingsAuditTargetID {
+	if len(events) != 1 || events[0].Action != "settings.initialize" || events[0].TargetType != "settings" || events[0].TargetID != "" {
 		t.Fatalf("audit events = %+v, want one settings.initialize event", events)
 	}
 	scopes := f.store.AuditScopes()
