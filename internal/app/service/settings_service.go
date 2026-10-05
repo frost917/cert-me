@@ -54,14 +54,11 @@ func NewSettingsService(deps SettingsDeps) (*SettingsService, error) {
 	return &SettingsService{deps: deps}, nil
 }
 
-// settingsAuditTargetID is the fixed target id for every settings audit
-// event, matching the fixed PK=1 service_settings row
-// (docs/data-model.md "고정 PK=1").
-const settingsAuditTargetID = "1"
-
 // Settings is installation-wide: service_settings has a fixed PK=1 and no
 // authority relation. Keep that fact explicit in the audit port instead of
-// encoding installation scope as an empty authority list.
+// encoding installation scope as an empty authority list. Audit target_id
+// holds optional UUIDs, so this singleton is identified by target_type and
+// installation scope, not by copying its integer primary key into target_id.
 func settingsScope() port.AuditScope { return port.NewInstallationAuditScope() }
 
 // Get returns the current settings snapshot. It is a plain authorized read:
@@ -195,7 +192,6 @@ func (s *SettingsService) Update(ctx context.Context, meta contract.MutationMeta
 			ActorID:    string(meta.Principal.AccountID()),
 			Action:     "settings.update",
 			TargetType: "settings",
-			TargetID:   settingsAuditTargetID,
 			ClientIP:   clientIP(meta.RequestMeta),
 			Result:     contract.AuditResultSuccess,
 			Details:    contract.AuditDetails{SchemaVersion: 1},

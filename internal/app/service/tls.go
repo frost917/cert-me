@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"cert-me/internal/app/contract"
 	"cert-me/internal/app/port"
@@ -788,7 +789,10 @@ func (s *TLSService) prepareBootstrap(ctx context.Context, existing *domain.Auth
 	if err != nil {
 		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
 	}
-	window, err := validity.Window(x509NotBefore(now))
+	// Bootstrap must be usable in this same startup. X.509 timestamps have
+	// second precision; rounding up would make the new issuer not yet valid
+	// for the immediate leaf plan and chain verification below.
+	window, err := validity.Window(domain.NewInstant(now.Time().Truncate(time.Second)))
 	if err != nil {
 		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
 	}

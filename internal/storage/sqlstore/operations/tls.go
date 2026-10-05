@@ -273,7 +273,8 @@ func scanTLSVersion(row rowScanner) (domain.TLSVersion, error) {
 }
 
 func scanTLSChange(row rowScanner) (domain.TLSChange, error) {
-	var previous, candidate, phase string
+	var previous sql.NullString
+	var candidate, phase string
 	var errorCode sql.NullString
 	var version int64
 	if err := row.Scan(&previous, &candidate, &phase, &errorCode, &version); err != nil {
@@ -283,8 +284,8 @@ func scanTLSChange(row rowScanner) (domain.TLSChange, error) {
 		return domain.TLSChange{}, fmt.Errorf("TLS change version is negative")
 	}
 	facts := domain.TLSChangeFacts{CandidateVersionID: domain.TLSVersionID(candidate), Phase: domain.TLSChangePhase(phase), Version: domain.Version(version)}
-	if previous != "" {
-		facts.PreviousVersionID = domain.TLSVersionID(previous)
+	if previous.Valid {
+		facts.PreviousVersionID = domain.TLSVersionID(previous.String)
 	}
 	if errorCode.Valid {
 		facts.ErrorCode = errorCode.String

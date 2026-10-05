@@ -3,7 +3,9 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -54,8 +56,7 @@ func runRuntimeInitialHTTPSAdminFlow(t *testing.T, database runtimeDBSpec) {
 	if !app.gate.OpenAdmission() {
 		t.Fatal("could not open runtime request admission")
 	}
-	server := startRuntimeIntegrationHTTPS(t, app)
-	client := server.Client()
+	server, client := startRuntimeIntegrationHTTPS(t, app)
 	origin := server.URL
 
 	setupResponse := mustRequest(t, client, http.MethodGet, origin+"/api/v1/setup", nil, nil, nil)
@@ -305,9 +306,9 @@ func runRuntimeInitialHTTPSAdminFlow(t *testing.T, database runtimeDBSpec) {
 	if !reopened.gate.OpenAdmission() {
 		t.Fatal("could not open admission after runtime restart")
 	}
-	restartedServer := startRuntimeIntegrationHTTPS(t, reopened)
+	restartedServer, restartedClient := startRuntimeIntegrationHTTPS(t, reopened)
 	restartedOrigin := restartedServer.URL
-	restartedSetup := mustRequest(t, restartedServer.Client(), http.MethodGet, restartedOrigin+"/api/v1/setup", nil, nil, nil)
+	restartedSetup := mustRequest(t, restartedClient, http.MethodGet, restartedOrigin+"/api/v1/setup", nil, nil, nil)
 	if restartedSetup.StatusCode != http.StatusOK {
 		failWithAPIStatus(t, restartedSetup, http.StatusOK)
 	}
@@ -321,7 +322,7 @@ func runRuntimeInitialHTTPSAdminFlow(t *testing.T, database runtimeDBSpec) {
 	if restartedStatus.Data.SetupStage != "pki_required" || !restartedStatus.Data.BootstrapHTTPS {
 		t.Fatal("restart did not restore the administrator setup stage and bootstrap HTTPS state")
 	}
-	restartedMe := mustRequest(t, restartedServer.Client(), http.MethodGet, restartedOrigin+"/api/v1/auth/me", nil, sessionCookie, nil)
+	restartedMe := mustRequest(t, restartedClient, http.MethodGet, restartedOrigin+"/api/v1/auth/me", nil, sessionCookie, nil)
 	if restartedMe.StatusCode != http.StatusOK {
 		failWithAPIStatus(t, restartedMe, http.StatusOK)
 	}
@@ -329,7 +330,7 @@ func runRuntimeInitialHTTPSAdminFlow(t *testing.T, database runtimeDBSpec) {
 	if me.Data.Account.LoginName != "runtime-admin" || !me.Data.Account.IsGlobalAdmin {
 		t.Fatal("runtime restart did not preserve the authenticated administrator session")
 	}
-	restartedSettings := mustRequest(t, restartedServer.Client(), http.MethodGet, restartedOrigin+"/api/v1/settings", nil, sessionCookie, nil)
+	restartedSettings := mustRequest(t, restartedClient, http.MethodGet, restartedOrigin+"/api/v1/settings", nil, sessionCookie, nil)
 	if restartedSettings.StatusCode != http.StatusOK || restartedSettings.Header.Get("ETag") != `"v2"` {
 		failWithAPIStatus(t, restartedSettings, http.StatusOK)
 	}
@@ -437,13 +438,42 @@ func openRuntimeIntegrationApp(t *testing.T, database runtimeDBSpec) *App {
 	return app
 }
 
-func startRuntimeIntegrationHTTPS(t *testing.T, app *App) *httptest.Server {
+func startRuntimeIntegrationHTTPS(t *testing.T, app *App) (*httptest.Server, *http.Client) {
 	t.Helper()
+	active, err := app.readActiveTLS(context.Background())
+	if err != nil {
+		t.Fatalf("read active runtime TLS snapshot: %v", err)
+	}
+	chain := active.ChainBundle()
+	block, rest := pem.Decode(chain)
+	if block == nil || block.Type != "CERTIFICATE" || len(bytes.TrimSpace(rest)) != 0 {
+		t.Fatal("bootstrap TLS snapshot has an invalid CA chain bundle")
+	}
+	bootstrapRoot, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse bootstrap trust anchor: %v", err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(bootstrapRoot)
+
 	server := httptest.NewUnstartedServer(app.server.Handler)
 	server.TLS = app.tlsManager.ServerConfig()
 	server.StartTLS()
 	t.Cleanup(server.Close)
-	return server
+	client := server.Client()
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		server.Close()
+		t.Fatal("HTTPS test server returned an unexpected transport")
+	}
+	transport = transport.Clone()
+	tlsConfig := transport.TLSClientConfig.Clone()
+	tlsConfig.InsecureSkipVerify = false
+	tlsConfig.RootCAs = roots
+	tlsConfig.ServerName = "cert-me"
+	transport.TLSClientConfig = tlsConfig
+	client.Transport = transport
+	return server, client
 }
 
 func getPreAuthCSRF(t *testing.T, client *http.Client, origin string) preAuthCredential {

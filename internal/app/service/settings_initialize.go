@@ -95,12 +95,11 @@ func (s *SettingsService) Initialize(ctx context.Context, meta contract.Mutation
 			OccurredAt: now,
 			ActorKind:  contract.AuditActorAccount,
 			ActorID:    string(meta.Principal.AccountID()),
-			Action:     "settings.initialize",
+			Action:     "settings.update",
 			TargetType: "settings",
-			TargetID:   settingsAuditTargetID,
 			ClientIP:   clientIP(meta.RequestMeta),
 			Result:     contract.AuditResultSuccess,
-			Details:    contract.AuditDetails{SchemaVersion: settingsSchemaVersionV1},
+			Details:    contract.AuditDetails{SchemaVersion: settingsSchemaVersionV1, Fields: map[string]string{"operation": "initialize"}},
 		}
 		if err := tx.Audit().Append(ctx, event, settingsScope()); err != nil {
 			return storeError(err, "settings_audit_failed", "could not record the settings audit event")
