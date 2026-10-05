@@ -243,8 +243,10 @@
     try {
       if (settingsSnapshot === null) {
         let response;
+        let initialized;
         try {
           response = await sendJSON("/api/v1/setup/settings", "POST", currentSettings(form), true);
+          initialized = (await response.json()).data;
         } catch (error) {
           // A committed creation is never retried as an overwrite. Recover
           // its version through the authorized read after a lost response
@@ -258,7 +260,7 @@
           }
           throw error;
         }
-        settingsSnapshot = (await response.json()).data;
+        settingsSnapshot = initialized;
         settingsETag = response.headers.get("ETag") || "";
         fillSettings(settingsSnapshot);
         byID("settings-unavailable").hidden = true;
