@@ -20,7 +20,7 @@ const response = (status, data, headers = {}) => ({
 });
 const settle = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
 
-function browserFixture({ reset = false, exists = false, failCreate = false, loseCreate = false } = {}) {
+function browserFixture({ reset = false, exists = false, failCreate = false, loseCreate = false, concurrentCreate = false } = {}) {
   const nodes = new Map();
   const node = id => {
     if (!nodes.has(id)) nodes.set(id, { hidden: true, textContent: "", value: "", events: {}, elements: {},
@@ -45,6 +45,7 @@ function browserFixture({ reset = false, exists = false, failCreate = false, los
       if (failCreate) return response(422, { error: { code: "invalid_service_url", message: "Invalid service address." } });
       exists = true;
       if (loseCreate) throw new TypeError("Disposable test connection interrupted.");
+      if (concurrentCreate) return response(409, { error: { code: "settings_already_configured", message: "Existing settings." } });
       return response(201, { data: { ...settings, version: 1 } }, { ETag: '"v1"' });
     }
     if (url === "/api/v1/settings" && options.method === "PATCH") {
@@ -95,6 +96,11 @@ export async function verifyStage3UI() {
   lost.form.elements.rotate_every.value = "4";
   await lost.form.events.submit({ preventDefault() {}, currentTarget: lost.form });
   assert.ok(lost.calls.some(call => call.method === "PATCH" && call.headers["If-Match"] === '"v1"'));
+
+  const concurrent = browserFixture({ concurrentCreate: true });
+  await settle();
+  await concurrent.form.events.submit({ preventDefault() {}, currentTarget: concurrent.form });
+  assert.equal(concurrent.node("setup-complete-panel").hidden, false, "concurrent creation must recover through GET");
 
   const reset = browserFixture({ reset: true });
   await settle();
