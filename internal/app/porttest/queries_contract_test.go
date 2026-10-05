@@ -137,6 +137,73 @@ func TestQueryCursorIsExclusive(t *testing.T) {
 	}
 }
 
+func TestManagedAuthorityFilterRunsBeforePagingAndDefaultsToInternalView(t *testing.T) {
+	store := NewStore()
+	seedAuthorities(t, store)
+	bootstrapID := domain.AuthorityID("00000000-0000-4000-8000-000000000001")
+	bootstrap, err := domain.NewAuthority(domain.AuthorityFacts{
+		ID:              bootstrapID,
+		Kind:            domain.AuthorityKindBootstrap,
+		Name:            "internal-bootstrap",
+		IssuanceState:   domain.IssuanceStateInventory,
+		KeyGenerationID: domain.CAKeyGenerationID("00000000-0000-4000-8000-000000000002"),
+		KeyAvailable:    true,
+		Version:         1,
+	})
+	if err != nil {
+		t.Fatalf("NewAuthority bootstrap: %v", err)
+	}
+	if err := store.Write(context.Background(), func(tx port.TxStores) error {
+		return tx.PKI().InsertAuthority(context.Background(), bootstrap)
+	}); err != nil {
+		t.Fatalf("insert bootstrap authority: %v", err)
+	}
+
+	ctx := context.Background()
+	var internalPage contract.Page[port.QueriedAuthority]
+	err = store.Read(ctx, func(tx port.TxStores) error {
+		var err error
+		internalPage, err = tx.Queries().ListAuthorities(ctx,
+			contract.AuthorityListQuery{Page: contract.PageRequest{Limit: 1}}, port.QueryScope{All: true})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("internal ListAuthorities: %v", err)
+	}
+	if len(internalPage.Items) != 1 || internalPage.Items[0].Authority.ID() != bootstrapID {
+		t.Fatalf("internal first page = %#v, want bootstrap %q", internalPage.Items, bootstrapID)
+	}
+
+	var first, second contract.Page[port.QueriedAuthority]
+	err = store.Read(ctx, func(tx port.TxStores) error {
+		var err error
+		first, err = tx.Queries().ListAuthorities(ctx, contract.AuthorityListQuery{
+			ManagedOnly: true,
+			Page:        contract.PageRequest{Limit: 2},
+		}, port.QueryScope{All: true})
+		if err != nil {
+			return err
+		}
+		if first.NextCursor == nil {
+			return nil
+		}
+		second, err = tx.Queries().ListAuthorities(ctx, contract.AuthorityListQuery{
+			ManagedOnly: true,
+			Page:        contract.PageRequest{Limit: 2, Cursor: *first.NextCursor},
+		}, port.QueryScope{All: true})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("managed ListAuthorities: %v", err)
+	}
+	if len(first.Items) != 2 || first.Items[0].Authority.ID() != domain.AuthorityID(authAID) || first.Items[1].Authority.ID() != domain.AuthorityID(authBID) {
+		t.Fatalf("first managed page = %#v, want A and B", first.Items)
+	}
+	if len(second.Items) != 1 || second.Items[0].Authority.ID() != domain.AuthorityID(authCID) || second.NextCursor != nil {
+		t.Fatalf("second managed page = %#v, want C and no cursor", second)
+	}
+}
+
 // TestQueryGetOutOfScopeIsNotFound checks that an out-of-scope row is
 // indistinguishable from a missing one, so a reader cannot probe for the
 // existence of a range it may not see.

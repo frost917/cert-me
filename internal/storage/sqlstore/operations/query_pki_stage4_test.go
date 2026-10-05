@@ -51,13 +51,16 @@ func TestQueryRepositoryStage4ProjectionsReadPersistedRows(t *testing.T) {
 	}
 
 	const (
-		authorityID = "11111111-1111-4111-8111-111111111111"
-		caKeyGenID  = "22222222-2222-4222-8222-222222222222"
-		keyID       = "33333333-3333-4333-8333-333333333333"
-		seriesID    = "44444444-4444-4444-8444-444444444444"
-		leafGenID   = "55555555-5555-4555-8555-555555555555"
-		certID      = "66666666-6666-4666-8666-666666666666"
-		deliveryID  = "77777777-7777-4777-8777-777777777777"
+		authorityID         = "11111111-1111-4111-8111-111111111111"
+		caKeyGenID          = "22222222-2222-4222-8222-222222222222"
+		keyID               = "33333333-3333-4333-8333-333333333333"
+		seriesID            = "44444444-4444-4444-8444-444444444444"
+		leafGenID           = "55555555-5555-4555-8555-555555555555"
+		certID              = "66666666-6666-4666-8666-666666666666"
+		deliveryID          = "77777777-7777-4777-8777-777777777777"
+		bootstrapID         = "00000000-0000-4000-8000-000000000001"
+		bootstrapCAKeyGenID = "00000000-0000-4000-8000-000000000002"
+		bootstrapKeyID      = "00000000-0000-4000-8000-000000000003"
 	)
 	const authorityCreatedAt int64 = 1_700_000_000_000_001
 	const seriesCreatedAt int64 = 1_700_000_000_000_002
@@ -82,8 +85,20 @@ func TestQueryRepositoryStage4ProjectionsReadPersistedRows(t *testing.T) {
 			args:  []any{caKeyGenID, authorityID, keyID},
 		},
 		{
+			query: `INSERT INTO authorities (id, created_at, kind, name, management_parent_id, issuance_state, issuance_certificate_id, archived_at, version) VALUES (?, ?, 'bootstrap', 'query-bootstrap', NULL, 'inventory', NULL, NULL, 1)`,
+			args:  []any{bootstrapID, authorityCreatedAt + 1},
+		},
+		{
+			query: `INSERT INTO ca_key_generations (id, authority_id, key_material_id, generation_no, key_destroyed_at) VALUES (?, ?, ?, 1, NULL)`,
+			args:  []any{bootstrapCAKeyGenID, bootstrapID, bootstrapKeyID},
+		},
+		{
 			query: `INSERT INTO key_materials (id, algorithm) VALUES (?, 'ecdsa_p256')`,
 			args:  []any{keyID},
+		},
+		{
+			query: `INSERT INTO key_materials (id, algorithm) VALUES (?, 'ecdsa_p256')`,
+			args:  []any{bootstrapKeyID},
 		},
 		{
 			query: `INSERT INTO leaf_series (id, created_at, name, purpose, management_authority_id, current_certificate_id, current_key_generation_id, validity_policy_json, version, archived_at) VALUES (?, ?, 'query-leaf', 'distributed', ?, ?, ?, '{"schema_version":1,"rotate_every":3,"validity":{"value":1,"unit":"years"}}', 1, ?)`,
@@ -123,7 +138,7 @@ func TestQueryRepositoryStage4ProjectionsReadPersistedRows(t *testing.T) {
 	scope := port.QueryScope{All: true}
 
 	t.Run("authority list and get retain stored created_at", func(t *testing.T) {
-		page, err := repo.ListAuthorities(ctx, contract.AuthorityListQuery{Page: contract.PageRequest{Limit: 10}}, scope)
+		page, err := repo.ListAuthorities(ctx, contract.AuthorityListQuery{ManagedOnly: true, Page: contract.PageRequest{Limit: 10}}, scope)
 		if err != nil {
 			t.Fatalf("ListAuthorities: %v", err)
 		}
@@ -139,6 +154,20 @@ func TestQueryRepositoryStage4ProjectionsReadPersistedRows(t *testing.T) {
 		}
 		if got := item.CreatedAt; !got.Equal(domain.InstantFromUnixMicro(authorityCreatedAt)) {
 			t.Errorf("authority created_at = %s, want persisted %d", got, authorityCreatedAt)
+		}
+		internalPage, err := repo.ListAuthorities(ctx, contract.AuthorityListQuery{Page: contract.PageRequest{Limit: 10}}, scope)
+		if err != nil {
+			t.Fatalf("internal ListAuthorities: %v", err)
+		}
+		if len(internalPage.Items) != 2 || internalPage.Items[0].Authority.ID() != domain.AuthorityID(bootstrapID) {
+			t.Fatalf("internal authority list = %#v, want bootstrap and root", internalPage.Items)
+		}
+		internalBootstrap, err := repo.GetAuthority(ctx, domain.AuthorityID(bootstrapID), scope)
+		if err != nil {
+			t.Fatalf("internal GetAuthority bootstrap: %v", err)
+		}
+		if internalBootstrap.Authority.Kind() != domain.AuthorityKindBootstrap {
+			t.Fatalf("internal bootstrap kind = %q", internalBootstrap.Authority.Kind())
 		}
 	})
 

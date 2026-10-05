@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"cert-me/internal/app/contract"
@@ -236,6 +237,54 @@ func TestQueryServiceAuthorityProjectionUsesStoredCreatedAtAndCRLInOneRead(t *te
 			}
 		})
 	}
+}
+
+func TestQueryServiceManagedAuthorityQueriesHideBootstrapAuthority(t *testing.T) {
+	f := newQueryFixture(t)
+	bootstrapID := seedQueryBootstrapAuthority(t, f)
+
+	page, err := f.svc.ListAuthorities(context.Background(), f.meta(), contract.AuthorityListQuery{
+		Page: contract.PageRequest{Limit: 1},
+	})
+	if err != nil {
+		t.Fatalf("ListAuthorities: %v", err)
+	}
+	if len(page.Items) != 1 || page.Items[0].ID != f.authorityID {
+		t.Fatalf("managed first page = %#v, want only root %q (bootstrap %q must not consume a page slot)", page.Items, f.authorityID, bootstrapID)
+	}
+	if page.NextCursor != nil {
+		t.Fatalf("managed authority list has unexpected cursor %q", *page.NextCursor)
+	}
+
+	_, err = f.svc.GetAuthority(context.Background(), f.meta(), contract.AuthorityGetQuery{AuthorityID: bootstrapID})
+	var appErr *contract.AppError
+	if !errors.As(err, &appErr) || appErr.Code() != "not_found" {
+		t.Fatalf("GetAuthority(bootstrap) error = %v, want indistinguishable not_found", err)
+	}
+}
+
+func seedQueryBootstrapAuthority(t *testing.T, f *queryFixture) domain.AuthorityID {
+	t.Helper()
+	id := domain.AuthorityID("00000000-0000-4000-8000-000000000001")
+	keyGenerationID := domain.CAKeyGenerationID("00000000-0000-4000-8000-000000000002")
+	authority, err := domain.NewAuthority(domain.AuthorityFacts{
+		ID:              id,
+		Kind:            domain.AuthorityKindBootstrap,
+		Name:            "query-bootstrap",
+		IssuanceState:   domain.IssuanceStateInventory,
+		KeyGenerationID: keyGenerationID,
+		KeyAvailable:    true,
+		Version:         1,
+	})
+	if err != nil {
+		t.Fatalf("new bootstrap authority: %v", err)
+	}
+	if err := f.store.Write(context.Background(), func(tx port.TxStores) error {
+		return tx.PKI().InsertAuthority(context.Background(), authority)
+	}); err != nil {
+		t.Fatalf("insert bootstrap authority: %v", err)
+	}
+	return id
 }
 
 type stage4AuthorityProjectionReadStore struct {
