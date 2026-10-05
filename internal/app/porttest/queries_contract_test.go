@@ -70,7 +70,7 @@ func TestQueryScopeAppliedBeforePaging(t *testing.T) {
 	store := NewStore()
 	seedAuthorities(t, store)
 
-	var page contract.Page[domain.Authority]
+	var page contract.Page[port.QueriedAuthority]
 	err := store.Read(context.Background(), func(tx port.TxStores) error {
 		var err error
 		page, err = tx.Queries().ListAuthorities(context.Background(),
@@ -86,8 +86,8 @@ func TestQueryScopeAppliedBeforePaging(t *testing.T) {
 	if len(page.Items) != 2 {
 		t.Fatalf("want 2 in-scope authorities in one page, got %d", len(page.Items))
 	}
-	if page.Items[0].ID() != domain.AuthorityID(authAID) || page.Items[1].ID() != domain.AuthorityID(authCID) {
-		t.Fatalf("want A and C, got %q and %q", page.Items[0].ID(), page.Items[1].ID())
+	if page.Items[0].Authority.ID() != domain.AuthorityID(authAID) || page.Items[1].Authority.ID() != domain.AuthorityID(authCID) {
+		t.Fatalf("want A and C, got %q and %q", page.Items[0].Authority.ID(), page.Items[1].Authority.ID())
 	}
 	if page.NextCursor != nil {
 		t.Fatalf("want an exhausted page, got cursor %q", *page.NextCursor)
@@ -104,7 +104,7 @@ func TestQueryCursorIsExclusive(t *testing.T) {
 	var seen []domain.AuthorityID
 	cursor := ""
 	for step := 0; step < 5; step++ {
-		var page contract.Page[domain.Authority]
+		var page contract.Page[port.QueriedAuthority]
 		err := store.Read(ctx, func(tx port.TxStores) error {
 			var err error
 			page, err = tx.Queries().ListAuthorities(ctx,
@@ -116,7 +116,7 @@ func TestQueryCursorIsExclusive(t *testing.T) {
 			t.Fatalf("ListAuthorities: %v", err)
 		}
 		for _, a := range page.Items {
-			seen = append(seen, a.ID())
+			seen = append(seen, a.Authority.ID())
 		}
 		if page.NextCursor == nil {
 			break
