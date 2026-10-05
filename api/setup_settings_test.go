@@ -39,3 +39,17 @@ func TestInitialSettingsContract(t *testing.T) {
 		t.Fatal("partial initial settings must be rejected")
 	}
 }
+
+func TestSetupCompletionBodyContract(t *testing.T) {
+	doc, err := openapi3.NewLoader().LoadFromFile("openapi.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := doc.Paths.Find("/api/v1/setup/complete").Post
+	if op.RequestBody.Value.Required {
+		t.Fatal("setup completion must accept the UI's bodyless versioned request")
+	}
+	if err := op.RequestBody.Value.Content["application/json"].Schema.Value.VisitJSON(map[string]any{"unexpected": "value"}); err == nil {
+		t.Fatal("setup completion must reject fields outside its empty command")
+	}
+}
