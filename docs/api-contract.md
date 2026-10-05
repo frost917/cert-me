@@ -56,9 +56,14 @@
 | GET `/auth/me` | 계정과 세션 만료 시각 |
 | POST `/auth/password-reset` | reset_token, new_password → 소비·비밀번호 변경·세션 삭제, 204 |
 | GET / PATCH `/settings` | 전체 설정 조회 / 허용된 설정 필드 수정, If-Match |
+| POST `/setup/settings` | 관리자 세션+CSRF. `pki_required`이며 설정이 없을 때 전체 설정을 명시 입력해 최초 생성, 201·Settings·ETag·Location |
 | POST `/setup/complete` | 설정 version → URL·최소 한 Root·선택한 생성/import 절차 완료 검증 |
 
 재설정 링크 화면은 `/reset-password/{token}`이며 GET은 토큰을 소비하지 않는다. 웹 API에는 재설정 링크 발급 경로가 없다. 내부 CLI만 발급하며 유효기간은 3시간이다. 설정 완료는 서명 불가능한 이력 보관용 import도 허용한다. signer 활성화는 별도 CA 조건을 검사한다.
+
+setup 완료의 version은 If-Match로 전달한다. 본문은 생략하거나 빈 JSON 객체 `{}`만 허용하며, 필드가 있는 객체·잘못된 JSON·초과 크기는 서비스 호출 전에 거부한다.
+
+최초 설정 생성은 `SettingsInitialize`의 모든 필드를 요구한다. `service_url`은 관리자 명시 입력만 사용하고 요청 Host나 임의 URL로 생성하지 않는다. 생성할 설정 행이 없으므로 If-Match는 요구하지 않는다. 설정 행 생성·감사는 최신 세션/CSRF와 설치 상태를 재검사하는 동일 트랜잭션에 커밋한다. 초기 version은 1이다. 이미 설정이 있으면 409 `settings_already_configured`, 설치 단계가 다르면 409 `setup_settings_unavailable`이다. 응답 손실 시 GET `/settings`로 확인하며 최초 생성 요청은 기존 값을 덮어쓰지 않는다. 이후 수정은 기존 PATCH·If-Match를 사용한다. bootstrap TLS의 운영 URL 결합이 없을 때에는 첫 URL을 설정할 수 있고, 운영 TLS가 활성화되어 있으면 기존 URL 일치 검사를 유지한다.
 
 ## CA·Leaf·폐기
 
