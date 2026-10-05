@@ -107,23 +107,69 @@ func TestPostgresCatalogCheckNormalizationRemovesOnlyAtomicPredicateGrouping(t *
 }
 
 func TestMySQLCatalogCheckNormalizationMatchesRegexFunctionRoundTrip(t *testing.T) {
-	want := normalizeCheck("serial_hex REGEXP '^[0-9a-f]+$'", config.MySQL)
-	got := normalizeCheck("REGEXP_LIKE(serial_hex, '^[0-9a-f]+$')", config.MySQL)
-	if got != want {
-		t.Fatalf("normalized MySQL regex checks differ: got %q, want %q", got, want)
+	want := mysqlCatalogTable(columnShape{name: "serial_hex", typeName: "varchar", length: "40", nullable: false, charset: "ascii", collation: "ascii_bin"})
+	want.constraints = []constraintShape{{kind: "check", expression: "serial_hex REGEXP '^[0-9a-f]+$'"}}
+	actual := want
+	actual.constraints = []constraintShape{{kind: "check", expression: "REGEXP_LIKE(serial_hex, '^[0-9a-f]+$')"}}
+	if !sameTable(actual, want, config.MySQL) {
+		t.Fatal("MySQL catalog did not normalize the REGEXP function round-trip")
 	}
 	for name, changed := range map[string]string{
 		"changed pattern":  "REGEXP_LIKE(serial_hex, '^[0-9a-f]*$')",
 		"extra match mode": "REGEXP_LIKE(serial_hex, '^[0-9a-f]+$', 'i')",
 	} {
 		t.Run(name, func(t *testing.T) {
-			if got := normalizeCheck(changed, config.MySQL); got == want {
+			changedTable := want
+			changedTable.constraints = []constraintShape{{kind: "check", expression: changed}}
+			if sameTable(changedTable, want, config.MySQL) {
 				t.Fatalf("normalization erased %s", name)
 			}
 		})
 	}
-	if normalizeCheck("serial_hex REGEXP '^[0-9a-f]+$'", config.MariaDB) == normalizeCheck("REGEXP_LIKE(serial_hex, '^[0-9a-f]+$')", config.MariaDB) {
+	mariaExpected := want
+	mariaExpected.constraints[0].expression = "serial_hex REGEXP '^[0-9a-f]+$'"
+	mariaActual := mariaExpected
+	mariaActual.constraints = []constraintShape{{kind: "check", expression: "REGEXP_LIKE(serial_hex, '^[0-9a-f]+$')"}}
+	if sameTable(mariaActual, mariaExpected, config.MariaDB) {
 		t.Fatal("MySQL REGEXP alias normalization was applied to MariaDB")
+	}
+}
+
+func TestPostgresCheckNormalizationDoesNotRewriteCastLikeLiteralText(t *testing.T) {
+	castLikeLiteral := normalizeCheck("state = 'root::text'", config.Postgres)
+	plainLiteral := normalizeCheck("state = 'root'", config.Postgres)
+	if castLikeLiteral == plainLiteral {
+		t.Fatal("PostgreSQL normalization erased cast-like text inside a string literal")
+	}
+
+	arrayLikeLiteral := normalizeCheck("payload = 'state=any(array[active])'", config.Postgres)
+	inLikeLiteral := normalizeCheck("payload = 'statein(active)'", config.Postgres)
+	if arrayLikeLiteral == inLikeLiteral {
+		t.Fatal("PostgreSQL normalization rewrote array-membership text inside a string literal")
+	}
+}
+
+func TestMariaDBCatalogCheckComparisonPreservesLogicalPrecedence(t *testing.T) {
+	columns := []columnShape{
+		{name: "kind", typeName: "varchar", length: "32", nullable: false, charset: "ascii", collation: "ascii_bin"},
+		{name: "management_parent_id", typeName: "varchar", length: "36", nullable: true, charset: "ascii", collation: "ascii_bin"},
+	}
+	expected := mysqlCatalogTable(columns[0])
+	expected.columns = columns
+	expected.constraints = []constraintShape{{kind: "check", expression: "(kind='intermediate' AND management_parent_id IS NOT NULL) OR (kind IN ('root','bootstrap') AND management_parent_id IS NULL)"}}
+	actual := expected
+	actual.constraints = []constraintShape{{kind: "check", expression: "kind='intermediate' AND management_parent_id IS NOT NULL OR kind IN ('root','bootstrap') AND management_parent_id IS NULL"}}
+	if !sameTable(actual, expected, config.MariaDB) {
+		t.Fatalf("MariaDB catalog dropped only precedence-redundant grouping: actual=%q expected=%q", actual.constraints[0].expression, expected.constraints[0].expression)
+	}
+
+	left := expected
+	left.columns = []columnShape{{name: "a", typeName: "integer"}, {name: "b", typeName: "integer"}, {name: "c", typeName: "integer"}}
+	left.constraints = []constraintShape{{kind: "check", expression: "a = 1 AND (b = 2 OR c = 3)"}}
+	right := left
+	right.constraints = []constraintShape{{kind: "check", expression: "(a = 1 AND b = 2) OR c = 3"}}
+	if sameTable(left, right, config.MariaDB) {
+		t.Fatal("MariaDB comparison erased parentheses that change boolean precedence")
 	}
 }
 
@@ -310,6 +356,41 @@ func TestExternalPostgresCatalogExcludesIntrinsicNotNullConstraints(t *testing.T
 	want := plan.full[0].tables["schema_migrations"]
 	if !sameTable(got, want, config.Postgres) {
 		t.Fatalf("intrinsic NOT NULL constraints changed the reviewed schema_migrations shape: got %d constraints, want %d", len(got.constraints), len(want.constraints))
+	}
+}
+
+func TestExternalPostgresMigrationStepCatalogDiagnostic(t *testing.T) {
+	database, ok := migrationDiagnosticDatabase(t, config.Postgres)
+	if !ok {
+		t.Skip("disposable PostgreSQL database is not configured")
+	}
+	defer database.Password.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	handle, err := connection.Open(ctx, database, connection.Options{})
+	if err != nil {
+		t.Fatal("could not open disposable PostgreSQL database")
+	}
+	defer handle.Close()
+	plan, err := loadPlan(config.Postgres)
+	if err != nil {
+		t.Fatalf("load PostgreSQL migration plan: %v", err)
+	}
+	step := plan.files[3].steps[0]
+	tx, err := handle.WriterConn().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin diagnostic transaction: %v", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, step.sql); err != nil {
+		t.Fatalf("execute PostgreSQL v3 step1 in rollback-only diagnostic transaction: %v", err)
+	}
+	actual, err := readCatalog(ctx, tx, config.Postgres)
+	if err != nil {
+		t.Fatalf("read PostgreSQL step catalog: %v", err)
+	}
+	if !catalogMatches(actual, step.after, config.Postgres) {
+		t.Logf("PostgreSQL v3 step1 catalog differences: %v", catalogDifferences(actual, step.after, config.Postgres))
 	}
 }
 
