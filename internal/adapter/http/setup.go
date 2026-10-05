@@ -143,6 +143,7 @@ func NewSetupHandler(config SetupHandlerConfig) (http.Handler, error) {
 	mux.HandleFunc("PATCH /api/v1/settings", h.patchSettings)
 	mux.HandleFunc("POST /api/v1/setup/settings", h.postInitializeSettings)
 	mux.HandleFunc("POST /api/v1/setup/complete", h.postCompleteSetup)
+	registerAuthorityRoutes(mux, h)
 	if err := registerWebRoutes(mux, h); err != nil {
 		return nil, err
 	}
