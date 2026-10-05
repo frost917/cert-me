@@ -6,7 +6,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"net"
 	"net/netip"
 	"net/url"
 	"strconv"
@@ -180,15 +179,8 @@ func (URLValidator) Validate(ctx context.Context, raw string) error {
 		return errors.New("cryptoformats: service URL must be an absolute HTTPS URL without userinfo, query, or fragment")
 	}
 	host := u.Hostname()
-	if host == "" || strings.ContainsAny(host, " \t\r\n\\") {
+	if host == "" || strings.ContainsAny(host, " \t\r\n\\") || !validServiceURLHost(u.Host, host) {
 		return errors.New("cryptoformats: service URL host is invalid")
-	}
-	if parsedIP, err := netip.ParseAddr(host); err == nil {
-		if parsedIP.Zone() != "" {
-			return errors.New("cryptoformats: service URL IP host must not contain a zone identifier")
-		}
-	} else if net.ParseIP(host) != nil {
-		return errors.New("cryptoformats: service URL IP host is invalid")
 	}
 	if portText := u.Port(); portText != "" {
 		port, err := strconv.ParseUint(portText, 10, 16)
@@ -197,6 +189,59 @@ func (URLValidator) Validate(ctx context.Context, raw string) error {
 		}
 	}
 	return checkContext(ctx)
+}
+
+func validServiceURLHost(authority, host string) bool {
+	if strings.HasPrefix(authority, "[") {
+		closingBracket := strings.IndexByte(authority, ']')
+		if closingBracket < 0 {
+			return false
+		}
+		tail := authority[closingBracket+1:]
+		if tail != "" && !strings.HasPrefix(tail, ":") {
+			return false
+		}
+		addr, err := netip.ParseAddr(host)
+		return err == nil && addr.Is6() && addr.Zone() == ""
+	}
+	if strings.ContainsAny(authority, "[]") {
+		return false
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return addr.Is4() && addr.Zone() == ""
+	}
+	return validServiceURLDNSHost(host)
+}
+
+func validServiceURLDNSHost(host string) bool {
+	host = strings.TrimSuffix(host, ".")
+	if len(host) == 0 || len(host) > 253 {
+		return false
+	}
+
+	numeric := true
+	for i := 0; i < len(host); i++ {
+		if (host[i] < '0' || host[i] > '9') && host[i] != '.' {
+			numeric = false
+		}
+	}
+	if numeric {
+		return false
+	}
+
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') &&
+				(c < '0' || c > '9') && c != '-' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func checkContext(ctx context.Context) error {
