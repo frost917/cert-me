@@ -59,7 +59,7 @@
       body: JSON.stringify(payload),
       cache: "no-store",
     });
-    if (!response.ok) throw new Error(await responseMessage(response));
+    if (!response.ok) throw Object.assign(new Error(await responseMessage(response)), { status: response.status });
     return response;
   }
 
@@ -242,7 +242,22 @@
     const form = event.currentTarget;
     try {
       if (settingsSnapshot === null) {
-        const response = await sendJSON("/api/v1/setup/settings", "POST", currentSettings(form), true);
+        let response;
+        try {
+          response = await sendJSON("/api/v1/setup/settings", "POST", currentSettings(form), true);
+        } catch (error) {
+          // A committed creation is never retried as an overwrite. Recover
+          // its version through the authorized read after a lost response
+          // or a concurrent creator, then keep using ordinary versioned PATCH.
+          if (error instanceof TypeError || error.status === 409) {
+            await loadSettings();
+            if (settingsSnapshot !== null) {
+              byID("settings-result").textContent = "저장된 초기 설정을 확인했습니다.";
+              return;
+            }
+          }
+          throw error;
+        }
         settingsSnapshot = (await response.json()).data;
         settingsETag = response.headers.get("ETag") || "";
         fillSettings(settingsSnapshot);
