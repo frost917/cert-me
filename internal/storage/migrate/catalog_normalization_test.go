@@ -93,6 +93,40 @@ func TestMySQLCatalogCheckNormalizationRemovesOnlyAtomicPredicateGrouping(t *tes
 	}
 }
 
+func TestPostgresCatalogCheckNormalizationRemovesOnlyAtomicPredicateGrouping(t *testing.T) {
+	want := normalizeCheck("(state = 'active' AND role = 'admin') OR (state = 'disabled' AND role = 'reader')", config.Postgres)
+	got := normalizeCheck("((state = 'active') AND (role = 'admin')) OR ((state = 'disabled') AND (role = 'reader'))", config.Postgres)
+	if got != want {
+		t.Fatalf("normalized PostgreSQL predicate grouping differs: got %q, want %q", got, want)
+	}
+	left := normalizeCheck("a = 1 AND (b = 2 OR c = 3)", config.Postgres)
+	right := normalizeCheck("(a = 1 AND b = 2) OR c = 3", config.Postgres)
+	if left == right {
+		t.Fatal("PostgreSQL normalization erased parentheses that change AND/OR grouping")
+	}
+}
+
+func TestMySQLCatalogCheckNormalizationMatchesRegexFunctionRoundTrip(t *testing.T) {
+	want := normalizeCheck("serial_hex REGEXP '^[0-9a-f]+$'", config.MySQL)
+	got := normalizeCheck("REGEXP_LIKE(serial_hex, '^[0-9a-f]+$')", config.MySQL)
+	if got != want {
+		t.Fatalf("normalized MySQL regex checks differ: got %q, want %q", got, want)
+	}
+	for name, changed := range map[string]string{
+		"changed pattern":  "REGEXP_LIKE(serial_hex, '^[0-9a-f]*$')",
+		"extra match mode": "REGEXP_LIKE(serial_hex, '^[0-9a-f]+$', 'i')",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := normalizeCheck(changed, config.MySQL); got == want {
+				t.Fatalf("normalization erased %s", name)
+			}
+		})
+	}
+	if normalizeCheck("serial_hex REGEXP '^[0-9a-f]+$'", config.MariaDB) == normalizeCheck("REGEXP_LIKE(serial_hex, '^[0-9a-f]+$')", config.MariaDB) {
+		t.Fatal("MySQL REGEXP alias normalization was applied to MariaDB")
+	}
+}
+
 func TestMariaDBNullableNULLDefaultMatchesAbsentDefaultOnlyWhenNullable(t *testing.T) {
 	wantNullable := mysqlCatalogTable(columnShape{name: "value", typeName: "varchar", length: "20", nullable: true, charset: "ascii", collation: "ascii_bin"})
 	gotNullable := wantNullable
@@ -167,6 +201,18 @@ func TestExternalMigrationCatalogPrefixDiagnostic(t *testing.T) {
 				}
 				rows.Close()
 				t.Logf("MariaDB CHECK_CONSTRAINTS columns=%v", columns)
+				rows, err = handle.ReadDB().QueryContext(ctx, `SELECT constraint_name, check_clause FROM information_schema.check_constraints
+					WHERE constraint_schema=DATABASE() AND table_name='authorities' ORDER BY constraint_name`)
+				if err == nil {
+					for rows.Next() {
+						var name, clause string
+						if scanErr := rows.Scan(&name, &clause); scanErr != nil {
+							break
+						}
+						t.Logf("MariaDB raw authority CHECK name=%s clause=%q", name, clause)
+					}
+					rows.Close()
+				}
 			}
 
 			plan, err := loadPlan(kind)
@@ -264,6 +310,42 @@ func TestExternalPostgresCatalogExcludesIntrinsicNotNullConstraints(t *testing.T
 	want := plan.full[0].tables["schema_migrations"]
 	if !sameTable(got, want, config.Postgres) {
 		t.Fatalf("intrinsic NOT NULL constraints changed the reviewed schema_migrations shape: got %d constraints, want %d", len(got.constraints), len(want.constraints))
+	}
+}
+
+func TestExternalMariaDBCatalogKeepsCheckConstraintsOnTheirTable(t *testing.T) {
+	database, ok := migrationDiagnosticDatabase(t, config.MariaDB)
+	if !ok {
+		t.Skip("disposable MariaDB database is not configured")
+	}
+	defer database.Password.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	handle, err := connection.Open(ctx, database, connection.Options{})
+	if err != nil {
+		t.Fatal("could not open disposable MariaDB database")
+	}
+	defer func() {
+		if err := handle.Close(); err != nil {
+			t.Errorf("close disposable MariaDB database: %v", err)
+		}
+	}()
+
+	actual, err := readCatalog(ctx, handle.ReadDB(), config.MariaDB)
+	if err != nil {
+		t.Fatalf("read MariaDB catalog: %v", err)
+	}
+	got, ok := actual.tables["accounts"]
+	if !ok {
+		t.Skip("MariaDB test database does not yet contain the accounts table")
+	}
+	plan, err := loadPlan(config.MariaDB)
+	if err != nil {
+		t.Fatalf("load MariaDB migration plan: %v", err)
+	}
+	want := plan.full[1].tables["accounts"]
+	if !sameTable(got, want, config.MariaDB) {
+		t.Fatalf("MariaDB joined CHECK constraints across tables: got %d constraints, want %d", len(got.constraints), len(want.constraints))
 	}
 }
 
