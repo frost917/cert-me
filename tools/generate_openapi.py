@@ -37,6 +37,7 @@ S['Session']=obj({'account':ref('Account'),'idle_expires_at':TIME,'absolute_expi
 S['Login']=obj({**S['Session']['properties'],'csrf_token':string(minLength=32,maxLength=256)},['account','csrf_token','idle_expires_at','absolute_expires_at'])
 settings={'service_url':string(format='uri',pattern='^https://'),'leaf_validity':ref('Validity'),'root_validity':ref('Validity'),'intermediate_validity':ref('Validity'),'rotate_every':{'type':'integer','minimum':1,'maximum':100,'default':3},'private_delivery_seconds':{'type':'integer','minimum':300,'maximum':86400,'default':10800},'public_link_seconds':{'type':'integer','minimum':60,'maximum':10800,'default':600},'crl_interval_seconds':{'type':'integer','minimum':300,'maximum':86400,'default':43200},'crl_validity_seconds':{'type':'integer','minimum':600,'maximum':604800,'default':172800},'audit_retention_days':{'type':'integer','minimum':30,'maximum':3650,'default':365}}
 S['SettingsPatch']=obj(settings);S['SettingsPatch']['minProperties']=1
+S['SettingsInitialize']=obj(settings,list(settings))
 S['Settings']=obj({**settings,'version':VERSION},list(settings)+['version']);S['Settings']['description']='CRL validity must be at least twice interval; URL must match active operational TLS certificate or be changed through CLI recovery.'
 S['NamePatch']=obj({'name':NAME},['name'])
 S['LeafPatch']=obj({'name':NAME,'validity':ref('Validity'),'rotate_every':settings['rotate_every']});S['LeafPatch']['minProperties']=1
@@ -147,6 +148,8 @@ endpoint('get','/auth/me','getSession','Session')
 endpoint('post','/auth/password-reset','completePasswordReset',body='PasswordReset',status=204,public=True)
 endpoint('get','/settings','getSettings','Settings')
 endpoint('patch','/settings','updateSettings','Settings','SettingsPatch',match=True)
+initial=endpoint('post','/setup/settings','initializeSettings','Settings','SettingsInitialize',201,description='Administrator session and CSRF required. Create the initial settings only during pki_required, with every field explicitly supplied. Existing settings return 409; after a lost response use GET /settings. No Host-derived URL or implicit PATCH upsert. Bootstrap TLS may have no operational URL binding; operational TLS must match service_url.')
+initial['responses']['201']['headers']['Location']={'schema':string(),'description':'/api/v1/settings'}
 endpoint('post','/setup/complete','completeSetup','Setup','Empty',match=True)
 endpoint('get','/authorities','listAuthorities','Authority',listing=True)
 endpoint('post','/authorities','createAuthority','Authority','AuthorityCreate',201,idem=True)

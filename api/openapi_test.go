@@ -16,7 +16,7 @@ func TestOpenAPI(t *testing.T) {
 	if err = doc.Validate(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if doc.Paths.Len() != 51 {
+	if doc.Paths.Len() != 52 {
 		t.Fatal("unexpected route set")
 	}
 	seen := map[string]bool{}
@@ -28,7 +28,7 @@ func TestOpenAPI(t *testing.T) {
 			seen[op.OperationID] = true
 		}
 	}
-	if len(seen) != 59 {
+	if len(seen) != 60 {
 		t.Fatal("unexpected operation count")
 	}
 }
