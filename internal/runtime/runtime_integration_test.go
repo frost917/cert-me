@@ -19,7 +19,11 @@ import (
 	"time"
 
 	"cert-me/internal/app/contract"
+	"cert-me/internal/app/port"
+	"cert-me/internal/app/service"
+	"cert-me/internal/authcrypto"
 	"cert-me/internal/config"
+	"cert-me/internal/cryptoformats"
 	"cert-me/internal/secret"
 	"cert-me/internal/storage/migrate"
 )
@@ -207,9 +211,87 @@ func runRuntimeInitialHTTPSAdminFlow(t *testing.T, database runtimeDBSpec) {
 		"Sec-Fetch-Site": "same-origin",
 		"X-CSRF-Token":   login.Data.CSRFToken,
 	}
-	initializeResponse := mustRequest(t, client, http.MethodPost, origin+"/api/v1/setup/settings", settingsSnapshot, sessionCookie, setupSettingsHeaders)
-	if initializeResponse.StatusCode != http.StatusCreated {
-		failWithAPIStatus(t, initializeResponse, http.StatusCreated)
+	assertSettingsAuditFailureRollsBack(t, app, sessionCookie.Value, login.Data.CSRFToken, settingsSnapshot)
+	initializeStart := make(chan struct{})
+	initializeReady := make(chan struct{}, 2)
+	initializeResults := make(chan runtimeHTTPResult, 2)
+	for range 2 {
+		go func() {
+			initializeReady <- struct{}{}
+			<-initializeStart
+			response, err := runtimeRequest(client, http.MethodPost, origin+"/api/v1/setup/settings", settingsSnapshot, sessionCookie, setupSettingsHeaders)
+			initializeResults <- runtimeHTTPResult{response: response, err: err}
+		}()
+	}
+	for range 2 {
+		<-initializeReady
+	}
+	close(initializeStart)
+	var initializeResponse, concurrentLoser *http.Response
+	for range 2 {
+		result := <-initializeResults
+		if result.err != nil {
+			t.Fatalf("concurrent settings initialization request failed: %v", result.err)
+		}
+		switch result.response.StatusCode {
+		case http.StatusCreated:
+			if initializeResponse != nil {
+				closeResponseBody(t, initializeResponse)
+				closeResponseBody(t, result.response)
+				t.Fatal("both concurrent settings initialization requests succeeded")
+			}
+			initializeResponse = result.response
+		case http.StatusConflict:
+			if concurrentLoser != nil {
+				closeResponseBody(t, concurrentLoser)
+				closeResponseBody(t, result.response)
+				t.Fatal("both concurrent settings initialization requests conflicted")
+			}
+			concurrentLoser = result.response
+		default:
+			closeResponseBody(t, result.response)
+			t.Fatalf("concurrent settings initialization status = %d, want one 201 and one 409", result.response.StatusCode)
+		}
+	}
+	if initializeResponse == nil || concurrentLoser == nil {
+		t.Fatal("concurrent settings initialization did not produce one winner and one conflict")
+	}
+	if got := concurrentLoser.StatusCode; got != http.StatusConflict {
+		t.Fatalf("concurrent settings loser status = %d, want %d", got, http.StatusConflict)
+	}
+	if got := concurrentLoser.Header.Get("ETag"); got != "" {
+		t.Fatalf("conflict response unexpectedly exposed settings ETag %q", got)
+	}
+	for _, response := range []*http.Response{initializeResponse, concurrentLoser} {
+		body := captureResponseBody(t, response)
+		assertResponseOmitsSessionSecrets(t, body, sessionCookie.Value, login.Data.CSRFToken)
+		if len(response.Cookies()) != 0 {
+			t.Fatal("settings initialization response unexpectedly changed authentication cookies")
+		}
+	}
+	var duplicateEnvelope struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	loserBody := captureResponseBody(t, concurrentLoser)
+	if err := json.Unmarshal(loserBody, &duplicateEnvelope); err != nil {
+		t.Fatalf("decode concurrent settings conflict response: %v", err)
+	}
+	if duplicateEnvelope.Error.Code != "settings_already_configured" {
+		t.Fatalf("concurrent settings conflict code = %q, want settings_already_configured", duplicateEnvelope.Error.Code)
+	}
+	var loserFields map[string]json.RawMessage
+	if err := json.Unmarshal(loserBody, &loserFields); err != nil {
+		t.Fatalf("decode concurrent settings conflict shape: %v", err)
+	}
+	if _, exposed := loserFields["data"]; exposed || bytes.Contains(loserBody, []byte(origin)) {
+		t.Fatal("concurrent settings conflict response exposed the stored settings payload")
+	}
+	for field := range settingsSnapshot {
+		if _, exposed := loserFields[field]; exposed {
+			t.Fatal("concurrent settings conflict response echoed an initialization field")
+		}
 	}
 	if initializeResponse.Header.Get("Location") != "/api/v1/settings" || initializeResponse.Header.Get("ETag") != `"v1"` {
 		closeResponseBody(t, initializeResponse)
@@ -351,6 +433,11 @@ func runRuntimeInitialHTTPSAdminFlow(t *testing.T, database runtimeDBSpec) {
 type preAuthCredential struct {
 	cookie *http.Cookie
 	token  string
+}
+
+type runtimeHTTPResult struct {
+	response *http.Response
+	err      error
 }
 
 type runtimeDBSpec struct {
@@ -520,17 +607,25 @@ func getPreAuthCSRF(t *testing.T, client *http.Client, origin string) preAuthCre
 
 func mustRequest(t *testing.T, client *http.Client, method, target string, body any, cookie *http.Cookie, headers map[string]string) *http.Response {
 	t.Helper()
+	response, err := runtimeRequest(client, method, target, body, cookie, headers)
+	if err != nil {
+		t.Fatalf("send %s request: %v", method, err)
+	}
+	return response
+}
+
+func runtimeRequest(client *http.Client, method, target string, body any, cookie *http.Cookie, headers map[string]string) (*http.Response, error) {
 	var requestBody io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
 		if err != nil {
-			t.Fatalf("encode test request: %v", err)
+			return nil, err
 		}
 		requestBody = bytes.NewReader(encoded)
 	}
 	request, err := http.NewRequest(method, target, requestBody)
 	if err != nil {
-		t.Fatalf("create test request: %v", err)
+		return nil, err
 	}
 	request.Header.Set("Accept", "application/json")
 	if body != nil {
@@ -542,11 +637,29 @@ func mustRequest(t *testing.T, client *http.Client, method, target string, body 
 	for name, value := range headers {
 		request.Header.Set(name, value)
 	}
-	response, err := client.Do(request)
+	return client.Do(request)
+}
+
+func captureResponseBody(t *testing.T, response *http.Response) []byte {
+	t.Helper()
+	body, err := io.ReadAll(response.Body)
 	if err != nil {
-		t.Fatalf("send %s request: %v", method, err)
+		t.Fatalf("read response body: %v", err)
 	}
-	return response
+	if err := response.Body.Close(); err != nil {
+		t.Fatalf("close response body: %v", err)
+	}
+	response.Body = io.NopCloser(bytes.NewReader(body))
+	return body
+}
+
+func assertResponseOmitsSessionSecrets(t *testing.T, body []byte, secrets ...string) {
+	t.Helper()
+	for _, value := range secrets {
+		if value != "" && bytes.Contains(body, []byte(value)) {
+			t.Fatal("HTTP response exposed an authentication secret")
+		}
+	}
 }
 
 func responseCookie(t *testing.T, response *http.Response, name string) *http.Cookie {
@@ -606,4 +719,90 @@ func closeRuntimeIntegrationApp(app *App) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return app.Close(ctx)
+}
+
+func assertSettingsAuditFailureRollsBack(t *testing.T, app *App, sessionToken, csrfToken string, payload map[string]any) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	common := service.CommonDeps{
+		UnitOfWork: app.store,
+		ReadStore:  app.store,
+		Authorizer: adminAuthorizer{},
+		Clock:      systemClock{},
+		IDs:        randomIDs{},
+	}
+	identity, err := service.NewIdentityService(service.IdentityDeps{
+		CommonDeps:     common,
+		PasswordHasher: authcrypto.PasswordHasher{},
+		TokenCodec:     authcrypto.TokenCodec{},
+	})
+	if err != nil {
+		t.Fatalf("create runtime identity service for rollback check: %v", err)
+	}
+	sessionInput := secret.FromString(sessionToken)
+	csrfInput := secret.FromString(csrfToken)
+	defer sessionInput.Close()
+	defer csrfInput.Close()
+	authenticated, err := identity.Authenticate(ctx, contract.RequestMeta{}, contract.IdentityAuthenticateCommand{
+		SessionToken: sessionInput,
+		CSRFToken:    csrfInput,
+	})
+	if err != nil {
+		t.Fatalf("authenticate runtime session for rollback check: %v", err)
+	}
+
+	failingStore := failingAuditUnitOfWork{UnitOfWork: app.store}
+	settings, err := service.NewSettingsService(service.SettingsDeps{
+		CommonDeps: service.CommonDeps{
+			UnitOfWork: failingStore,
+			ReadStore:  app.store,
+			Authorizer: adminAuthorizer{},
+			Clock:      systemClock{},
+			IDs:        randomIDs{},
+		},
+		URLValidator: cryptoformats.URLValidator{},
+	})
+	if err != nil {
+		t.Fatalf("create runtime settings service for rollback check: %v", err)
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("encode rollback settings fixture: %v", err)
+	}
+	var command contract.SettingsInitializeCommand
+	if err := json.Unmarshal(encoded, &command); err != nil {
+		t.Fatalf("decode rollback settings fixture: %v", err)
+	}
+	meta := contract.MutationMeta{RequestMeta: contract.RequestMeta{Principal: authenticated.Principal}}
+	if _, err := settings.Initialize(ctx, meta, command); err == nil {
+		t.Fatal("settings initialization succeeded when the audit append failed")
+	} else if appErr, ok := contract.AsAppError(err); !ok || appErr.Code() != "settings_audit_failed" {
+		t.Fatal("settings initialization did not report its audit append failure")
+	}
+
+	_, err = settings.Get(ctx, meta.RequestMeta, contract.SettingsGetCommand{})
+	if appErr, ok := contract.AsAppError(err); !ok || appErr.Code() != "settings_not_configured" {
+		t.Fatal("settings persisted even though its required audit append failed")
+	}
+}
+
+type failingAuditUnitOfWork struct{ port.UnitOfWork }
+
+func (store failingAuditUnitOfWork) Write(ctx context.Context, fn func(port.TxStores) error) error {
+	return store.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
+		return fn(failingAuditTxStores{TxStores: tx})
+	})
+}
+
+type failingAuditTxStores struct{ port.TxStores }
+
+func (stores failingAuditTxStores) Audit() port.AuditRepository {
+	return failingAuditRepository{AuditRepository: stores.TxStores.Audit()}
+}
+
+type failingAuditRepository struct{ port.AuditRepository }
+
+func (failingAuditRepository) Append(context.Context, port.AuditEvent, port.AuditScope) error {
+	return errors.New("test audit append failure")
 }
