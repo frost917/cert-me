@@ -71,6 +71,14 @@ func TestCertificateSignerFixedBootstrapSAN(t *testing.T) {
 			if len(parsed.DNSNames) != 1 || parsed.DNSNames[0] != "cert-me" || len(leaf.SANs()) != 1 || leaf.SANs()[0].Value() != "cert-me" {
 				t.Fatal("bootstrap SAN differs between DER and domain certificate")
 			}
+			otherSubject, err := domain.NewSubject(domain.SubjectFacts{CommonName: "other.example"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan.Subject = otherSubject
+			if _, err := signer.Sign(ctx, port.CertificateSigningRequest{Plan: plan, CertificateID: "77777777-7777-4777-8777-777777777777", KeyMaterialID: testOtherID, SubjectPublicKey: leafKey.PublicKey, Kind: domain.CertificateKindLeaf, Serial: serial, IssuerCertificate: root}, rootKey.EncryptedSecret); err == nil {
+				t.Fatal("non-fixed subject must not use the bootstrap SAN exception")
+			}
 		})
 	}
 }
