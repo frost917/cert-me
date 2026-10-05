@@ -237,6 +237,32 @@ func TestMariaDBNullableNULLDefaultMatchesAbsentDefaultOnlyWhenNullable(t *testi
 	}
 }
 
+func TestMariaDBBooleanDefaultZeroMatchesFalseOnlyForBooleanColumns(t *testing.T) {
+	want := mysqlCatalogTable(columnShape{name: "needs_review", typeName: "boolean", nullable: false, defaultSQL: "false"})
+	got := want
+	got.columns = append([]columnShape(nil), want.columns...)
+	got.columns[0].defaultSQL = "0"
+	if !sameTable(got, want, config.MariaDB) {
+		t.Fatal("MariaDB numeric boolean default 0 did not match reviewed FALSE")
+	}
+
+	for name, column := range map[string]columnShape{
+		"numeric default differs":     {name: "needs_review", typeName: "boolean", nullable: false, defaultSQL: "1"},
+		"quoted zero is not boolean":  {name: "needs_review", typeName: "boolean", nullable: false, defaultSQL: "'0'"},
+		"integer zero is not boolean": {name: "needs_review", typeName: "integer", nullable: false, defaultSQL: "0"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := mysqlCatalogTable(column)
+			if sameTable(changed, want, config.MariaDB) {
+				t.Fatal("normalization accepted a changed or non-boolean default")
+			}
+		})
+	}
+	if sameTable(got, want, config.MySQL) {
+		t.Fatal("MariaDB boolean default normalization was applied to MySQL")
+	}
+}
+
 func mysqlCatalogTable(column columnShape) tableShape {
 	return tableShape{
 		name: "sample", columns: []columnShape{column},
