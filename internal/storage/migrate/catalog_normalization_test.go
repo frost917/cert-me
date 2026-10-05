@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -146,6 +147,30 @@ func TestPostgresCheckNormalizationDoesNotRewriteCastLikeLiteralText(t *testing.
 	inLikeLiteral := normalizeCheck("payload = 'statein(active)'", config.Postgres)
 	if arrayLikeLiteral == inLikeLiteral {
 		t.Fatal("PostgreSQL normalization rewrote array-membership text inside a string literal")
+	}
+
+	integerCast := normalizeCheck("version::integer >= 0", config.Postgres)
+	plainInteger := normalizeCheck("version >= 0", config.Postgres)
+	if integerCast == plainInteger {
+		t.Fatal("PostgreSQL normalization removed a numeric cast that can change comparison semantics")
+	}
+}
+
+func TestPostgresBetweenNormalizationMatchesOnlyExpandedInclusiveBounds(t *testing.T) {
+	want := normalizeCheck("length(serial_hex) BETWEEN 1 AND 40", config.Postgres)
+	got := normalizeCheck("length(serial_hex) >= 1 AND length(serial_hex) <= 40", config.Postgres)
+	if got != want {
+		t.Fatalf("normalized PostgreSQL BETWEEN checks differ: got %q, want %q", got, want)
+	}
+	for name, changed := range map[string]string{
+		"changed lower bound": "length(serial_hex) >= 0 AND length(serial_hex) <= 40",
+		"changed upper bound": "length(serial_hex) >= 1 AND length(serial_hex) <= 41",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if normalizeCheck(changed, config.Postgres) == want {
+				t.Fatalf("normalization erased %s", name)
+			}
+		})
 	}
 }
 
@@ -359,6 +384,74 @@ func TestExternalPostgresCatalogExcludesIntrinsicNotNullConstraints(t *testing.T
 	}
 }
 
+func TestExternalPostgresCatalogPreservesCompositeForeignKeyOrder(t *testing.T) {
+	databaseName := os.Getenv("CERTME_CATALOG_TEST_POSTGRES_DATABASE")
+	if databaseName == "" {
+		t.Skip("dedicated PostgreSQL catalog database is not configured")
+	}
+	database, ok := migrationDiagnosticDatabase(t, config.Postgres)
+	if !ok {
+		t.Skip("disposable PostgreSQL database connection is not configured")
+	}
+	defer database.Password.Close()
+	database.DatabaseName = databaseName
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	handle, err := connection.Open(ctx, database, connection.Options{})
+	if err != nil {
+		t.Fatal("could not open dedicated PostgreSQL catalog database")
+	}
+	defer func() {
+		if err := handle.Close(); err != nil {
+			t.Errorf("close dedicated PostgreSQL catalog database: %v", err)
+		}
+	}()
+	tx, err := handle.WriterConn().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin composite-key catalog fixture transaction: %v", err)
+	}
+	defer tx.Rollback()
+
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+	parentTable := "catalog_probe_parent_" + suffix
+	childTable := "catalog_probe_child_" + suffix
+	foreignKey := "catalog_probe_fk_" + suffix
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`CREATE TABLE public.%s (
+		first_id BIGINT NOT NULL,
+		second_id BIGINT NOT NULL,
+		PRIMARY KEY (first_id, second_id)
+	)`, parentTable)); err != nil {
+		t.Fatalf("create composite-key catalog parent fixture: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`CREATE TABLE public.%s (
+		local_first BIGINT NOT NULL,
+		local_second BIGINT NOT NULL,
+		CONSTRAINT %s FOREIGN KEY (local_first, local_second)
+		REFERENCES public.%s (second_id, first_id)
+	)`, childTable, foreignKey, parentTable)); err != nil {
+		t.Fatalf("create reordered composite foreign-key catalog fixture: %v", err)
+	}
+	actual, err := readCatalog(ctx, tx, config.Postgres)
+	if err != nil {
+		t.Fatalf("read PostgreSQL composite-key fixture catalog: %v", err)
+	}
+	child, ok := actual.tables[childTable]
+	if !ok {
+		t.Fatal("PostgreSQL catalog omitted the child fixture table")
+	}
+	for _, constraint := range child.constraints {
+		if constraint.kind != "foreign" {
+			continue
+		}
+		if !reflect.DeepEqual(constraint.columns, []string{"local_first", "local_second"}) ||
+			!reflect.DeepEqual(constraint.refColumns, []string{"second_id", "first_id"}) || constraint.reference != parentTable {
+			t.Fatalf("PostgreSQL composite foreign-key order = %#v", constraint)
+		}
+		return
+	}
+	t.Fatal("PostgreSQL catalog omitted the composite foreign-key constraint")
+}
+
 func TestExternalPostgresMigrationStepCatalogDiagnostic(t *testing.T) {
 	database, ok := migrationDiagnosticDatabase(t, config.Postgres)
 	if !ok {
@@ -376,21 +469,25 @@ func TestExternalPostgresMigrationStepCatalogDiagnostic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load PostgreSQL migration plan: %v", err)
 	}
-	step := plan.files[3].steps[0]
 	tx, err := handle.WriterConn().BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatalf("begin diagnostic transaction: %v", err)
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, step.sql); err != nil {
-		t.Fatalf("execute PostgreSQL v3 step1 in rollback-only diagnostic transaction: %v", err)
-	}
-	actual, err := readCatalog(ctx, tx, config.Postgres)
-	if err != nil {
-		t.Fatalf("read PostgreSQL step catalog: %v", err)
-	}
-	if !catalogMatches(actual, step.after, config.Postgres) {
-		t.Logf("PostgreSQL v3 step1 catalog differences: %v", catalogDifferences(actual, step.after, config.Postgres))
+	for _, step := range plan.files[3].steps {
+		if step.sql != "" {
+			if _, err := tx.ExecContext(ctx, step.sql); err != nil {
+				t.Fatalf("execute PostgreSQL v3 step %d in rollback-only diagnostic transaction: %v", step.order, err)
+			}
+		}
+		actual, err := readCatalog(ctx, tx, config.Postgres)
+		if err != nil {
+			t.Fatalf("read PostgreSQL v3 step %d catalog: %v", step.order, err)
+		}
+		if !catalogMatches(actual, step.after, config.Postgres) {
+			t.Logf("PostgreSQL v3 step %d catalog differences: %v", step.order, catalogDifferences(actual, step.after, config.Postgres))
+			break
+		}
 	}
 }
 
