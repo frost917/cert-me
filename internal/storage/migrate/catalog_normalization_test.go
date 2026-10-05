@@ -31,6 +31,20 @@ func TestMySQLCatalogCheckNormalizationMatchesRoundTrippedExpression(t *testing.
 	}
 }
 
+func TestMySQLCatalogCheckNormalizationPreservesKnownCharsetIntroducers(t *testing.T) {
+	want := normalizeCheck("purpose IN ('ca_signing','leaf_delivery')", config.MySQL)
+	got := normalizeCheck("(`purpose` IN (_ascii\\'ca_signing\\',_ascii\\'leaf_delivery\\'))", config.MySQL)
+	if got != want {
+		t.Fatalf("normalized MySQL ASCII check differs: got %q, want %q", got, want)
+	}
+	for _, marker := range []string{"_latin1", "_binary"} {
+		changed := normalizeCheck("purpose IN ("+marker+"\\'ca_signing\\',"+marker+"\\'leaf_delivery\\')", config.MySQL)
+		if changed == want {
+			t.Fatalf("normalization erased unknown charset marker %q", marker)
+		}
+	}
+}
+
 func TestMySQLCatalogCheckNormalizationIsNarrow(t *testing.T) {
 	want := normalizeCheck("state IN ('applying','applied','failed')", config.MySQL)
 	for name, changed := range map[string]string{
