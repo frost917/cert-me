@@ -257,16 +257,18 @@ func (f *httpTestSetupApplication) completeResult() (int, int64) {
 type httpTestIdentityApplication struct {
 	mu sync.Mutex
 
-	principal contract.Principal
-	loginFn   func(context.Context, contract.MutationMeta, contract.IdentityLoginCommand) (contract.LoginView, error)
-	authFn    func(context.Context, contract.RequestMeta, contract.IdentityAuthenticateCommand) (contract.AuthenticateResult, error)
-	logoutErr error
-	issueErr  error
+	principal       contract.Principal
+	loginFn         func(context.Context, contract.MutationMeta, contract.IdentityLoginCommand) (contract.LoginView, error)
+	authFn          func(context.Context, contract.RequestMeta, contract.IdentityAuthenticateCommand) (contract.AuthenticateResult, error)
+	completeResetFn func(context.Context, contract.MutationMeta, contract.IdentityCompleteResetCommand) (contract.CompleteResetResult, error)
+	logoutErr       error
+	issueErr        error
 
-	loginCall        int
-	authenticateCall int
-	issueCSRFCall    int
-	logoutCall       int
+	loginCall         int
+	authenticateCall  int
+	issueCSRFCall     int
+	logoutCall        int
+	completeResetCall int
 }
 
 func (f *httpTestIdentityApplication) Login(ctx context.Context, meta contract.MutationMeta, command contract.IdentityLoginCommand) (contract.LoginView, error) {
@@ -326,7 +328,14 @@ func httpTestSecretEquals(value *secret.Input, want string) bool {
 	return matched
 }
 
-func (f *httpTestIdentityApplication) CompleteReset(context.Context, contract.MutationMeta, contract.IdentityCompleteResetCommand) (contract.CompleteResetResult, error) {
+func (f *httpTestIdentityApplication) CompleteReset(ctx context.Context, meta contract.MutationMeta, command contract.IdentityCompleteResetCommand) (contract.CompleteResetResult, error) {
+	f.mu.Lock()
+	f.completeResetCall++
+	fn := f.completeResetFn
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, meta, command)
+	}
 	return contract.CompleteResetResult{}, nil
 }
 
@@ -347,18 +356,28 @@ func (f *httpTestIdentityApplication) callCounts() (login, authenticate, issueCS
 	return f.loginCall, f.authenticateCall, f.issueCSRFCall, f.logoutCall
 }
 
+func (f *httpTestIdentityApplication) completeResetCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.completeResetCall
+}
+
 type httpTestSettingsApplication struct {
 	mu sync.Mutex
 
-	view     contract.SettingsView
-	getErr   error
-	getFn    func(context.Context, contract.RequestMeta, contract.SettingsGetCommand) (contract.SettingsView, error)
-	updateFn func(context.Context, contract.MutationMeta, contract.SettingsUpdateCommand) (contract.SettingsView, error)
+	view          contract.SettingsView
+	getErr        error
+	getFn         func(context.Context, contract.RequestMeta, contract.SettingsGetCommand) (contract.SettingsView, error)
+	initializeErr error
+	initializeFn  func(context.Context, contract.MutationMeta, contract.SettingsInitializeCommand) (contract.SettingsView, error)
+	updateFn      func(context.Context, contract.MutationMeta, contract.SettingsUpdateCommand) (contract.SettingsView, error)
 
-	getCall             int
-	updateCall          int
-	lastExpectedVersion int64
-	lastCommand         contract.SettingsUpdateCommand
+	getCall               int
+	initializeCall        int
+	updateCall            int
+	lastExpectedVersion   int64
+	lastInitializeCommand contract.SettingsInitializeCommand
+	lastCommand           contract.SettingsUpdateCommand
 }
 
 func (f *httpTestSettingsApplication) Get(ctx context.Context, meta contract.RequestMeta, command contract.SettingsGetCommand) (contract.SettingsView, error) {
@@ -371,6 +390,29 @@ func (f *httpTestSettingsApplication) Get(ctx context.Context, meta contract.Req
 		return fn(ctx, meta, command)
 	}
 	return view, getErr
+}
+
+func (f *httpTestSettingsApplication) Initialize(ctx context.Context, meta contract.MutationMeta, command contract.SettingsInitializeCommand) (contract.SettingsView, error) {
+	f.mu.Lock()
+	f.initializeCall++
+	f.lastInitializeCommand = command
+	fn := f.initializeFn
+	view, initializeErr := f.view, f.initializeErr
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, meta, command)
+	}
+	if initializeErr != nil {
+		return contract.SettingsView{}, initializeErr
+	}
+	if command.ServiceURL != nil {
+		view.ServiceURL = *command.ServiceURL
+	}
+	view.Version, _ = domain.ParseVersion(1)
+	f.mu.Lock()
+	f.view = view
+	f.mu.Unlock()
+	return view, nil
 }
 
 func (f *httpTestSettingsApplication) Update(ctx context.Context, meta contract.MutationMeta, command contract.SettingsUpdateCommand) (contract.SettingsView, error) {
@@ -402,6 +444,12 @@ func (f *httpTestSettingsApplication) updateState() (calls int, expectedVersion 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.updateCall, f.lastExpectedVersion, f.lastCommand
+}
+
+func (f *httpTestSettingsApplication) initializeState() (calls int, command contract.SettingsInitializeCommand) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.initializeCall, f.lastInitializeCommand
 }
 
 func (f *httpTestSettingsApplication) getCalls() int {
