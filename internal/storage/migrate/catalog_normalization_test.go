@@ -43,6 +43,9 @@ func TestMySQLCatalogCheckNormalizationPreservesKnownCharsetIntroducers(t *testi
 			t.Fatalf("normalization erased unknown charset marker %q", marker)
 		}
 	}
+	if got := normalizeCheck("purpose = _ascii\\'café\\'", config.MySQL); got == normalizeCheck("purpose = 'café'", config.MySQL) {
+		t.Fatal("normalization accepted non-ASCII bytes under the _ascii introducer")
+	}
 }
 
 func TestMySQLCatalogCheckNormalizationIsNarrow(t *testing.T) {
@@ -258,8 +261,8 @@ func TestMariaDBBooleanDefaultZeroMatchesFalseOnlyForBooleanColumns(t *testing.T
 			}
 		})
 	}
-	if sameTable(got, want, config.MySQL) {
-		t.Fatal("MariaDB boolean default normalization was applied to MySQL")
+	if !sameTable(got, want, config.MySQL) {
+		t.Fatal("MySQL numeric boolean default 0 did not match reviewed FALSE")
 	}
 }
 
@@ -723,7 +726,7 @@ func tableDifferences(actual, expected tableShape, kind config.DatabaseKind) []s
 	}
 	for i := 0; i < len(actual.columns) && i < len(expected.columns); i++ {
 		got, want := actual.columns[i], expected.columns[i]
-		gotDefault := normalizeCatalogDefault(got.defaultSQL, got.nullable, kind)
+		gotDefault := normalizeCatalogDefault(got.defaultSQL, got.typeName, got.nullable, kind)
 		if got.name != want.name || got.typeName != want.typeName || canonicalLength(got.length) != canonicalLength(want.length) || got.nullable != want.nullable || gotDefault != want.defaultSQL || got.collation != want.collation || (kind == config.MySQL || kind == config.MariaDB) && got.charset != want.charset {
 			differences = append(differences, fmt.Sprintf("table %s column %s actual=%#v expected=%#v", expected.name, got.name, got, want))
 		}
