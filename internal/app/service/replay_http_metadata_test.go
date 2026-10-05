@@ -5,6 +5,8 @@ import (
 	"testing"
 )
 
+// These assertions concern transport metadata only; stored result replay must
+// still recheck current authorization and never persist this transient bit.
 func TestAuthorityReplaySignalsHTTPStatus(t *testing.T) {
 	f := newAuthorityFixture(t)
 	meta := authorityCreateMeta("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
