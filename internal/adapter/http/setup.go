@@ -43,6 +43,7 @@ type IdentityApplication interface {
 // SettingsApplication exposes only the settings use cases needed by HTTP.
 type SettingsApplication interface {
 	Get(context.Context, contract.RequestMeta, contract.SettingsGetCommand) (contract.SettingsView, error)
+	Initialize(context.Context, contract.MutationMeta, contract.SettingsInitializeCommand) (contract.SettingsView, error)
 	Update(context.Context, contract.MutationMeta, contract.SettingsUpdateCommand) (contract.SettingsView, error)
 }
 
@@ -128,6 +129,7 @@ func NewSetupHandler(config SetupHandlerConfig) (http.Handler, error) {
 	mux.HandleFunc("POST /api/v1/auth/password-reset", h.postCompleteReset)
 	mux.HandleFunc("GET /api/v1/settings", h.getSettings)
 	mux.HandleFunc("PATCH /api/v1/settings", h.patchSettings)
+	mux.HandleFunc("POST /api/v1/setup/settings", h.postInitializeSettings)
 	mux.HandleFunc("POST /api/v1/setup/complete", h.postCompleteSetup)
 	if err := registerWebRoutes(mux, h); err != nil {
 		return nil, err
