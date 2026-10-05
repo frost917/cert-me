@@ -3,9 +3,11 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -16,8 +18,10 @@ import (
 	"testing"
 	"time"
 
+	"cert-me/internal/app/contract"
 	"cert-me/internal/config"
 	"cert-me/internal/secret"
+	"cert-me/internal/storage/migrate"
 )
 
 const runtimeIntegrationSessionCookieName = "__Host-certme_session"
@@ -355,6 +359,10 @@ type runtimeDBSpec struct {
 	envPrefix  string
 }
 
+// External database cases opt in through CERTME_RUNTIME_TEST_<KIND>_{HOST,
+// PORT,DATABASE,USERNAME,PASSWORD}. Each database must be a dedicated empty
+// disposable database distinct from CERTME_TEST_<KIND>_DSN, which is reserved
+// for the migration schema tests.
 func runtimeIntegrationDatabaseForKind(t *testing.T, kind config.DatabaseKind) (runtimeDBSpec, bool) {
 	t.Helper()
 	if kind == config.SQLite {
@@ -425,8 +433,19 @@ func openRuntimeIntegrationApp(t *testing.T, database runtimeDBSpec) *App {
 		ListenAddress: "127.0.0.1:0",
 	})
 	if err != nil {
+		if appErr, ok := contract.AsAppError(err); ok {
+			t.Fatalf("open runtime for %s: application %s (%s)", database.kind, appErr.Code(), appErr.Kind())
+		}
+		var migrationErr *migrate.MigrationError
+		if errors.As(err, &migrationErr) {
+			t.Fatalf("open runtime for %s: migration %s (%s)", database.kind, migrationErr.Code, migrationErr.Kind)
+		}
 		if database.kind == config.SQLite {
 			t.Fatalf("open runtime for %s database: %v", database.kind, err)
+		}
+		stage := strings.SplitN(err.Error(), ":", 3)
+		if len(stage) >= 2 {
+			t.Fatalf("open runtime for %s failed at %s: %s", database.kind, stage[0], stage[1])
 		}
 		t.Fatalf("open runtime for %s database failed", database.kind)
 	}
@@ -467,11 +486,12 @@ func startRuntimeIntegrationHTTPS(t *testing.T, app *App) (*httptest.Server, *ht
 		t.Fatal("HTTPS test server returned an unexpected transport")
 	}
 	transport = transport.Clone()
-	tlsConfig := transport.TLSClientConfig.Clone()
-	tlsConfig.InsecureSkipVerify = false
-	tlsConfig.RootCAs = roots
-	tlsConfig.ServerName = "cert-me"
-	transport.TLSClientConfig = tlsConfig
+	transport.TLSClientConfig = &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"http/1.1"},
+		RootCAs:    roots,
+		ServerName: "cert-me",
+	}
 	client.Transport = transport
 	return server, client
 }
