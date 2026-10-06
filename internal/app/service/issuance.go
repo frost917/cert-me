@@ -805,6 +805,7 @@ func (s *IssuanceService) replayBeforePreparation(
 		if err != nil {
 			return err
 		}
+		projected.Replayed = true
 		*result = projected
 		found = true
 		return nil
@@ -984,6 +985,7 @@ func (s *IssuanceService) commitIssue(ctx context.Context, tx port.TxStores, met
 		if err != nil {
 			return err
 		}
+		v.Replayed = true
 		*result = v
 		return nil
 	}
@@ -1528,6 +1530,7 @@ func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, met
 		if err != nil {
 			return err
 		}
+		v.Replayed = true
 		*result = v
 		return nil
 	}
