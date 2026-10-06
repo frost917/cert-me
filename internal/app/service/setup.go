@@ -292,7 +292,7 @@ func (s *SetupService) Complete(ctx context.Context, meta contract.MutationMeta,
 
 		now := s.deps.Clock.Now()
 		if err := appendAccountAudit(ctx, tx, s.deps.IDs, now, meta.RequestMeta,
-			contract.AuditActorAccount, string(meta.Principal.AccountID()), "setup.complete", "installation", "installation"); err != nil {
+			contract.AuditActorAccount, string(meta.Principal.AccountID()), "setup.complete", "installation", ""); err != nil {
 			return err
 		}
 
@@ -312,7 +312,8 @@ func installationHasRoot(ctx context.Context, tx port.TxStores) (bool, error) {
 		if err != nil {
 			return false, storeError(err, "setup_authority_read_failed", "could not verify the initial Root authority")
 		}
-		for _, authority := range result.Items {
+		for _, queried := range result.Items {
+			authority := queried.Authority
 			if authority.Kind() == domain.AuthorityKindRoot {
 				return true, nil
 			}
