@@ -1381,6 +1381,9 @@ func (s *IssuanceService) prepareRenew(ctx context.Context, meta contract.Mutati
 	if err := targetIssuer.CanIssue(domain.IssuerContext{RequestedWindow: policyWindow, Intent: domain.IssuanceIntentLeaf}, prep.now); err != nil {
 		return renewPrepared{}, contract.FromDomainError(err)
 	}
+	if !revoked && !keyCompromised && prep.snapshot.CurrentKeyGeneration.Custody() != domain.KeyCustodyClientHeld {
+		return renewPrepared{}, contract.NewAppError(contract.ErrorKindConflict, "delivery_not_available", "개인키 수령이 불가능합니다.")
+	}
 
 	keyReady := !revoked && !keyCompromised && prep.snapshot.CurrentKeyGeneration.Custody() == domain.KeyCustodyClientHeld
 	renewalPlan, err := prep.snapshot.Series.PlanRenewal(domain.RenewalFacts{
