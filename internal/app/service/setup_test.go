@@ -516,6 +516,38 @@ func TestComplete_AdvancesStageAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestComplete_AuditUsesInstallationTargetWithoutUUID(t *testing.T) {
+	f := newSetupFixture(t)
+	seedInstallation(t, f.store, port.SetupStagePKIRequired)
+	meta := seedAdminSession(t, f.store, testNow())
+	seedDefaultSettings(t, f.store)
+	seedIssuableRoot(t, f.store, f.ids, testNow())
+	zero := domain.Version(0)
+	meta.ExpectedVersion = &zero
+
+	if _, err := f.svc.Complete(context.Background(), meta, contract.SetupCompleteCommand{}); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	var completion *port.AuditEvent
+	for _, event := range f.store.AuditEvents() {
+		if event.Action == "setup.complete" {
+			copy := event
+			completion = &copy
+			break
+		}
+	}
+	if completion == nil {
+		t.Fatal("setup completion did not append its audit event")
+	}
+	if completion.TargetType != "installation" {
+		t.Fatalf("completion audit target type = %q, want installation", completion.TargetType)
+	}
+	if completion.TargetID != "" {
+		t.Fatalf("completion audit target id = %q, want empty for the installation singleton", completion.TargetID)
+	}
+}
+
 // TestComplete_RejectsExpiredAdminSession is the "관리 서비스의 모든 변경은
 // 현재 계정 상태·epoch를 트랜잭션 안에서 다시 확인한다" check applied to
 // Complete: a session that authenticated the request has since gone
