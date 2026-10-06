@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"cert-me/internal/app/contract"
 	"cert-me/internal/app/port"
@@ -104,12 +105,8 @@ func decodeStoredAuthorityResult(stored port.OperationRequestResult) (storedAuth
 	return v, nil
 }
 
-// toView re-reads the live authority row for replay. CreatedAt is left zero:
-// there is no created_at column on the authorities table
-// (docs/data-model.md's authorities row lists none) and no other stored fact
-// this developer's files can derive it from, so a replay cannot recover the
-// original creation instant. Flagged for the lead alongside AuthorityView's
-// own already-documented CRLStatus gap.
+// toView re-reads the live authority row for replay. The HTTP query projection
+// supplies persisted creation metadata and CRL status before rendering it.
 func (v storedAuthorityCreateResult) toView(ctx context.Context, tx port.TxStores) (contract.AuthorityView, error) {
 	authority, err := tx.PKI().GetIssuerForUpdate(ctx, domain.AuthorityID(v.AuthorityID))
 	if err != nil {
@@ -312,6 +309,7 @@ func (s *AuthorityService) replayCreateBeforePreparation(
 		if err != nil {
 			return err
 		}
+		projected.Replayed = true
 		*result = projected
 		found = true
 		return nil
@@ -402,7 +400,10 @@ func (s *AuthorityService) prepareCreate(ctx context.Context, meta contract.Muta
 		return authorityCreatePrepared{}, err
 	}
 
-	window, err := prep.validity.Window(x509NotBefore(prep.now))
+	// A newly enabled CA must be usable immediately. X.509 represents whole
+	// seconds, so use the current representable second for CA validity rather
+	// than placing its start in the future. Issuer checks still use actual now.
+	window, err := prep.validity.Window(domain.NewInstant(prep.now.Time().Truncate(time.Second)))
 	if err != nil {
 		return authorityCreatePrepared{}, contract.FromDomainError(err)
 	}
@@ -563,6 +564,7 @@ func (s *AuthorityService) commitCreate(ctx context.Context, tx port.TxStores, m
 		if err != nil {
 			return err
 		}
+		v.Replayed = true
 		*result = v
 		return nil
 	}
