@@ -11,6 +11,7 @@ import (
 	"cert-me/internal/app/port"
 	"cert-me/internal/config"
 	"cert-me/internal/storage/connection"
+	"cert-me/internal/storage/sqlstore/dialect"
 )
 
 func openTestStore(t *testing.T) (*connection.DB, *Store, *SQLExecutor) {
@@ -175,6 +176,50 @@ func TestReadUsesOneTransactionSnapshot(t *testing.T) {
 	}
 	if committed != 20 {
 		t.Fatalf("committed value = %d, want 20", committed)
+	}
+}
+
+func TestReadFactorySuppressesRowLockClause(t *testing.T) {
+	_, store, executor := openTestStore(t)
+	var got string
+	err := store.Read(context.Background(), func(port.TxStores) error {
+		got = RowLockClause(*executor, " FOR UPDATE")
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Read(): %v", err)
+	}
+	if got != "" {
+		t.Fatalf("read snapshot row lock clause = %q, want empty", got)
+	}
+}
+
+func TestWriteFactoryRetainsRowLockClauseForEveryDialect(t *testing.T) {
+	_, store, executor := openTestStore(t)
+	var got []string
+	err := store.Write(context.Background(), func(port.TxStores) error {
+		for _, kind := range []config.DatabaseKind{config.SQLite, config.Postgres, config.MySQL, config.MariaDB} {
+			d, err := dialect.New(kind)
+			if err != nil {
+				return err
+			}
+			clause := d.RowLockClause()
+			if clause == "" {
+				// Use a representative lock suffix for SQLite, whose writer
+				// serialization does not use SQL row-lock syntax.
+				clause = " FOR UPDATE"
+			}
+			got = append(got, RowLockClause(*executor, clause))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Write(): %v", err)
+	}
+	for i, clause := range []string{" FOR UPDATE", " FOR UPDATE", " FOR UPDATE", " FOR UPDATE"} {
+		if got[i] != clause {
+			t.Errorf("write row lock clause[%d] = %q, want %q", i, got[i], clause)
+		}
 	}
 }
 
