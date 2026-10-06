@@ -80,6 +80,47 @@ func TestIssuanceReissueAlwaysCreatesFreshKeyAndReplaysBeforeChangedVersion(t *t
 	if !replayed.Replayed || replayed.CertificateID != first.CertificateID || f.keyEngine.generateCalls != 2 {
 		t.Fatalf("replay = %+v, key generations = %d; want the same result flagged as replay with no new key", replayed, f.keyEngine.generateCalls)
 	}
+	f.authorizer.allow = false
+	_, err = f.svc.Reissue(context.Background(), meta, cmd)
+	var authErr *contract.AppError
+	if !errors.As(err, &authErr) || authErr.Kind() != contract.ErrorKindForbidden {
+		t.Fatalf("replay after permission loss error = %v, want forbidden", err)
+	}
+	f.authorizer.allow = true
+	changedInput := cmd
+	changedInput.Reason = contract.ReissueReasonEmergency
+	_, err = f.svc.Reissue(context.Background(), meta, changedInput)
+	var conflict *contract.AppError
+	if !errors.As(err, &conflict) || conflict.Kind() != contract.ErrorKindConflict || conflict.Code() != "idempotency_key_reused" {
+		t.Fatalf("replay with changed input error = %v, want idempotency_key_reused conflict", err)
+	}
+}
+
+func TestIssuanceReissueReplayRequiresCurrentAuthentication(t *testing.T) {
+	f := newIssuanceFixture(t)
+	source := issueReissueSource(t, f)
+	if err := markIssueDeliveryCompletedForTest(t, f, source); err != nil {
+		t.Fatalf("complete source delivery: %v", err)
+	}
+	snapshot := currentSeriesSnapshot(t, f.store, source.SeriesID)
+	meta := reissueMeta(t, snapshot.Series.Version(), "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
+	cmd := reissueCommandFor(source, contract.ReissueReasonManualRotation)
+	if _, err := f.svc.Reissue(context.Background(), meta, cmd); err != nil {
+		t.Fatalf("initial Reissue: %v", err)
+	}
+	if err := f.store.Write(context.Background(), func(tx port.TxStores) error {
+		return tx.Accounts().DeleteAllSessions(context.Background(), issuanceTestAdminAccountID)
+	}); err != nil {
+		t.Fatalf("invalidate admin session: %v", err)
+	}
+	_, err := f.svc.Reissue(context.Background(), meta, cmd)
+	var appErr *contract.AppError
+	if !errors.As(err, &appErr) || appErr.Kind() != contract.ErrorKindAuth {
+		t.Fatalf("replay after session invalidation error = %v, want auth failure", err)
+	}
+	if f.keyEngine.generateCalls != 2 {
+		t.Fatalf("key generation calls = %d, want no key generation during rejected replay", f.keyEngine.generateCalls)
+	}
 }
 
 func TestIssuanceReissueFailureAndExpiryCompleteRevocationAtomically(t *testing.T) {
@@ -116,33 +157,75 @@ func TestIssuanceReissueFailureAndExpiryCompleteRevocationAtomically(t *testing.
 	}
 }
 
-func TestIssuanceReissueKeyCompromiseMarksAndRevokesSource(t *testing.T) {
+func TestIssuanceReissueManualRotationClosesPendingDeliveryAndRevokesSourceAtomically(t *testing.T) {
 	f := newIssuanceFixture(t)
 	source := issueReissueSource(t, f)
 	snapshot := currentSeriesSnapshot(t, f.store, source.SeriesID)
 	issuerID := sourceIssuerKeyID(t, f.store, source.CertificateID)
 	seedCRLState(t, f.store, issuerID)
-	if err := f.store.Write(context.Background(), func(tx port.TxStores) error {
-		return tx.PKI().MarkCompromised(context.Background(), snapshot.CurrentKeyGeneration.KeyMaterialID(), testNow())
-	}); err != nil {
-		t.Fatalf("mark current key compromised: %v", err)
-	}
+	assertReissueSourceDeliveryPending(t, f.store, snapshot.CurrentKeyGeneration.ID())
 
-	cmd := reissueCommandFor(source, contract.ReissueReasonKeyCompromise)
+	cmd := reissueCommandFor(source, contract.ReissueReasonManualRotation)
+	result, err := f.svc.Reissue(context.Background(), reissueMeta(t, snapshot.Series.Version(), "98989898-9898-4989-8989-989898989898"), cmd)
+	if err != nil {
+		t.Fatalf("Reissue with a pending source delivery: %v", err)
+	}
+	if result.CertificateID == source.CertificateID || !result.KeyRotated {
+		t.Fatalf("Reissue result = %+v, want a replacement certificate with a fresh key", result)
+	}
+	assertPendingReissueCleanup(t, f.store, source.CertificateID, snapshot.CurrentKeyGeneration.ID(),
+		snapshot.CurrentKeyGeneration.KeyMaterialID(), issuerID)
+}
+
+func TestIssuanceReissueKeyCompromiseMarksAndRevokesSource(t *testing.T) {
+	f := newIssuanceFixture(t)
+	initial := issueReissueSource(t, f)
+	if err := markIssueDeliveryCompletedForTest(t, f, initial); err != nil {
+		t.Fatalf("complete initial delivery: %v", err)
+	}
+	snapshot := currentSeriesSnapshot(t, f.store, initial.SeriesID)
+	renewMeta := issueMutationMeta(t, "abababab-abab-4bab-8bab-abababababab")
+	renewMeta.ExpectedVersion = contract.WithExpectedVersion(snapshot.Series.Version())
+	renewed, err := f.svc.Renew(context.Background(), renewMeta, renewCommand(initial.SeriesID, initial.CertificateID))
+	if err != nil {
+		t.Fatalf("renew without key rotation: %v", err)
+	}
+	if renewed.KeyRotated || renewed.KeyGenerationID != snapshot.CurrentKeyGeneration.ID() {
+		t.Fatalf("renewal = %+v, want same key generation before compromise", renewed)
+	}
+	current := contract.IssuanceView{SeriesID: initial.SeriesID, CertificateID: renewed.CertificateID}
+	snapshot = currentSeriesSnapshot(t, f.store, initial.SeriesID)
+	issuerID := sourceIssuerKeyID(t, f.store, initial.CertificateID)
+	seedCRLState(t, f.store, issuerID)
+	cmd := reissueCommandFor(current, contract.ReissueReasonKeyCompromise)
 	result, err := f.svc.Reissue(context.Background(), reissueMeta(t, snapshot.Series.Version(), "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"), cmd)
 	if err != nil {
 		t.Fatalf("Reissue after key compromise: %v", err)
 	}
-	if result.CertificateID == source.CertificateID || result.KeyGenerationID == snapshot.CurrentKeyGeneration.ID() || result.RenewalCount != 0 {
+	if result.CertificateID == renewed.CertificateID || result.KeyGenerationID == snapshot.CurrentKeyGeneration.ID() || result.RenewalCount != 0 {
 		t.Fatalf("reissue = %+v, want fresh key generation and reset count", result)
 	}
-	assertReissueRevocation(t, f.store, source.CertificateID, domain.RevocationReasonKeyCompromise)
+	assertReissueRevocation(t, f.store, initial.CertificateID, domain.RevocationReasonKeyCompromise)
+	assertReissueRevocation(t, f.store, renewed.CertificateID, domain.RevocationReasonKeyCompromise)
+	var key port.KeyMaterial
+	if err := f.store.Read(context.Background(), func(tx port.TxStores) error {
+		var err error
+		key, err = tx.PKI().GetKeyMaterial(context.Background(), snapshot.CurrentKeyGeneration.KeyMaterialID())
+		return err
+	}); err != nil {
+		t.Fatalf("read compromised key material: %v", err)
+	}
+	if key.CompromisedAt.IsZero() {
+		t.Fatal("key_compromise reissue did not persist compromised_at")
+	}
 }
 
 func TestIssuanceReissueEmergencyRequiresMatchingOpenImpactAndUsesTargetAuthority(t *testing.T) {
 	f := newIssuanceFixture(t)
 	source := issueReissueSource(t, f)
-	targetAuthorityID := seedIssuableIntermediate(t, f.store, f.ids, testNow())
+	targetAuthorityID := seedDistinctReissueAuthority(t, f)
+	recordingAuthorizer := &recordingReissueAuthorizer{}
+	f.svc.deps.Authorizer = recordingAuthorizer
 	transitionID, err := domain.ParseTransitionID(f.ids.NewUUID())
 	if err != nil {
 		t.Fatalf("transition ID: %v", err)
@@ -168,6 +251,8 @@ func TestIssuanceReissueEmergencyRequiresMatchingOpenImpactAndUsesTargetAuthorit
 		t.Fatalf("seed emergency impact: %v", err)
 	}
 	snapshot := currentSeriesSnapshot(t, f.store, source.SeriesID)
+	seedCRLState(t, f.store, sourceIssuerKeyID(t, f.store, source.CertificateID))
+	assertReissueSourceDeliveryPending(t, f.store, snapshot.CurrentKeyGeneration.ID())
 	cmd := reissueCommandFor(source, contract.ReissueReasonEmergency)
 	cmd.TargetAuthorityID = targetAuthorityID
 	cmd.TransitionID = transitionID
@@ -192,6 +277,43 @@ func TestIssuanceReissueEmergencyRequiresMatchingOpenImpactAndUsesTargetAuthorit
 	if !linked {
 		t.Fatal("successful emergency reissue did not link its replacement certificate to the impact")
 	}
+	assertPendingReissueCleanup(t, f.store, source.CertificateID, snapshot.CurrentKeyGeneration.ID(),
+		snapshot.CurrentKeyGeneration.KeyMaterialID(), sourceIssuerKeyID(t, f.store, source.CertificateID))
+	if !recordingAuthorizer.hasScopes(f.authorityID, targetAuthorityID) {
+		t.Fatalf("authorization scopes = %#v, want both transition source and target authorities", recordingAuthorizer.scopes)
+	}
+}
+
+func TestIssuanceReissueKeyCompromiseRevokesUnexpiredCertificateBeforeNotBefore(t *testing.T) {
+	f := newIssuanceFixture(t)
+	now := testNow().Add(domain.NewDuration(500 * time.Millisecond))
+	f.svc.deps.Clock = fixedClock{now: now}
+	source := issueReissueSource(t, f)
+
+	var certificate domain.Certificate
+	if err := f.store.Read(context.Background(), func(tx port.TxStores) error {
+		var err error
+		certificate, err = tx.PKI().GetCertificate(context.Background(), source.CertificateID)
+		return err
+	}); err != nil {
+		t.Fatalf("read source certificate: %v", err)
+	}
+	if !certificate.Validity().NotBefore().After(now) || certificate.IsExpiredAt(now) {
+		t.Fatalf("source validity = %+v at %s, want unexpired with a future not_before", certificate.Validity(), now)
+	}
+
+	issuerID := sourceIssuerKeyID(t, f.store, source.CertificateID)
+	seedCRLState(t, f.store, issuerID)
+	snapshot := currentSeriesSnapshot(t, f.store, source.SeriesID)
+	cmd := reissueCommandFor(source, contract.ReissueReasonKeyCompromise)
+	if _, err := f.svc.Reissue(context.Background(), reissueMeta(t, snapshot.Series.Version(), "97979797-9797-4979-8979-979797979797"), cmd); err != nil {
+		t.Fatalf("Reissue after key compromise: %v", err)
+	}
+	assertReissueRevocation(t, f.store, source.CertificateID, domain.RevocationReasonKeyCompromise)
+	state := crlState(t, f.store, issuerID)
+	if state.RevocationGeneration() <= state.PublishedGeneration() {
+		t.Fatalf("CRL state = %+v, want a generation newer than the published generation", state)
+	}
 }
 
 func TestIssuanceReissueRejectsUnsupportedEvidenceWithoutSigning(t *testing.T) {
@@ -201,7 +323,6 @@ func TestIssuanceReissueRejectsUnsupportedEvidenceWithoutSigning(t *testing.T) {
 	}{
 		{name: "failed reason with pending delivery", reason: contract.ReissueReasonDeliveryFailed},
 		{name: "expired reason with pending delivery", reason: contract.ReissueReasonDeliveryExpired},
-		{name: "compromise without compromise marker", reason: contract.ReissueReasonKeyCompromise},
 		{name: "emergency without transition", reason: contract.ReissueReasonEmergency},
 	}
 	for _, tc := range tests {
@@ -224,6 +345,68 @@ func TestIssuanceReissueRejectsUnsupportedEvidenceWithoutSigning(t *testing.T) {
 	}
 }
 
+func TestIssuanceReissueCompromisedKeyRequiresCompromiseReason(t *testing.T) {
+	f := newIssuanceFixture(t)
+	source := issueReissueSource(t, f)
+	snapshot := currentSeriesSnapshot(t, f.store, source.SeriesID)
+	if err := f.store.Write(context.Background(), func(tx port.TxStores) error {
+		return tx.PKI().MarkCompromised(context.Background(), snapshot.CurrentKeyGeneration.KeyMaterialID(), testNow())
+	}); err != nil {
+		t.Fatalf("mark current key compromised: %v", err)
+	}
+	_, err := f.svc.Reissue(context.Background(), reissueMeta(t, snapshot.Series.Version(), "12121212-1212-4212-8212-121212121212"),
+		reissueCommandFor(source, contract.ReissueReasonManualRotation))
+	var appErr *contract.AppError
+	if !errors.As(err, &appErr) || appErr.Kind() != contract.ErrorKindForbidden {
+		t.Fatalf("manual reissue of a compromised key error = %v, want forbidden", err)
+	}
+	if f.signer.calls != 1 || f.keyEngine.generateCalls != 1 {
+		t.Fatalf("signer calls = %d, generated keys = %d, want no extra preparation", f.signer.calls, f.keyEngine.generateCalls)
+	}
+}
+
+func TestIssuanceReissueRequiresEmergencyTransitionModeAndTargetMatch(t *testing.T) {
+	f := newIssuanceFixture(t)
+	source := issueReissueSource(t, f)
+	targetID := seedDistinctReissueAuthority(t, f)
+	transitionID, err := domain.ParseTransitionID(f.ids.NewUUID())
+	if err != nil {
+		t.Fatalf("transition ID: %v", err)
+	}
+	transition, err := domain.NewTransition(domain.TransitionFacts{
+		ID: transitionID, SourceAuthorityID: f.authorityID, TargetAuthorityID: targetID,
+		Mode: domain.TransitionModeNormal, State: domain.TransitionStateInProgress,
+		ReportedBy: issuanceTestAdminAccountID, ReportedAt: testNow(), Reason: "normal replacement", Version: 1,
+	})
+	if err != nil {
+		t.Fatalf("NewTransition: %v", err)
+	}
+	impact, err := domain.NewTransitionImpact(domain.TransitionImpactFacts{TransitionID: transitionID, CertificateID: source.CertificateID})
+	if err != nil {
+		t.Fatalf("NewTransitionImpact: %v", err)
+	}
+	if err := f.store.Write(context.Background(), func(tx port.TxStores) error {
+		if err := tx.Transitions().Insert(context.Background(), transition); err != nil {
+			return err
+		}
+		return tx.Transitions().AddImpact(context.Background(), impact)
+	}); err != nil {
+		t.Fatalf("seed normal transition: %v", err)
+	}
+	snapshot := currentSeriesSnapshot(t, f.store, source.SeriesID)
+	cmd := reissueCommandFor(source, contract.ReissueReasonEmergency)
+	cmd.TransitionID = transitionID
+	cmd.TargetAuthorityID = targetID
+	_, err = f.svc.Reissue(context.Background(), reissueMeta(t, snapshot.Series.Version(), "13131313-1313-4313-8313-131313131313"), cmd)
+	var appErr *contract.AppError
+	if !errors.As(err, &appErr) || appErr.Kind() != contract.ErrorKindConflict {
+		t.Fatalf("emergency request against normal transition error = %v, want conflict", err)
+	}
+	if f.signer.calls != 1 || f.keyEngine.generateCalls != 1 {
+		t.Fatalf("signer calls = %d, generated keys = %d, want failure before preparation", f.signer.calls, f.keyEngine.generateCalls)
+	}
+}
+
 func TestIssuanceReissueConcurrentSameRequestCommitsOnce(t *testing.T) {
 	f := newIssuanceFixture(t)
 	source := issueReissueSource(t, f)
@@ -233,6 +416,11 @@ func TestIssuanceReissueConcurrentSameRequestCommitsOnce(t *testing.T) {
 	snapshot := currentSeriesSnapshot(t, f.store, source.SeriesID)
 	meta := reissueMeta(t, snapshot.Series.Version(), "dddddddd-dddd-4ddd-8ddd-dddddddddddd")
 	cmd := reissueCommandFor(source, contract.ReissueReasonManualRotation)
+	guard := &sync.Mutex{}
+	f.svc.deps.IDs = synchronizedReissueIDs{IDGenerator: f.ids, mu: guard}
+	f.svc.deps.KeyEngine = synchronizedReissueKeyEngine{KeyEngine: f.keyEngine, mu: guard}
+	f.svc.deps.SerialGenerator = synchronizedReissueSerials{SerialGenerator: f.serials, mu: guard}
+	f.svc.deps.CertificateSigner = synchronizedReissueSigner{CertificateSigner: f.signer, mu: guard}
 	start := make(chan struct{})
 	results := make([]contract.IssuanceView, 2)
 	errs := make([]error, 2)
@@ -255,9 +443,154 @@ func TestIssuanceReissueConcurrentSameRequestCommitsOnce(t *testing.T) {
 	if results[0].CertificateID == "" || results[0].CertificateID != results[1].CertificateID {
 		t.Fatalf("concurrent results = %+v and %+v, want one certificate result", results[0], results[1])
 	}
-	if f.keyEngine.generateCalls != 2 {
-		t.Fatalf("key generation calls = %d, want only one reissue key in addition to the initial key", f.keyEngine.generateCalls)
+	after := currentSeriesSnapshot(t, f.store, source.SeriesID)
+	if after.Series.Version() != snapshot.Series.Version().Next() || after.Series.CurrentCertificateID() != results[0].CertificateID {
+		t.Fatalf("series after concurrent request = version %d/current %s, want one committed replacement from version %d", after.Series.Version(), after.Series.CurrentCertificateID(), snapshot.Series.Version())
 	}
+}
+
+func TestIssuanceReissueKeyCompromiseRollsBackAllChangesWhenAuditFails(t *testing.T) {
+	f := newIssuanceFixture(t)
+	source := issueReissueSource(t, f)
+	if err := markIssueDeliveryCompletedForTest(t, f, source); err != nil {
+		t.Fatalf("complete source delivery: %v", err)
+	}
+	snapshot := currentSeriesSnapshot(t, f.store, source.SeriesID)
+	issuerID := sourceIssuerKeyID(t, f.store, source.CertificateID)
+	seedCRLState(t, f.store, issuerID)
+	beforeEvents := len(f.store.AuditEvents())
+	meta := reissueMeta(t, snapshot.Series.Version(), "ffffffff-ffff-4fff-8fff-ffffffffffff")
+	cmd := reissueCommandFor(source, contract.ReissueReasonKeyCompromise)
+	f.svc.deps.UnitOfWork = failingReissueAuditUoW{inner: f.store}
+	if _, err := f.svc.Reissue(context.Background(), meta, cmd); err == nil {
+		t.Fatal("Reissue succeeded when audit persistence failed")
+	}
+	if len(f.store.AuditEvents()) != beforeEvents {
+		t.Fatalf("audit event count = %d, want unchanged %d after rollback", len(f.store.AuditEvents()), beforeEvents)
+	}
+	after := currentSeriesSnapshot(t, f.store, source.SeriesID)
+	if after.Series.Version() != snapshot.Series.Version() || after.Series.CurrentCertificateID() != source.CertificateID {
+		t.Fatal("series pointer/version changed despite failed audit and rollback")
+	}
+	var key port.KeyMaterial
+	var revocationErr error
+	if err := f.store.Read(context.Background(), func(tx port.TxStores) error {
+		var err error
+		key, err = tx.PKI().GetKeyMaterial(context.Background(), snapshot.CurrentKeyGeneration.KeyMaterialID())
+		if err != nil {
+			return err
+		}
+		certificate, err := tx.PKI().GetCertificate(context.Background(), source.CertificateID)
+		if err != nil {
+			return err
+		}
+		_, revocationErr = tx.Revocations().FindForUpdate(context.Background(), certificate.IssuerCAKeyGenerationID(), certificate.Serial())
+		return nil
+	}); err != nil {
+		t.Fatalf("read post-rollback state: %v", err)
+	}
+	if !key.CompromisedAt.IsZero() {
+		t.Fatal("compromised_at mutation survived the failed reissue transaction")
+	}
+	if !errors.Is(revocationErr, port.ErrNotFound) {
+		t.Fatalf("source revocation error = %v, want no committed revocation", revocationErr)
+	}
+	if f.signer.calls < 2 {
+		t.Fatal("test did not reach signing before injected audit failure")
+	}
+}
+
+type failingReissueAuditRepo struct{ port.AuditRepository }
+
+func (failingReissueAuditRepo) Append(context.Context, port.AuditEvent, port.AuditScope) error {
+	return errors.New("injected reissue audit failure")
+}
+
+type failingReissueAuditTxStores struct{ port.TxStores }
+
+func (f failingReissueAuditTxStores) Audit() port.AuditRepository {
+	return failingReissueAuditRepo{AuditRepository: f.TxStores.Audit()}
+}
+
+type failingReissueAuditUoW struct{ inner port.UnitOfWork }
+
+func (u failingReissueAuditUoW) Write(ctx context.Context, fn func(port.TxStores) error) error {
+	return u.inner.Write(ctx, func(tx port.TxStores) error { return fn(failingReissueAuditTxStores{TxStores: tx}) })
+}
+
+type recordingReissueAuthorizer struct {
+	scopes []port.AuthorizationScope
+}
+
+func (a *recordingReissueAuthorizer) Authorize(_ context.Context, _ contract.Principal, action port.Action, scope port.AuthorizationScope) error {
+	if action == port.ActionIssuanceReissue {
+		a.scopes = append(a.scopes, scope)
+	}
+	return nil
+}
+
+func (a *recordingReissueAuthorizer) hasScopes(want ...domain.AuthorityID) bool {
+	for _, scope := range a.scopes {
+		found := make(map[domain.AuthorityID]bool)
+		for _, id := range scope.AuthorityIDs() {
+			found[id] = true
+		}
+		allFound := true
+		for _, id := range want {
+			if !found[id] {
+				allFound = false
+				break
+			}
+		}
+		if allFound {
+			return true
+		}
+	}
+	return false
+}
+
+type synchronizedReissueIDs struct {
+	port.IDGenerator
+	mu *sync.Mutex
+}
+
+func (g synchronizedReissueIDs) NewUUID() string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.IDGenerator.NewUUID()
+}
+
+type synchronizedReissueKeyEngine struct {
+	port.KeyEngine
+	mu *sync.Mutex
+}
+
+func (e synchronizedReissueKeyEngine) Generate(ctx context.Context, spec port.KeySpec) (port.GeneratedKey, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.KeyEngine.Generate(ctx, spec)
+}
+
+type synchronizedReissueSerials struct {
+	port.SerialGenerator
+	mu *sync.Mutex
+}
+
+func (g synchronizedReissueSerials) NewSerial(ctx context.Context) (domain.SerialNumber, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.SerialGenerator.NewSerial(ctx)
+}
+
+type synchronizedReissueSigner struct {
+	port.CertificateSigner
+	mu *sync.Mutex
+}
+
+func (s synchronizedReissueSigner) Sign(ctx context.Context, request port.CertificateSigningRequest, secret domain.EncryptedSecret) (domain.Certificate, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.CertificateSigner.Sign(ctx, request, secret)
 }
 
 func sourceIssuerKeyID(t *testing.T, store *porttest.Store, certificateID domain.CertificateID) domain.CAKeyGenerationID {
@@ -273,6 +606,92 @@ func sourceIssuerKeyID(t *testing.T, store *porttest.Store, certificateID domain
 		t.Fatalf("read certificate issuer: %v", err)
 	}
 	return id
+}
+
+func seedDistinctReissueAuthority(t *testing.T, f *issuanceFixture) domain.AuthorityID {
+	t.Helper()
+	ctx := context.Background()
+	authorityID, err := domain.ParseAuthorityID(f.ids.NewUUID())
+	if err != nil {
+		t.Fatalf("target authority ID: %v", err)
+	}
+	parentID, err := domain.ParseAuthorityID(f.ids.NewUUID())
+	if err != nil {
+		t.Fatalf("target parent ID: %v", err)
+	}
+	keyGenerationID, err := domain.ParseCAKeyGenerationID(f.ids.NewUUID())
+	if err != nil {
+		t.Fatalf("target key generation ID: %v", err)
+	}
+	keyMaterialID, err := domain.ParseKeyMaterialID(f.ids.NewUUID())
+	if err != nil {
+		t.Fatalf("target key material ID: %v", err)
+	}
+	certificateID, err := domain.ParseCertificateID(f.ids.NewUUID())
+	if err != nil {
+		t.Fatalf("target certificate ID: %v", err)
+	}
+	publicKey, err := domain.NewPublicKey(domain.KeyAlgorithmECDSAP256, []byte("target public key "+string(keyMaterialID)))
+	if err != nil {
+		t.Fatalf("target public key: %v", err)
+	}
+	now := testNow()
+	window, err := domain.NewValidityWindow(now.Add(domain.NewDuration(-time.Hour)), now.Add(domain.NewDuration(24*365*5*time.Hour)))
+	if err != nil {
+		t.Fatalf("target issuer window: %v", err)
+	}
+	subject, err := domain.NewSubject(domain.SubjectFacts{CommonName: "Target Intermediate CA"})
+	if err != nil {
+		t.Fatalf("target issuer subject: %v", err)
+	}
+	certificate, err := domain.NewCertificate(domain.CertificateFacts{
+		ID: certificateID, DER: []byte("target issuer DER " + string(certificateID)), KeyMaterialID: keyMaterialID,
+		IssuerCAKeyGenerationID: keyGenerationID, Serial: serial(t, "91"), Validity: window,
+		Subject: subject, Kind: domain.CertificateKindCA, KeyAlgorithm: domain.KeyAlgorithmECDSAP256,
+		Origin: domain.CertificateOriginGenerated,
+	})
+	if err != nil {
+		t.Fatalf("target issuer certificate: %v", err)
+	}
+	secret, err := domain.NewEncryptedSecret(domain.EncryptedSecretFacts{
+		OwnerKeyID: keyMaterialID, Purpose: domain.SecretPurposeCASigning, FormatVersion: 1,
+		EncryptionGenerationID: "gen-1", Nonce: []byte("target-nonce-0000001"), Ciphertext: []byte("target-ca-ciphertext"),
+	})
+	if err != nil {
+		t.Fatalf("target issuer secret: %v", err)
+	}
+	authority, err := domain.NewAuthority(domain.AuthorityFacts{
+		ID: authorityID, Kind: domain.AuthorityKindIntermediate, Name: "Target Intermediate",
+		ManagementParentID: parentID, IssuanceState: domain.IssuanceStateEnabled,
+		IssuanceCertificateID: certificateID, KeyGenerationID: keyGenerationID,
+		KeyAvailable: true, CertificateWindow: window, Version: 1,
+	})
+	if err != nil {
+		t.Fatalf("target authority: %v", err)
+	}
+	if err := f.store.Write(ctx, func(tx port.TxStores) error {
+		if err := tx.PKI().InsertKeyMaterial(ctx, port.KeyMaterial{ID: keyMaterialID, PublicKey: publicKey, Origin: "generated"}); err != nil {
+			return err
+		}
+		if err := tx.PKI().InsertKeyGeneration(ctx, port.CAKeyGeneration{
+			ID: keyGenerationID, AuthorityID: authorityID, KeyMaterialID: keyMaterialID, GenerationNo: 1,
+		}); err != nil {
+			return err
+		}
+		if err := tx.PKI().InsertCertificate(ctx, certificate); err != nil {
+			return err
+		}
+		if err := tx.PKI().InsertCACertificateRecord(ctx, port.CACertificateRecord{CertificateID: certificateID, CAKeyGenerationID: keyGenerationID}); err != nil {
+			return err
+		}
+		if err := tx.Secrets().InsertEncrypted(ctx, secret); err != nil {
+			return err
+		}
+		return tx.PKI().InsertAuthority(ctx, authority)
+	}); err != nil {
+		t.Fatalf("seed target authority: %v", err)
+	}
+	return authorityID
 }
 
 func assertReissueRevocation(t *testing.T, store *porttest.Store, certificateID domain.CertificateID, reason domain.RevocationReason) {
@@ -293,6 +712,72 @@ func assertReissueRevocation(t *testing.T, store *porttest.Store, certificateID 
 	}
 	if revocation.CertificateID() != certificateID || revocation.Reason() != reason {
 		t.Fatalf("revocation = %#v, want certificate %s with reason %s", revocation, certificateID, reason)
+	}
+}
+
+func assertReissueSourceDeliveryPending(t *testing.T, store *porttest.Store, generationID domain.LeafKeyGenerationID) {
+	t.Helper()
+	var delivery domain.Delivery
+	if err := store.Read(context.Background(), func(tx port.TxStores) error {
+		var err error
+		delivery, err = tx.Delivery().GetDeliveryByLeafKeyGenerationForUpdate(context.Background(), generationID)
+		return err
+	}); err != nil {
+		t.Fatalf("read source delivery: %v", err)
+	}
+	if delivery.State() != domain.DeliveryStatePending || delivery.ExpiresAt().IsExpiredAt(testNow()) {
+		t.Fatalf("source delivery = state %s, expires %s; want pending and unexpired at %s", delivery.State(), delivery.ExpiresAt(), testNow())
+	}
+}
+
+func assertPendingReissueCleanup(
+	t *testing.T,
+	store *porttest.Store,
+	certificateID domain.CertificateID,
+	generationID domain.LeafKeyGenerationID,
+	keyMaterialID domain.KeyMaterialID,
+	issuerID domain.CAKeyGenerationID,
+) {
+	t.Helper()
+	var revocation domain.Revocation
+	var revocationErr error
+	var state domain.CRLState
+	var delivery domain.Delivery
+	var secretErr error
+	err := store.Read(context.Background(), func(tx port.TxStores) error {
+		certificate, err := tx.PKI().GetCertificate(context.Background(), certificateID)
+		if err != nil {
+			return err
+		}
+		revocation, revocationErr = tx.Revocations().FindForUpdate(context.Background(), certificate.IssuerCAKeyGenerationID(), certificate.Serial())
+		state, err = tx.CRLs().GetStateForUpdate(context.Background(), issuerID)
+		if err != nil {
+			return err
+		}
+		delivery, err = tx.Delivery().GetDeliveryByLeafKeyGenerationForUpdate(context.Background(), generationID)
+		if err != nil {
+			return err
+		}
+		_, secretErr = tx.Secrets().GetEncrypted(context.Background(), keyMaterialID, domain.SecretPurposeLeafDelivery)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("read source cleanup state: %v", err)
+	}
+	if revocationErr != nil {
+		t.Fatalf("source certificate revocation error = %v, want a committed revocation", revocationErr)
+	}
+	if revocation.CertificateID() != certificateID || revocation.Reason() != domain.RevocationReasonUnspecified {
+		t.Fatalf("source revocation = %#v, want certificate %s with unspecified reason", revocation, certificateID)
+	}
+	if state.RevocationGeneration() <= state.PublishedGeneration() {
+		t.Fatalf("CRL state generation = %d, published generation = %d; want dirty CRL state", state.RevocationGeneration(), state.PublishedGeneration())
+	}
+	if delivery.State() != domain.DeliveryStateFailed || delivery.FailureCode() != "reissued" {
+		t.Fatalf("source delivery = state %s, failure code %q; want failed/reissued", delivery.State(), delivery.FailureCode())
+	}
+	if !errors.Is(secretErr, port.ErrNotFound) {
+		t.Fatalf("old private-key ciphertext error = %v, want deleted ciphertext", secretErr)
 	}
 }
 
@@ -353,9 +838,20 @@ func setReissueDeliveryTerminalForTest(t *testing.T, f *issuanceFixture, issue c
 		case domain.DeliveryStateFailed:
 			next, err = delivery.Fail("transfer_failed", testNow())
 		case domain.DeliveryStateExpired:
-			expiry := delivery.ExpiresAt().Add(domain.NewDuration(time.Second))
-			next, err = delivery.Expire(expiry)
-			f.svc.deps.Clock = fixedClock{now: expiry}
+			alreadyExpired, buildErr := domain.NewDelivery(domain.DeliveryFacts{
+				ID: delivery.ID(), LeafKeyGenerationID: delivery.LeafKeyGenerationID(), CertificateID: delivery.CertificateID(),
+				ExpiresAt: testNow().Add(domain.NewDuration(-time.Second)), State: domain.DeliveryStatePending, Version: delivery.Version(),
+			})
+			if buildErr != nil {
+				return buildErr
+			}
+			if err := tx.Delivery().SaveDelivery(context.Background(), alreadyExpired, delivery.Version()); err != nil {
+				return err
+			}
+			next, err = alreadyExpired.Expire(testNow())
+			if err == nil {
+				return tx.Delivery().SaveDelivery(context.Background(), next, alreadyExpired.Version())
+			}
 		default:
 			return errors.New("unsupported test delivery state")
 		}
