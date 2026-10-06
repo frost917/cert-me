@@ -199,6 +199,19 @@ type PKIRepository interface {
 	// (§13).
 	SaveLeafKeyGeneration(ctx context.Context, generation domain.LeafKeyGeneration) error
 
+	// MarkLeafKeyGenerationClientHeld moves a leaf generation from
+	// pending_delivery to client_held only after its matching key delivery has
+	// a persisted server_completed outcome. It is idempotent for an already
+	// client_held generation, but only while that same completion proof still
+	// exists. The repository also requires the delivery certificate's leaf
+	// subtype row to identify this generation and series, and refuses to mark
+	// custody while a leaf_delivery secret remains. Callers must hold the
+	// matching delivery and series locks in the same transaction; no generic
+	// generation save path may change custody. It returns ErrNotFound when the
+	// generation is absent and domain.ErrNotPermitted when the completion
+	// proof, custody state, or secret-deletion condition is not satisfied.
+	MarkLeafKeyGenerationClientHeld(ctx context.Context, id domain.LeafKeyGenerationID) error
+
 	// InsertCertificate stores a freshly signed or imported certificate.
 	// certificates.der_sha256 is unique, so a duplicate DER surfaces as a
 	// conflict error rather than a silent second row.

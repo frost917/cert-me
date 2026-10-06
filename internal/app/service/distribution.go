@@ -355,6 +355,10 @@ func (s *DistributionService) commitConsumption(ctx context.Context, meta contra
 	var result consumedTransfer
 	var consumeNow domain.Instant
 	err := s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
+		scope, err := leafManagementAuthority(ctx, tx, prep.certificate.ID())
+		if err != nil {
+			return err
+		}
 		grant, err := tx.Delivery().GetGrantForUpdate(ctx, prep.tokenHash)
 		if err != nil {
 			if errors.Is(err, port.ErrNotFound) {
@@ -387,11 +391,6 @@ func (s *DistributionService) commitConsumption(ctx context.Context, meta contra
 		// resolves either), so this is a hard failure.
 		if grant.Purpose() != prep.purpose || grant.CertificateID() != prep.certificate.ID() {
 			return contract.NewAppError(contract.ErrorKindConflict, "download_grant_changed", "the download link changed since it was read")
-		}
-
-		scope, err := leafManagementAuthority(ctx, tx, prep.certificate.ID())
-		if err != nil {
-			return err
 		}
 
 		if grant.Purpose() != domain.GrantPurposeLeafPrivate {

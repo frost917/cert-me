@@ -1382,7 +1382,7 @@ func (s *IssuanceService) prepareRenew(ctx context.Context, meta contract.Mutati
 		return renewPrepared{}, contract.FromDomainError(err)
 	}
 	if !revoked && !keyCompromised && prep.snapshot.CurrentKeyGeneration.Custody() != domain.KeyCustodyClientHeld {
-		return renewPrepared{}, contract.NewAppError(contract.ErrorKindConflict, "delivery_not_available", "개인키 수령이 불가능합니다.")
+		return renewPrepared{}, contract.NewAppError(contract.ErrorKindConflict, "delivery_not_available", "the current private key must be received before renewal")
 	}
 
 	keyReady := !revoked && !keyCompromised && prep.snapshot.CurrentKeyGeneration.Custody() == domain.KeyCustodyClientHeld

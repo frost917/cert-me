@@ -146,6 +146,55 @@ func (r pkiRepo) SaveLeafKeyGeneration(_ context.Context, generation domain.Leaf
 	return nil
 }
 
+func (r pkiRepo) MarkLeafKeyGenerationClientHeld(ctx context.Context, id domain.LeafKeyGenerationID) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	generation, ok := r.s.leafKeyGenerations[id]
+	if !ok {
+		return port.ErrNotFound
+	}
+	if generation.Custody() != domain.KeyCustodyPendingDelivery && generation.Custody() != domain.KeyCustodyClientHeld {
+		return domain.ErrNotPermitted
+	}
+
+	var completionProven bool
+	for _, delivery := range r.s.deliveries {
+		if delivery.LeafKeyGenerationID() != id || delivery.State() != domain.DeliveryStateServerCompleted {
+			continue
+		}
+		record, hasLeafRecord := r.s.leafCertRecords[delivery.CertificateID()]
+		certificate, hasCertificate := r.s.certificates[delivery.CertificateID()]
+		if hasLeafRecord && hasCertificate && record.CertificateID == delivery.CertificateID() &&
+			record.SeriesID == generation.SeriesID() && record.LeafKeyGenerationID == id &&
+			certificate.KeyMaterialID() == generation.KeyMaterialID() {
+			completionProven = true
+			break
+		}
+	}
+	if !completionProven {
+		return domain.ErrNotPermitted
+	}
+	if _, secretPresent := r.s.secrets[secretKey{keyID: generation.KeyMaterialID(), purpose: domain.SecretPurposeLeafDelivery}]; secretPresent {
+		return domain.ErrNotPermitted
+	}
+
+	updated, err := domain.NewLeafKeyGeneration(domain.LeafKeyGenerationFacts{
+		ID:                  generation.ID(),
+		SeriesID:            generation.SeriesID(),
+		KeyMaterialID:       generation.KeyMaterialID(),
+		GenerationNo:        generation.GenerationNo(),
+		RenewalCount:        generation.RenewalCount(),
+		PriorHistoryUnknown: generation.PriorHistoryUnknown(),
+		Custody:             domain.KeyCustodyClientHeld,
+	})
+	if err != nil {
+		return err
+	}
+	r.s.leafKeyGenerations[id] = updated
+	return nil
+}
+
 func (r pkiRepo) InsertCertificate(_ context.Context, certificate domain.Certificate) error {
 	if _, ok := r.s.certificates[certificate.ID()]; ok {
 		return ErrDuplicate

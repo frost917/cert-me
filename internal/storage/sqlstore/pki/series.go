@@ -198,6 +198,79 @@ func (r *Repository) SaveLeafKeyGeneration(ctx context.Context, generation domai
 	return nil
 }
 
+// MarkLeafKeyGenerationClientHeld is an evidence-gated custody transition.
+// The update itself requires a completed delivery linked to a leaf
+// certificate in the generation's series, and requires the delivery secret
+// to have been removed already by the consuming transaction.
+func (r *Repository) MarkLeafKeyGenerationClientHeld(ctx context.Context, id domain.LeafKeyGenerationID) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("pki: mark leaf key generation client-held: %w", err)
+	}
+	parsedID, err := domain.ParseLeafKeyGenerationID(string(id))
+	if err != nil {
+		return fmt.Errorf("pki: invalid leaf key generation id: %w", err)
+	}
+
+	b := r.builder()
+	clientHeldParam := b.Add(string(domain.KeyCustodyClientHeld))
+	idParam := b.Add(string(parsedID))
+	pendingParam := b.Add(string(domain.KeyCustodyPendingDelivery))
+	clientHeldGuardParam := b.Add(string(domain.KeyCustodyClientHeld))
+	completedParam := b.Add(string(domain.DeliveryStateServerCompleted))
+	secretPurposeParam := b.Add(string(domain.SecretPurposeLeafDelivery))
+	query := "UPDATE leaf_key_generations SET custody = " + clientHeldParam +
+		" WHERE id = " + idParam + " AND custody IN (" + pendingParam + "," + clientHeldGuardParam + ")" +
+		" AND EXISTS (SELECT 1 FROM key_deliveries d JOIN leaf_certificates lc ON lc.certificate_id = d.certificate_id" +
+		" AND lc.leaf_key_generation_id = d.leaf_key_generation_id" +
+		" JOIN certificates c ON c.id = d.certificate_id AND c.key_material_id = leaf_key_generations.key_material_id" +
+		" WHERE d.leaf_key_generation_id = leaf_key_generations.id AND lc.series_id = leaf_key_generations.series_id AND d.state = " + completedParam + ")" +
+		" AND NOT EXISTS (SELECT 1 FROM private_key_secrets s WHERE s.key_material_id = leaf_key_generations.key_material_id" +
+		" AND s.purpose = " + secretPurposeParam + ")"
+	result, err := r.exec.ExecContext(ctx, query, b.Args()...)
+	if err != nil {
+		return mapWriteError("pki: mark leaf key generation client-held", err)
+	}
+	n, err := rowsAffected(result, nil)
+	if err != nil {
+		return fmt.Errorf("pki: mark leaf key generation client-held rows affected: %w", err)
+	}
+	if n != 0 {
+		return nil
+	}
+
+	completed, err := r.hasCompletedLeafKeyDelivery(ctx, parsedID)
+	if err != nil {
+		return fmt.Errorf("pki: verify completed delivery for client-held key generation: %w", err)
+	}
+	if completed {
+		return nil
+	}
+	exists, err := r.rowExists(ctx, "leaf_key_generations", "id", string(parsedID))
+	if err != nil {
+		return fmt.Errorf("pki: check leaf key generation after custody update: %w", err)
+	}
+	if !exists {
+		return port.ErrNotFound
+	}
+	return domain.ErrNotPermitted
+}
+
+func (r *Repository) hasCompletedLeafKeyDelivery(ctx context.Context, id domain.LeafKeyGenerationID) (bool, error) {
+	b := r.builder()
+	query := "SELECT EXISTS (SELECT 1 FROM leaf_key_generations g JOIN key_deliveries d ON d.leaf_key_generation_id = g.id" +
+		" JOIN leaf_certificates lc ON lc.certificate_id = d.certificate_id AND lc.leaf_key_generation_id = d.leaf_key_generation_id" +
+		" JOIN certificates c ON c.id = d.certificate_id AND c.key_material_id = g.key_material_id" +
+		" WHERE g.id = " + b.Add(string(id)) + " AND g.custody = " + b.Add(string(domain.KeyCustodyClientHeld)) +
+		" AND lc.series_id = g.series_id AND d.state = " + b.Add(string(domain.DeliveryStateServerCompleted)) +
+		" AND NOT EXISTS (SELECT 1 FROM private_key_secrets s WHERE s.key_material_id = g.key_material_id" +
+		" AND s.purpose = " + b.Add(string(domain.SecretPurposeLeafDelivery)) + "))"
+	var exists bool
+	if err := r.queryRow(ctx, query, b.Args()...).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
 func (r *Repository) InsertSeries(ctx context.Context, series domain.LeafSeries) error {
 	if err := validateSeries(series); err != nil {
 		return fmt.Errorf("pki: invalid series: %w", err)
