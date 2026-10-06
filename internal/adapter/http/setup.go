@@ -58,6 +58,7 @@ type SetupHandlerConfig struct {
 	PKIQueries        PKIQueryApplication
 	Issuance          IssuanceApplication
 	LeafQueries       LeafQueryApplication
+	PublicCA          PublicCAApplication
 	ServiceURL        string
 	ServiceURLVersion int64
 	TrustedProxies    []netip.Prefix
@@ -76,6 +77,7 @@ type setupHandler struct {
 	pkiQueries     PKIQueryApplication
 	issuance       IssuanceApplication
 	leafQueries    LeafQueryApplication
+	publicCA       PublicCAApplication
 	serviceURL     atomic.Pointer[serviceURLSnapshot]
 	trustedProxies []netip.Prefix
 	preAuthKey     [32]byte
@@ -124,6 +126,7 @@ func NewSetupHandler(config SetupHandlerConfig) (http.Handler, error) {
 		pkiQueries:     config.PKIQueries,
 		issuance:       config.Issuance,
 		leafQueries:    config.LeafQueries,
+		publicCA:       config.PublicCA,
 		trustedProxies: append([]netip.Prefix(nil), config.TrustedProxies...),
 	}
 	h.setServiceURL(config.ServiceURLVersion, config.ServiceURL)
@@ -144,6 +147,8 @@ func NewSetupHandler(config SetupHandlerConfig) (http.Handler, error) {
 	mux.HandleFunc("POST /api/v1/setup/settings", h.postInitializeSettings)
 	mux.HandleFunc("POST /api/v1/setup/complete", h.postCompleteSetup)
 	registerAuthorityRoutes(mux, h)
+	registerLeafRoutes(mux, h)
+	registerPublicCARoutes(mux, h)
 	if err := registerWebRoutes(mux, h); err != nil {
 		return nil, err
 	}
@@ -371,6 +376,10 @@ func writeApplicationError(w http.ResponseWriter, err error, requestID string) {
 	}
 	status := http.StatusInternalServerError
 	fields := appErr.PublicFields()
+	code := appErr.Code()
+	if code == "idempotency_key_reused" {
+		code = "idempotency_conflict"
+	}
 	switch appErr.Code() {
 	case "rate_limited":
 		status = http.StatusTooManyRequests
@@ -400,7 +409,7 @@ func writeApplicationError(w http.ResponseWriter, err error, requestID string) {
 	if message == "" {
 		message = "The request could not be processed."
 	}
-	writeSetupError(w, status, appErr.Code(), message, requestID, fields)
+	writeSetupError(w, status, code, message, requestID, fields)
 }
 
 func retryAfterHeader(fields map[string]string) string {
