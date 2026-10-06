@@ -35,3 +35,15 @@ func TestPKIErrorStatusContract(t *testing.T) {
 		})
 	}
 }
+
+func TestPKIIdempotencyConflictPublicCode(t *testing.T) {
+	response := httptest.NewRecorder()
+	writeApplicationError(response, contract.NewAppError(contract.ErrorKindConflict, "idempotency_key_reused", "Different input."), "request")
+	var body setupErrorResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != 409 || body.Error.Code != "idempotency_conflict" {
+		t.Fatalf("status=%d code=%q, want 409 idempotency_conflict", response.Code, body.Error.Code)
+	}
+}
