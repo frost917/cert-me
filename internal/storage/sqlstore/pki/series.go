@@ -62,13 +62,13 @@ func DecodeValidityPolicyV1(raw []byte) (domain.SeriesPolicy, error) {
 func (r *Repository) GetSeriesForUpdate(ctx context.Context, seriesID domain.SeriesID) (port.SeriesSnapshot, error) {
 	b := r.builder()
 	p := b.Add(string(seriesID))
-	query := "SELECT id, name, purpose, management_authority_id, current_certificate_id, current_key_generation_id, validity_policy_json, version, archived_at FROM leaf_series WHERE id = " + p + r.lockSuffix()
+	query := "SELECT id, created_at, name, purpose, management_authority_id, current_certificate_id, current_key_generation_id, validity_policy_json, version, archived_at FROM leaf_series WHERE id = " + p + r.lockSuffix()
 	var rawID, purpose, rawAuthority sql.NullString
 	var name, policyJSON string
 	var currentCertificate, currentGeneration sql.NullString
-	var version int64
+	var createdAt, version int64
 	var archived sql.NullInt64
-	if err := r.queryRow(ctx, query, b.Args()...).Scan(&rawID, &name, &purpose, &rawAuthority, &currentCertificate, &currentGeneration, &policyJSON, &version, &archived); err != nil {
+	if err := r.queryRow(ctx, query, b.Args()...).Scan(&rawID, &createdAt, &name, &purpose, &rawAuthority, &currentCertificate, &currentGeneration, &policyJSON, &version, &archived); err != nil {
 		return port.SeriesSnapshot{}, missing(err)
 	}
 	if err := validateNullableTimestamp("series archived_at", archived); err != nil {
@@ -121,7 +121,7 @@ func (r *Repository) GetSeriesForUpdate(ctx context.Context, seriesID domain.Ser
 	if err != nil {
 		return port.SeriesSnapshot{}, fmt.Errorf("pki: decode leaf series: %w", err)
 	}
-	snapshot := port.SeriesSnapshot{Series: series}
+	snapshot := port.SeriesSnapshot{Series: series, CreatedAt: domain.InstantFromUnixMicro(createdAt)}
 	if generationID == "" {
 		return snapshot, nil
 	}

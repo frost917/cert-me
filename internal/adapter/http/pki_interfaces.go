@@ -34,3 +34,7 @@ type LeafQueryApplication interface {
 	ListCertificates(context.Context, contract.RequestMeta, contract.CertificateListQuery) (contract.Page[contract.CertificateView], error)
 	GetCertificate(context.Context, contract.RequestMeta, contract.CertificateGetQuery) (contract.CertificateView, error)
 }
+
+type PublicCAApplication interface {
+	ReadPublicCACertificate(context.Context, contract.RequestMeta, contract.PublicCACertificateQuery) (contract.PublicCACertificateView, error)
+}

@@ -83,6 +83,10 @@ type Page[T any] struct {
 type AuthorityListQuery struct {
 	Search string
 	Page   PageRequest
+	// ManagedOnly is server-derived. Public QueryService lists set it so the
+	// internal bootstrap authority cannot appear in managed CA pages; direct
+	// repository consumers leave it false when they need installation internals.
+	ManagedOnly bool `json:"-"`
 }
 
 func (q AuthorityListQuery) Validate() error {

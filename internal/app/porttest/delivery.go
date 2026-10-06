@@ -20,6 +20,15 @@ func (r deliveryRepo) GetDeliveryForUpdate(_ context.Context, deliveryID domain.
 	return d, nil
 }
 
+func (r deliveryRepo) GetDeliveryByLeafKeyGenerationForUpdate(_ context.Context, generationID domain.LeafKeyGenerationID) (domain.Delivery, error) {
+	for _, delivery := range r.s.deliveries {
+		if delivery.LeafKeyGenerationID() == generationID {
+			return delivery, nil
+		}
+	}
+	return domain.Delivery{}, port.ErrNotFound
+}
+
 // GetGrantForUpdate looks a grant up by token hash only. The double never
 // stores a raw token, matching the rule that only the SHA-256 hash is
 // persisted (docs/backend-implementation.md §6).

@@ -620,7 +620,8 @@ func readTLSBootstrapGraph(t *testing.T, f *tlsFixture) tlsBootstrapGraph {
 		if err != nil {
 			return err
 		}
-		for _, authority := range page.Items {
+		for _, queried := range page.Items {
+			authority := queried.Authority
 			if authority.Kind() == domain.AuthorityKindBootstrap {
 				if graph.authority.ID() != "" {
 					return fmt.Errorf("more than one bootstrap authority")

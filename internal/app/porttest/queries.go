@@ -136,26 +136,31 @@ func matchesSearch(search, value string) bool {
 
 // ---- authorities ----
 
-func (r queryRepo) ListAuthorities(_ context.Context, query contract.AuthorityListQuery, scope port.QueryScope) (contract.Page[domain.Authority], error) {
-	var items []domain.Authority
+func (r queryRepo) ListAuthorities(_ context.Context, query contract.AuthorityListQuery, scope port.QueryScope) (contract.Page[port.QueriedAuthority], error) {
+	var items []port.QueriedAuthority
 	for id, a := range r.s.authorities {
+		if query.ManagedOnly && a.Kind() == domain.AuthorityKindBootstrap {
+			continue
+		}
 		if !r.visible(scope, id) || !matchesSearch(query.Search, a.Name()) {
 			continue
 		}
-		items = append(items, a)
+		// The in-memory service fixture does not model SQL row timestamps.
+		// Leave CreatedAt zero rather than inventing a persistence time.
+		items = append(items, port.QueriedAuthority{Authority: a})
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].ID() < items[j].ID() })
-	return paginate(items, query.Page, func(a domain.Authority) string { return string(a.ID()) }), nil
+	sort.Slice(items, func(i, j int) bool { return items[i].Authority.ID() < items[j].Authority.ID() })
+	return paginate(items, query.Page, func(a port.QueriedAuthority) string { return string(a.Authority.ID()) }), nil
 }
 
-func (r queryRepo) GetAuthority(_ context.Context, id domain.AuthorityID, scope port.QueryScope) (domain.Authority, error) {
+func (r queryRepo) GetAuthority(_ context.Context, id domain.AuthorityID, scope port.QueryScope) (port.QueriedAuthority, error) {
 	a, ok := r.s.authorities[id]
 	// Out of scope is reported as not-found, so a reader cannot probe for
 	// the existence of a range it may not see.
 	if !ok || !r.visible(scope, id) {
-		return domain.Authority{}, port.ErrNotFound
+		return port.QueriedAuthority{}, port.ErrNotFound
 	}
-	return a, nil
+	return port.QueriedAuthority{Authority: a}, nil
 }
 
 // ---- series ----
@@ -169,10 +174,7 @@ func (r queryRepo) ListSeries(_ context.Context, query contract.SeriesListQuery,
 		if query.AuthorityID != nil && s.ManagementAuthorityID() != *query.AuthorityID {
 			continue
 		}
-		items = append(items, port.SeriesSnapshot{
-			Series:               s,
-			CurrentKeyGeneration: r.s.leafKeyGenerations[s.CurrentKeyGenerationID()],
-		})
+		items = append(items, r.seriesSnapshot(s))
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].Series.ID() < items[j].Series.ID() })
 	return paginate(items, query.Page, func(s port.SeriesSnapshot) string { return string(s.Series.ID()) }), nil
@@ -183,10 +185,24 @@ func (r queryRepo) GetSeries(_ context.Context, id domain.SeriesID, scope port.Q
 	if !ok || !r.visible(scope, s.ManagementAuthorityID()) {
 		return port.SeriesSnapshot{}, port.ErrNotFound
 	}
-	return port.SeriesSnapshot{
-		Series:               s,
-		CurrentKeyGeneration: r.s.leafKeyGenerations[s.CurrentKeyGenerationID()],
-	}, nil
+	return r.seriesSnapshot(s), nil
+}
+
+func (r queryRepo) seriesSnapshot(series domain.LeafSeries) port.SeriesSnapshot {
+	snapshot := port.SeriesSnapshot{
+		Series:               series,
+		CurrentKeyGeneration: r.s.leafKeyGenerations[series.CurrentKeyGenerationID()],
+	}
+	if certificateID := series.CurrentCertificateID(); certificateID != "" {
+		for _, delivery := range r.s.deliveries {
+			if delivery.CertificateID() == certificateID && delivery.LeafKeyGenerationID() == series.CurrentKeyGenerationID() {
+				currentDelivery := delivery
+				snapshot.Delivery = &currentDelivery
+				break
+			}
+		}
+	}
+	return snapshot
 }
 
 // ---- certificates ----

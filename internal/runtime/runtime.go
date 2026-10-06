@@ -353,6 +353,24 @@ func (a *App) prepareServices(ctx context.Context, keyEngine *cryptoengine.KeyEn
 	if err != nil {
 		return fmt.Errorf("runtime: create certificate signer: %w", err)
 	}
+	authorityService, err := service.NewAuthorityService(service.AuthorityDeps{
+		CommonDeps: common, KeyEngine: keyEngine, CertificateSigner: certSigner,
+		SerialGenerator: authcrypto.SerialGenerator{}, ProfileValidator: cryptoformats.ProfileValidator{},
+	})
+	if err != nil {
+		return fmt.Errorf("runtime: create authority service: %w", err)
+	}
+	issuanceService, err := service.NewIssuanceService(service.IssuanceDeps{
+		CommonDeps: common, KeyEngine: keyEngine, CertificateSigner: certSigner,
+		SerialGenerator: authcrypto.SerialGenerator{}, ProfileValidator: cryptoformats.ProfileValidator{},
+	})
+	if err != nil {
+		return fmt.Errorf("runtime: create issuance service: %w", err)
+	}
+	queryService, err := service.NewQueryService(common)
+	if err != nil {
+		return fmt.Errorf("runtime: create query service: %w", err)
+	}
 	noFileSource := unavailableTLSFileSource{}
 	tlsService, err := service.NewTLSService(service.TLSDeps{
 		CommonDeps:        common,
@@ -380,6 +398,11 @@ func (a *App) prepareServices(ctx context.Context, keyEngine *cryptoengine.KeyEn
 		Service:           setupService,
 		Identity:          identityService,
 		Settings:          settingsService,
+		Authorities:       authorityService,
+		PKIQueries:        queryService,
+		Issuance:          issuanceService,
+		LeafQueries:       queryService,
+		PublicCA:          queryService,
 		ServiceURL:        serviceURL,
 		ServiceURLVersion: serviceURLVersion,
 		TrustedProxies:    trusted,

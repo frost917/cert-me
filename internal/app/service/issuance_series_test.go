@@ -5,7 +5,6 @@ import (
 	"errors"
 	"sync"
 	"testing"
-	"time"
 
 	"cert-me/internal/app/contract"
 	"cert-me/internal/app/port"
@@ -57,7 +56,7 @@ func TestIssuanceUpdateSeriesChangesOnlyMutablePolicyAndName(t *testing.T) {
 	if view.Name != name || view.Validity.Value() != validity.Value || view.Validity.Unit() != domain.ValidityUnit(validity.Unit) || view.RotateEvery != rotateEvery {
 		t.Fatalf("updated series view = %+v, want requested policy/name", view)
 	}
-	if view.Version != before.Series.Version().Next() || view.CurrentCertificateID == nil || *view.CurrentCertificateID != issued.CertificateID ||
+	if view.Version != before.Series.Version()+2 || view.CurrentCertificateID == nil || *view.CurrentCertificateID != issued.CertificateID ||
 		view.CurrentKeyGenerationID == nil || *view.CurrentKeyGenerationID != before.CurrentKeyGeneration.ID() || view.RenewalCount != 0 {
 		t.Fatalf("updated series view = %+v, history/version/count were not preserved correctly", view)
 	}
@@ -96,16 +95,8 @@ func TestIssuanceUpdateSeriesRejectsEmptyStaleAndUnauthorizedMutations(t *testin
 		t.Fatal("UpdateSeries accepted an empty patch")
 	}
 
-	forbiddenPrincipal, err := contract.NewAdminPrincipal(contract.AdminPrincipalFacts{
-		AccountID: issuanceTestAdminAccountID, SessionID: domain.SessionID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"), AuthEpoch: 1,
-	})
-	if err != nil {
-		t.Fatalf("other admin principal: %v", err)
-	}
 	f.authorizer.allow = false
-	forbidden := contract.MutationMeta{
-		RequestMeta: contract.RequestMeta{Principal: forbiddenPrincipal}, ExpectedVersion: contract.WithExpectedVersion(snapshot.Series.Version().Next()),
-	}
+	forbidden := seriesMutationMeta(t, snapshot.Series.Version().Next())
 	_, err = f.svc.UpdateSeries(context.Background(), forbidden, contract.IssuanceUpdateSeriesCommand{SeriesID: issued.SeriesID, Name: &staleName})
 	var appErr *contract.AppError
 	if !errors.As(err, &appErr) || appErr.Kind() != contract.ErrorKindForbidden {

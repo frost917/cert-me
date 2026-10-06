@@ -40,6 +40,19 @@ func (r *DeliveryRepository) GetDeliveryForUpdate(ctx context.Context, id domain
 	return delivery, nil
 }
 
+func (r *DeliveryRepository) GetDeliveryByLeafKeyGenerationForUpdate(ctx context.Context, generationID domain.LeafKeyGenerationID) (domain.Delivery, error) {
+	if err := checkContext(ctx); err != nil {
+		return domain.Delivery{}, err
+	}
+	b := r.dialect.NewBuilder()
+	query := "SELECT id, leaf_key_generation_id, certificate_id, expires_at, state, consumed_at, finished_at, failure_code, version FROM key_deliveries WHERE leaf_key_generation_id = " + b.Add(string(generationID)) + r.dialect.RowLockClause()
+	delivery, err := scanDelivery(r.executor.QueryRowContext(ctx, query, b.Args()...))
+	if err != nil {
+		return domain.Delivery{}, fmt.Errorf("sqlstore delivery: get by leaf key generation for update: %w", notFound(err))
+	}
+	return delivery, nil
+}
+
 func (r *DeliveryRepository) InsertDelivery(ctx context.Context, delivery domain.Delivery) error {
 	if err := checkContext(ctx); err != nil {
 		return err

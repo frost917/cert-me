@@ -19,9 +19,9 @@ const authorityPathCTE = `WITH RECURSIVE authority_path(root_id, id, parent_id) 
  SELECT p.root_id, a.id, a.management_parent_id FROM authorities a JOIN authority_path p ON p.parent_id = a.id
 ) `
 
-func (r *QueryRepository) loadAuthority(ctx context.Context, id domain.AuthorityID) (domain.Authority, error) {
+func (r *QueryRepository) loadAuthority(ctx context.Context, id domain.AuthorityID) (port.QueriedAuthority, error) {
 	b := r.builder()
-	query := authorityPathCTE + `SELECT a.id, a.kind, a.name, a.management_parent_id, a.issuance_state,
+	query := authorityPathCTE + `SELECT a.id, a.created_at, a.kind, a.name, a.management_parent_id, a.issuance_state,
  a.issuance_certificate_id, a.archived_at, a.version, cg.id, cg.authority_id, cg.key_material_id,
  cg.generation_no, cg.key_destroyed_at, c.not_before, c.not_after,
  EXISTS (SELECT 1 FROM ca_takeovers tk WHERE tk.ca_key_generation_id = cg.id AND tk.state = 'pending'),
@@ -34,65 +34,66 @@ func (r *QueryRepository) loadAuthority(ctx context.Context, id domain.Authority
  LEFT JOIN certificates c ON c.id = a.issuance_certificate_id
  WHERE a.id = ` + b.Add(string(id))
 	var rawID, kind, name, state string
+	var createdAt int64
 	var parent, issuanceCert, rawGenID, genAuthority, rawKey sql.NullString
 	var archived, destroyed, notBefore, notAfter sql.NullInt64
 	var version, generationNo sql.NullInt64
 	var pending, affected bool
-	if err := r.queryRow(ctx, query, b.Args()...).Scan(&rawID, &kind, &name, &parent, &state, &issuanceCert, &archived, &version, &rawGenID, &genAuthority, &rawKey, &generationNo, &destroyed, &notBefore, &notAfter, &pending, &affected); err != nil {
-		return domain.Authority{}, missing(err)
+	if err := r.queryRow(ctx, query, b.Args()...).Scan(&rawID, &createdAt, &kind, &name, &parent, &state, &issuanceCert, &archived, &version, &rawGenID, &genAuthority, &rawKey, &generationNo, &destroyed, &notBefore, &notAfter, &pending, &affected); err != nil {
+		return port.QueriedAuthority{}, missing(err)
 	}
 	if (archived.Valid && archived.Int64 == 0) || (destroyed.Valid && destroyed.Int64 == 0) {
-		return domain.Authority{}, fmt.Errorf("authority contains a reserved zero timestamp")
+		return port.QueriedAuthority{}, fmt.Errorf("authority contains a reserved zero timestamp")
 	}
 	if !rawGenID.Valid || !genAuthority.Valid || !rawKey.Valid || !generationNo.Valid {
-		return domain.Authority{}, fmt.Errorf("authority row has no CA key generation")
+		return port.QueriedAuthority{}, fmt.Errorf("authority row has no CA key generation")
 	}
 	parsedID, err := domain.ParseAuthorityID(rawID)
 	if err != nil {
-		return domain.Authority{}, err
+		return port.QueriedAuthority{}, err
 	}
 	genID, err := domain.ParseCAKeyGenerationID(rawGenID.String)
 	if err != nil {
-		return domain.Authority{}, err
+		return port.QueriedAuthority{}, err
 	}
 	if _, err := domain.ParseKeyMaterialID(rawKey.String); err != nil {
-		return domain.Authority{}, err
+		return port.QueriedAuthority{}, err
 	}
 	ownerID, err := domain.ParseAuthorityID(genAuthority.String)
 	if err != nil {
-		return domain.Authority{}, err
+		return port.QueriedAuthority{}, err
 	}
 	if ownerID != parsedID {
-		return domain.Authority{}, fmt.Errorf("authority key generation belongs to another authority")
+		return port.QueriedAuthority{}, fmt.Errorf("authority key generation belongs to another authority")
 	}
 	var parentID domain.AuthorityID
 	if parent.Valid {
 		parentID, err = domain.ParseAuthorityID(parent.String)
 		if err != nil {
-			return domain.Authority{}, err
+			return port.QueriedAuthority{}, err
 		}
 	}
 	var issuanceID domain.CertificateID
 	if issuanceCert.Valid {
 		issuanceID, err = domain.ParseCertificateID(issuanceCert.String)
 		if err != nil {
-			return domain.Authority{}, err
+			return port.QueriedAuthority{}, err
 		}
 	}
 	if version.Int64 < 0 || generationNo.Int64 < 0 {
-		return domain.Authority{}, fmt.Errorf("authority has invalid version or key generation")
+		return port.QueriedAuthority{}, fmt.Errorf("authority has invalid version or key generation")
 	}
 	var window domain.ValidityWindow
 	if notBefore.Valid || notAfter.Valid {
 		if !notBefore.Valid || !notAfter.Valid {
-			return domain.Authority{}, fmt.Errorf("authority certificate has incomplete validity window")
+			return port.QueriedAuthority{}, fmt.Errorf("authority certificate has incomplete validity window")
 		}
 		if notBefore.Int64 == 0 || notAfter.Int64 == 0 {
-			return domain.Authority{}, fmt.Errorf("authority certificate has a reserved zero timestamp")
+			return port.QueriedAuthority{}, fmt.Errorf("authority certificate has a reserved zero timestamp")
 		}
 		window, err = domain.NewValidityWindow(domain.InstantFromUnixMicro(notBefore.Int64), domain.InstantFromUnixMicro(notAfter.Int64))
 		if err != nil {
-			return domain.Authority{}, err
+			return port.QueriedAuthority{}, err
 		}
 	}
 	facts := domain.AuthorityFacts{ID: parsedID, Kind: domain.AuthorityKind(kind), Name: name, ManagementParentID: parentID,
@@ -102,73 +103,80 @@ func (r *QueryRepository) loadAuthority(ctx context.Context, id domain.Authority
 	if archived.Valid {
 		facts.ArchivedAt = domain.InstantFromUnixMicro(archived.Int64)
 	}
-	return domain.NewAuthority(facts)
+	authority, err := domain.NewAuthority(facts)
+	if err != nil {
+		return port.QueriedAuthority{}, err
+	}
+	return port.QueriedAuthority{Authority: authority, CreatedAt: domain.InstantFromUnixMicro(createdAt)}, nil
 }
 
-func (r *QueryRepository) ListAuthorities(ctx context.Context, query contract.AuthorityListQuery, scope port.QueryScope) (contract.Page[domain.Authority], error) {
+func (r *QueryRepository) ListAuthorities(ctx context.Context, query contract.AuthorityListQuery, scope port.QueryScope) (contract.Page[port.QueriedAuthority], error) {
 	if err := checkContext(ctx); err != nil {
-		return contract.Page[domain.Authority]{}, err
+		return contract.Page[port.QueriedAuthority]{}, err
 	}
 	if err := query.Validate(); err != nil {
-		return contract.Page[domain.Authority]{}, failed("validate authority list", err)
+		return contract.Page[port.QueriedAuthority]{}, failed("validate authority list", err)
 	}
 	if err := r.validateScope(scope); err != nil {
-		return contract.Page[domain.Authority]{}, failed("validate authority scope", err)
+		return contract.Page[port.QueriedAuthority]{}, failed("validate authority scope", err)
 	}
 	b := r.builder()
 	conditions := []string{r.authorityScope(b, scope, "a.id")}
+	if query.ManagedOnly {
+		conditions = append(conditions, "a.kind IN ('root','intermediate')")
+	}
 	appendCondition(&conditions, r.contains(b, "a.name", query.Search))
 	limit, tail := addPageClause(b, &conditions, "a.id", query.Page)
 	ids, next, err := r.selectIDs(ctx, "SELECT a.id FROM authorities a WHERE "+joinConditions(conditions)+tail, b.Args(), limit)
 	if err != nil {
-		return contract.Page[domain.Authority]{}, err
+		return contract.Page[port.QueriedAuthority]{}, err
 	}
-	items := make([]domain.Authority, 0, len(ids))
+	items := make([]port.QueriedAuthority, 0, len(ids))
 	for _, raw := range ids {
 		id, e := domain.ParseAuthorityID(raw)
 		if e != nil {
-			return contract.Page[domain.Authority]{}, failed("decode authority id", e)
+			return contract.Page[port.QueriedAuthority]{}, failed("decode authority id", e)
 		}
 		a, e := r.loadAuthority(ctx, id)
 		if e != nil {
-			return contract.Page[domain.Authority]{}, failed("read authority", e)
+			return contract.Page[port.QueriedAuthority]{}, failed("read authority", e)
 		}
 		items = append(items, a)
 	}
 	return pageResult(items, next), nil
 }
 
-func (r *QueryRepository) GetAuthority(ctx context.Context, id domain.AuthorityID, scope port.QueryScope) (domain.Authority, error) {
+func (r *QueryRepository) GetAuthority(ctx context.Context, id domain.AuthorityID, scope port.QueryScope) (port.QueriedAuthority, error) {
 	if err := checkContext(ctx); err != nil {
-		return domain.Authority{}, err
+		return port.QueriedAuthority{}, err
 	}
 	if err := r.validateScope(scope); err != nil {
-		return domain.Authority{}, failed("validate authority scope", err)
+		return port.QueriedAuthority{}, failed("validate authority scope", err)
 	}
 	b := r.builder()
 	where := []string{"a.id = " + b.Add(string(id)), r.authorityScope(b, scope, "a.id")}
 	var exists bool
 	if err := r.queryRow(ctx, "SELECT EXISTS (SELECT 1 FROM authorities a WHERE "+joinConditions(where)+")", b.Args()...).Scan(&exists); err != nil {
-		return domain.Authority{}, failed("check authority scope", err)
+		return port.QueriedAuthority{}, failed("check authority scope", err)
 	}
 	if !exists {
-		return domain.Authority{}, port.ErrNotFound
+		return port.QueriedAuthority{}, port.ErrNotFound
 	}
 	a, err := r.loadAuthority(ctx, id)
 	if err != nil {
-		return domain.Authority{}, failed("read authority", err)
+		return port.QueriedAuthority{}, failed("read authority", err)
 	}
 	return a, nil
 }
 
 func (r *QueryRepository) loadSeries(ctx context.Context, id domain.SeriesID) (port.SeriesSnapshot, error) {
 	b := r.builder()
-	query := `SELECT id,name,purpose,management_authority_id,current_certificate_id,current_key_generation_id,validity_policy_json,version,archived_at FROM leaf_series WHERE id = ` + b.Add(string(id))
+	query := `SELECT id,created_at,name,purpose,management_authority_id,current_certificate_id,current_key_generation_id,validity_policy_json,version,archived_at FROM leaf_series WHERE id = ` + b.Add(string(id))
 	var rawID, name, purpose, authorityID, policy string
 	var certificateID, generationID sql.NullString
-	var version int64
+	var createdAt, version int64
 	var archived sql.NullInt64
-	if err := r.queryRow(ctx, query, b.Args()...).Scan(&rawID, &name, &purpose, &authorityID, &certificateID, &generationID, &policy, &version, &archived); err != nil {
+	if err := r.queryRow(ctx, query, b.Args()...).Scan(&rawID, &createdAt, &name, &purpose, &authorityID, &certificateID, &generationID, &policy, &version, &archived); err != nil {
 		return port.SeriesSnapshot{}, missing(err)
 	}
 	if archived.Valid && archived.Int64 == 0 {
@@ -215,7 +223,7 @@ func (r *QueryRepository) loadSeries(ctx context.Context, id domain.SeriesID) (p
 	if err != nil {
 		return port.SeriesSnapshot{}, err
 	}
-	snapshot := port.SeriesSnapshot{Series: series}
+	snapshot := port.SeriesSnapshot{Series: series, CreatedAt: domain.InstantFromUnixMicro(createdAt)}
 	if currentGen != "" {
 		b = r.builder()
 		var genID, owner, keyID, custody string
@@ -253,6 +261,16 @@ func (r *QueryRepository) loadSeries(ctx context.Context, id domain.SeriesID) (p
 			return port.SeriesSnapshot{}, fmt.Errorf("series current certificate and key generation are inconsistent")
 		}
 		snapshot.CurrentKeyGeneration = key
+		delivery, err := r.deliveryForCertificate(ctx, currentCert)
+		if err != nil {
+			return port.SeriesSnapshot{}, fmt.Errorf("read current series delivery: %w", err)
+		}
+		if delivery != nil {
+			if delivery.LeafKeyGenerationID() != currentGen || delivery.CertificateID() != currentCert {
+				return port.SeriesSnapshot{}, fmt.Errorf("series current delivery does not match its certificate and key generation")
+			}
+			snapshot.Delivery = delivery
+		}
 	}
 	return snapshot, nil
 }
@@ -377,11 +395,16 @@ func (r *QueryRepository) queriedCertificate(ctx context.Context, id domain.Cert
 	}
 	out := port.QueriedCertificate{Certificate: certificate}
 	b := r.builder()
+	var createdAt int64
 	var leaf, ca bool
-	query := `SELECT EXISTS (SELECT 1 FROM leaf_certificates WHERE certificate_id = ` + b.Add(string(id)) + `), EXISTS (SELECT 1 FROM ca_certificates WHERE certificate_id = ` + b.Add(string(id)) + `)`
-	if err := r.queryRow(ctx, query, b.Args()...).Scan(&leaf, &ca); err != nil {
+	query := `SELECT c.created_at,
+ EXISTS (SELECT 1 FROM leaf_certificates WHERE certificate_id = c.id),
+ EXISTS (SELECT 1 FROM ca_certificates WHERE certificate_id = c.id)
+ FROM certificates c WHERE c.id = ` + b.Add(string(id))
+	if err := r.queryRow(ctx, query, b.Args()...).Scan(&createdAt, &leaf, &ca); err != nil {
 		return port.QueriedCertificate{}, err
 	}
+	out.CreatedAt = domain.InstantFromUnixMicro(createdAt)
 	if leaf == ca {
 		return port.QueriedCertificate{}, fmt.Errorf("certificate subtype is missing or ambiguous")
 	}
@@ -405,45 +428,54 @@ func (r *QueryRepository) queriedCertificate(ctx context.Context, id domain.Cert
 	if err := r.queryRow(ctx, "SELECT EXISTS (SELECT 1 FROM transition_impacts WHERE certificate_id = "+b.Add(string(id))+")", b.Args()...).Scan(&out.Affected); err != nil {
 		return port.QueriedCertificate{}, err
 	}
-	b = r.builder()
-	var deliveryID, generationID, certID, state string
+	out.Delivery, err = r.deliveryForCertificate(ctx, id)
+	if err != nil {
+		return port.QueriedCertificate{}, err
+	}
+	return out, nil
+}
+
+func (r *QueryRepository) deliveryForCertificate(ctx context.Context, certificateID domain.CertificateID) (*domain.Delivery, error) {
+	b := r.builder()
+	var deliveryID, generationID, rawCertificateID, state string
 	var expires int64
 	var consumed, finished sql.NullInt64
 	var failure sql.NullString
 	var version int64
-	err = r.queryRow(ctx, "SELECT id,leaf_key_generation_id,certificate_id,expires_at,state,consumed_at,finished_at,failure_code,version FROM key_deliveries WHERE certificate_id = "+b.Add(string(id)), b.Args()...).Scan(&deliveryID, &generationID, &certID, &expires, &state, &consumed, &finished, &failure, &version)
-	if err == nil {
-		did, e := domain.ParseDeliveryID(deliveryID)
-		if e != nil {
-			return port.QueriedCertificate{}, e
-		}
-		gid, e := domain.ParseLeafKeyGenerationID(generationID)
-		if e != nil {
-			return port.QueriedCertificate{}, e
-		}
-		cid, e := domain.ParseCertificateID(certID)
-		if e != nil {
-			return port.QueriedCertificate{}, e
-		}
-		facts := domain.DeliveryFacts{ID: did, LeafKeyGenerationID: gid, CertificateID: cid, ExpiresAt: domain.InstantFromUnixMicro(expires), State: domain.DeliveryState(state), Version: domain.Version(version)}
-		if consumed.Valid {
-			facts.ConsumedAt = domain.InstantFromUnixMicro(consumed.Int64)
-		}
-		if finished.Valid {
-			facts.FinishedAt = domain.InstantFromUnixMicro(finished.Int64)
-		}
-		if failure.Valid {
-			facts.FailureCode = failure.String
-		}
-		delivery, e := domain.NewDelivery(facts)
-		if e != nil {
-			return port.QueriedCertificate{}, e
-		}
-		out.Delivery = &delivery
-	} else if err != sql.ErrNoRows {
-		return port.QueriedCertificate{}, err
+	err := r.queryRow(ctx, "SELECT id,leaf_key_generation_id,certificate_id,expires_at,state,consumed_at,finished_at,failure_code,version FROM key_deliveries WHERE certificate_id = "+b.Add(string(certificateID)), b.Args()...).Scan(&deliveryID, &generationID, &rawCertificateID, &expires, &state, &consumed, &finished, &failure, &version)
+	if err == sql.ErrNoRows {
+		return nil, nil
 	}
-	return out, nil
+	if err != nil {
+		return nil, err
+	}
+	did, err := domain.ParseDeliveryID(deliveryID)
+	if err != nil {
+		return nil, err
+	}
+	generation, err := domain.ParseLeafKeyGenerationID(generationID)
+	if err != nil {
+		return nil, err
+	}
+	parsedCertificateID, err := domain.ParseCertificateID(rawCertificateID)
+	if err != nil {
+		return nil, err
+	}
+	facts := domain.DeliveryFacts{ID: did, LeafKeyGenerationID: generation, CertificateID: parsedCertificateID, ExpiresAt: domain.InstantFromUnixMicro(expires), State: domain.DeliveryState(state), Version: domain.Version(version)}
+	if consumed.Valid {
+		facts.ConsumedAt = domain.InstantFromUnixMicro(consumed.Int64)
+	}
+	if finished.Valid {
+		facts.FinishedAt = domain.InstantFromUnixMicro(finished.Int64)
+	}
+	if failure.Valid {
+		facts.FailureCode = failure.String
+	}
+	delivery, err := domain.NewDelivery(facts)
+	if err != nil {
+		return nil, err
+	}
+	return &delivery, nil
 }
 
 func (r *QueryRepository) ListCertificates(ctx context.Context, query contract.CertificateListQuery, scope port.QueryScope) (contract.Page[port.QueriedCertificate], error) {

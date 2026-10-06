@@ -666,7 +666,8 @@ func (s *TLSService) findBootstrapAuthority(ctx context.Context) (domain.Authori
 			if err != nil {
 				return storeError(err, "tls_bootstrap_authority_lookup_failed", "could not find the bootstrap authority")
 			}
-			for _, authority := range page.Items {
+			for _, queried := range page.Items {
+				authority := queried.Authority
 				if authority.Kind() != domain.AuthorityKindBootstrap {
 					continue
 				}

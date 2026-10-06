@@ -32,14 +32,19 @@ type CAKeyGeneration struct {
 
 // SeriesSnapshot bundles a leaf series with the key generation its own
 // current_key_generation_id points at. RenewalFacts.CurrentGeneration needs
-// exactly this pair to call LeafSeries.PlanRenewal, and both rows must come
-// from the same locked read so a concurrent rotation cannot be planned
-// against a generation the series has already moved past
+// exactly this pair to call LeafSeries.PlanRenewal, and the PKI write-side
+// loader reads both under the same lock so a concurrent rotation cannot be
+// planned against a generation the series has already moved past
 // (docs/backend-implementation.md §2 "Facts에는 검증 대상의 ID/version도
-// 포함하고 서비스가 commit 안에서 최신 사실을 다시 구성한다").
+// 포함하고 서비스가 commit 안에서 최신 사실을 다시 구성한다"). CreatedAt
+// is persisted row metadata. Delivery is an optional non-locking projection
+// populated by QueryRepository for the current certificate; write-side
+// snapshots leave it unset.
 type SeriesSnapshot struct {
 	Series               domain.LeafSeries
 	CurrentKeyGeneration domain.LeafKeyGeneration
+	CreatedAt            domain.Instant
+	Delivery             *domain.Delivery
 }
 
 // Certificate issuance operations, the leaf_certificates.operation values

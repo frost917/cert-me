@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -71,7 +72,7 @@ func TestLeafAndCertificateReadRoutesMapOpenAPIShapesAndTypedFilters(t *testing.
 	assertLeafSeriesDTOShape(t, seriesPayload.Data)
 
 	const expiresBefore = "2026-12-03T04:05:06+02:00"
-	certificates := h.request(http.MethodGet, "/api/v1/certificates?q=service&cursor=cert-next&limit=4&authority_id="+httpTestAuthorityID+"&expires_before="+expiresBefore+"&revoked=false&affected=true", "", make(http.Header), httpTestSessionCookie())
+	certificates := h.request(http.MethodGet, "/api/v1/certificates?q=service&cursor=cert-next&limit=4&authority_id="+httpTestAuthorityID+"&expires_before="+url.QueryEscape(expiresBefore)+"&revoked=false&affected=true", "", make(http.Header), httpTestSessionCookie())
 	if certificates.Code != http.StatusOK {
 		t.Fatalf("certificate list status=%d want=%d: %s", certificates.Code, http.StatusOK, certificates.Body.String())
 	}
@@ -188,7 +189,7 @@ func TestLeafIssueRenewReissueUseSessionCSRFIdempotencyAndExpectedVersion(t *tes
 			}{
 				{name: "unauthenticated", headers: httpTestAdminHeaders(httpTestServiceURL), wantStatus: http.StatusUnauthorized},
 				{name: "csrf", headers: header("Origin", httpTestServiceURL), cookies: true, wantStatus: http.StatusForbidden},
-				{name: "idempotency", headers: mutationHeadersForLeaf(test.name, false, false), cookies: true, wantStatus: http.StatusBadRequest},
+				{name: "idempotency", headers: mutationHeadersForLeaf(test.name, test.name != "issue", false), cookies: true, wantStatus: http.StatusBadRequest},
 			}
 			if test.name != "issue" {
 				cases = append(cases, struct {
@@ -196,7 +197,7 @@ func TestLeafIssueRenewReissueUseSessionCSRFIdempotencyAndExpectedVersion(t *tes
 					headers    http.Header
 					cookies    bool
 					wantStatus int
-				}{name: "version", headers: mutationHeadersForLeaf(test.name, true, false), cookies: true, wantStatus: http.StatusPreconditionRequired})
+				}{name: "version", headers: mutationHeadersForLeaf(test.name, false, true), cookies: true, wantStatus: http.StatusPreconditionRequired})
 			}
 			for _, tc := range cases {
 				t.Run(tc.name, func(t *testing.T) {

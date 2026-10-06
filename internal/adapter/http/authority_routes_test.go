@@ -66,8 +66,26 @@ func TestAuthorityListAndDetailRequireAdminAndMapOpenAPIShape(t *testing.T) {
 		t.Fatalf("authority detail response is not JSON: %v", err)
 	}
 	assertAuthorityDTOShape(t, detailPayload.Data)
-	if _, ok := detailPayload.Data["crl"]; !ok {
+	var crl map[string]json.RawMessage
+	if raw, ok := detailPayload.Data["crl"]; !ok {
 		t.Fatal("authority detail omitted its available CRL status")
+	} else if err := json.Unmarshal(raw, &crl); err != nil {
+		t.Fatalf("authority CRL status is not an object: %v", err)
+	}
+	for _, field := range []string{"revocation_generation", "publication_state", "pending", "expired", "version"} {
+		if _, ok := crl[field]; !ok {
+			t.Errorf("CRL status omitted OpenAPI field %q", field)
+		}
+	}
+	allowedCRL := map[string]bool{
+		"number_hex": true, "covered_generation": true, "revocation_generation": true,
+		"next_publish_at": true, "next_update": true, "publication_state": true,
+		"pending": true, "expired": true, "last_error_code": true, "version": true,
+	}
+	for field := range crl {
+		if !allowedCRL[field] {
+			t.Errorf("CRL status included field %q outside the OpenAPI schema", field)
+		}
 	}
 	if strings.Contains(detail.Body.String(), "PRIVATE KEY") || strings.Contains(detail.Body.String(), "key_material") {
 		t.Fatal("authority response exposed signing secret material")
@@ -91,6 +109,15 @@ func TestAuthorityRoutesRejectInvalidPathAndQueryBeforeServiceCall(t *testing.T)
 	}
 	if h.queries.listCalls != 0 {
 		t.Fatalf("invalid authority query reached query service %d times", h.queries.listCalls)
+	}
+}
+
+func TestAuthorityGetMapsNotFoundTo404(t *testing.T) {
+	h := newAuthorityRoutesTestHarness(t)
+	h.queries.getErr = contract.NewAppError(contract.ErrorKindValidation, "not_found", "authority not found")
+	response := h.request(http.MethodGet, "/api/v1/authorities/"+httpTestAuthorityID, "", make(http.Header), httpTestSessionCookie())
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("missing authority status = %d; want %d", response.Code, http.StatusNotFound)
 	}
 }
 
@@ -132,6 +159,13 @@ func TestCreateAuthorityUsesSessionCSRFAndIdempotencyStatus(t *testing.T) {
 	if _, included := payload["replayed"]; included {
 		t.Fatal("replay response added a field absent from the OpenAPI envelope")
 	}
+	var replayData struct {
+		Data map[string]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(replayed.Body.Bytes(), &replayData); err != nil {
+		t.Fatalf("replay response envelope is not JSON: %v", err)
+	}
+	assertAuthorityDTOShape(t, replayData.Data)
 }
 
 func TestCreateAuthorityRejectsCSRFIdempotencyAndUnknownFields(t *testing.T) {
@@ -236,6 +270,24 @@ func TestAuthorityMutationsRequireIfMatchAndForwardPathID(t *testing.T) {
 			if h.authorities.lastAuthorityID != domain.AuthorityID(httpTestAuthorityID) {
 				t.Fatalf("command authority id = %q; want path id", h.authorities.lastAuthorityID)
 			}
+			switch tt.name {
+			case "rename":
+				if h.authorities.lastRename.Name != "Renamed Root" {
+					t.Fatalf("rename command = %#v", h.authorities.lastRename)
+				}
+			case "issuance state":
+				if h.authorities.lastState.State != "stopped" {
+					t.Fatalf("issuance state command = %#v", h.authorities.lastState)
+				}
+			case "key destruction":
+				if h.authorities.lastDestroy.Justification != "retirement complete" || string(h.authorities.lastDestroy.KeyGenerationID) != httpTestAuthorityKeyID {
+					t.Fatalf("key destruction command = %#v", h.authorities.lastDestroy)
+				}
+			case "archive":
+				if h.authorities.lastArchive.AuthorityID != domain.AuthorityID(httpTestAuthorityID) {
+					t.Fatalf("archive command = %#v", h.authorities.lastArchive)
+				}
+			}
 			if response.Header().Get("ETag") != `"v7"` || response.Header().Get("Cache-Control") != "no-store" {
 				t.Fatal("authority mutation omitted ETag or no-store response policy")
 			}
@@ -254,6 +306,17 @@ func TestAuthorityMutationRejectsBodyAuthorityOverride(t *testing.T) {
 	}
 	if h.authorities.renameCalls != 0 {
 		t.Fatalf("body path override reached Rename %d times", h.authorities.renameCalls)
+	}
+}
+
+func TestAuthorityMutationMapsVersionConflictTo412(t *testing.T) {
+	h := newAuthorityRoutesTestHarness(t)
+	h.authorities.renameErr = contract.NewAppError(contract.ErrorKindConflict, "authority_version_conflict", "authority changed")
+	headers := httpTestAdminHeaders(httpTestServiceURL)
+	headers.Set("If-Match", `"v7"`)
+	response := h.request(http.MethodPatch, "/api/v1/authorities/"+httpTestAuthorityID, `{"name":"Renamed Root"}`, headers, httpTestSessionCookie())
+	if response.Code != http.StatusPreconditionFailed {
+		t.Fatalf("authority version conflict status = %d; want %d", response.Code, http.StatusPreconditionFailed)
 	}
 }
 
@@ -345,6 +408,7 @@ type authorityTestApplication struct {
 	lastArchive      contract.AuthorityArchiveCommand
 	lastMutationMeta contract.MutationMeta
 	lastAuthorityID  domain.AuthorityID
+	renameErr        error
 }
 
 func (f *authorityTestApplication) Create(_ context.Context, meta contract.MutationMeta, command contract.AuthorityCreateCommand) (contract.AuthorityView, error) {
@@ -357,6 +421,9 @@ func (f *authorityTestApplication) Rename(_ context.Context, meta contract.Mutat
 	f.renameCalls++
 	f.lastMutationMeta, f.lastRename = meta, command
 	f.lastAuthorityID = command.AuthorityID
+	if f.renameErr != nil {
+		return contract.AuthorityView{}, f.renameErr
+	}
 	return f.view, nil
 }
 
@@ -388,6 +455,7 @@ type authorityTestQueryApplication struct {
 	getCalls  int
 	lastList  contract.AuthorityListQuery
 	lastGet   contract.AuthorityGetQuery
+	getErr    error
 }
 
 func (f *authorityTestQueryApplication) ListAuthorities(_ context.Context, _ contract.RequestMeta, query contract.AuthorityListQuery) (contract.Page[contract.AuthorityView], error) {
@@ -404,6 +472,9 @@ func (f *authorityTestQueryApplication) ListAuthorities(_ context.Context, _ con
 func (f *authorityTestQueryApplication) GetAuthority(_ context.Context, _ contract.RequestMeta, query contract.AuthorityGetQuery) (contract.AuthorityView, error) {
 	f.getCalls++
 	f.lastGet = query
+	if f.getErr != nil {
+		return contract.AuthorityView{}, f.getErr
+	}
 	return f.view, nil
 }
 
