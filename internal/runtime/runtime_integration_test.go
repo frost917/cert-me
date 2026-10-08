@@ -506,7 +506,10 @@ func (database runtimeDBSpec) config(t *testing.T) config.Database {
 
 func openRuntimeIntegrationApp(t *testing.T, database runtimeDBSpec) *App {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Fresh external schemas require catalog verification for every migration;
+	// race instrumentation and a shared DB host can exceed a 30-second budget.
+	// Keep startup bounded independently of HTTP operation deadlines.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	storageKey := secret.New(bytes.Repeat([]byte{0x5a}, 32))
 	defer storageKey.Close()
@@ -520,6 +523,9 @@ func openRuntimeIntegrationApp(t *testing.T, database runtimeDBSpec) *App {
 		ListenAddress: "127.0.0.1:0",
 	})
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("open runtime for %s exceeded the startup test deadline", database.kind)
+		}
 		if appErr, ok := contract.AsAppError(err); ok {
 			t.Fatalf("open runtime for %s: application %s (%s)", database.kind, appErr.Code(), appErr.Kind())
 		}
