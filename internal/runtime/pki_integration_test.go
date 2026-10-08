@@ -3,7 +3,9 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
@@ -356,6 +358,204 @@ func runRuntimePKIIssuanceFlow(t *testing.T, database runtimeDBSpec) {
 	}
 
 	stage4ExerciseTransferReissueBoundary(t, app, client, origin, sessionCookie, csrfToken, intermediateID)
+	stage4ExercisePublicCAAndAuthorityClosure(t, client, origin, sessionCookie, csrfToken, rootID, intermediateID, initialCertificateID)
+}
+
+func stage4ExercisePublicCAAndAuthorityClosure(t *testing.T, client *http.Client, origin string, sessionCookie *http.Cookie, csrfToken, rootID, intermediateID, leafCertificateID string) {
+	t.Helper()
+
+	rootResponse := mustRequest(t, client, http.MethodGet, origin+"/api/v1/authorities/"+rootID, nil, sessionCookie, nil)
+	stage4ExpectStatus(t, rootResponse, http.StatusOK)
+	rootAuthority := stage4ResponseData(t, rootResponse)
+	stage4AssertAuthority(t, rootAuthority, true)
+	rootCertificateID := stage4String(t, rootAuthority, "issuance_certificate_id")
+
+	intermediateResponse := mustRequest(t, client, http.MethodGet, origin+"/api/v1/authorities/"+intermediateID, nil, sessionCookie, nil)
+	stage4ExpectStatus(t, intermediateResponse, http.StatusOK)
+	intermediateAuthority := stage4ResponseData(t, intermediateResponse)
+	stage4AssertAuthority(t, intermediateAuthority, true)
+	intermediateCertificateID := stage4String(t, intermediateAuthority, "issuance_certificate_id")
+	intermediateKeyGenerationID := stage4String(t, intermediateAuthority, "key_generation_id")
+
+	rootCertDER, rootChainDER, rootCertETag, rootChainETag := stage4ReadPublicCACertificateAndChain(t, client, origin, rootCertificateID)
+	intermediateCertDER, intermediateChainDER, intermediateCertETag, intermediateChainETag := stage4ReadPublicCACertificateAndChain(t, client, origin, intermediateCertificateID)
+	if len(rootChainDER) != 1 || !bytes.Equal(rootChainDER[0], rootCertDER) {
+		t.Fatal("public Root chain did not contain only the Root certificate")
+	}
+	if len(intermediateChainDER) != 2 || !bytes.Equal(intermediateChainDER[0], intermediateCertDER) || !bytes.Equal(intermediateChainDER[1], rootCertDER) {
+		t.Fatal("public Intermediate chain was not ordered Intermediate then Root")
+	}
+	intermediateCertificate, err := x509.ParseCertificate(intermediateCertDER)
+	if err != nil {
+		t.Fatal("parse public Intermediate certificate")
+	}
+	rootCertificate, err := x509.ParseCertificate(rootCertDER)
+	if err != nil {
+		t.Fatal("parse public Root certificate")
+	}
+	if err := intermediateCertificate.CheckSignatureFrom(rootCertificate); err != nil {
+		t.Fatal("public Intermediate certificate was not signed by the public Root")
+	}
+	stage4AssertPublicCANotModified(t, client, origin, rootCertificateID, "certificate.pem", rootCertETag)
+	stage4AssertPublicCANotModified(t, client, origin, rootCertificateID, "chain.pem", rootChainETag)
+	stage4AssertPublicCANotModified(t, client, origin, intermediateCertificateID, "certificate.pem", intermediateCertETag)
+	stage4AssertPublicCANotModified(t, client, origin, intermediateCertificateID, "chain.pem", intermediateChainETag)
+	for _, filename := range []string{"certificate.pem", "chain.pem"} {
+		leafResponse := mustRequest(t, client, http.MethodGet, origin+"/pki/ca-certificates/"+leafCertificateID+"/"+filename, nil, nil, nil)
+		stage4ExpectStatus(t, leafResponse, http.StatusNotFound)
+		closeResponseBody(t, leafResponse)
+	}
+
+	renamed := "Runtime Integration Intermediate Renamed"
+	renameResponse := mustRequest(t, client, http.MethodPatch, origin+"/api/v1/authorities/"+intermediateID, map[string]string{"name": renamed}, sessionCookie, stage4MutationHeaders(origin, csrfToken, intermediateResponse.Header.Get("ETag"), ""))
+	stage4ExpectStatus(t, renameResponse, http.StatusOK)
+	renameData := stage4ResponseData(t, renameResponse)
+	stage4AssertAuthority(t, renameData, true)
+	if stage4String(t, renameData, "name") != renamed {
+		t.Fatal("Intermediate rename response did not persist the requested name")
+	}
+	renamedAuthority := mustRequest(t, client, http.MethodGet, origin+"/api/v1/authorities/"+intermediateID, nil, sessionCookie, nil)
+	stage4ExpectStatus(t, renamedAuthority, http.StatusOK)
+	renamedData := stage4ResponseData(t, renamedAuthority)
+	stage4AssertAuthority(t, renamedData, true)
+	if stage4String(t, renamedData, "name") != renamed {
+		t.Fatal("Intermediate rename was not persisted by the SQL repository")
+	}
+	renamedCertDER, renamedChainDER, _, _ := stage4ReadPublicCACertificateAndChain(t, client, origin, intermediateCertificateID)
+	if !bytes.Equal(renamedCertDER, intermediateCertDER) || !stage4EqualCertificateChains(renamedChainDER, intermediateChainDER) {
+		t.Fatal("renaming an Intermediate changed its immutable public certificate or chain")
+	}
+
+	stopResponse := mustRequest(t, client, http.MethodPost, origin+"/api/v1/authorities/"+intermediateID+"/issuance-state", map[string]string{"state": string(domain.IssuanceStateStopped)}, sessionCookie, stage4MutationHeaders(origin, csrfToken, renamedAuthority.Header.Get("ETag"), ""))
+	stage4ExpectStatus(t, stopResponse, http.StatusOK)
+	stopData := stage4ResponseData(t, stopResponse)
+	stage4AssertAuthority(t, stopData, true)
+	if stage4String(t, stopData, "issuance_state") != string(domain.IssuanceStateStopped) {
+		t.Fatal("Intermediate issuance was not explicitly stopped")
+	}
+	stopETag := stopResponse.Header.Get("ETag")
+	if stopETag == "" {
+		t.Fatal("stopping Intermediate issuance omitted the new authority ETag")
+	}
+
+	destroyResponse := mustRequest(t, client, http.MethodPost, origin+"/api/v1/authorities/"+intermediateID+"/key-destruction", map[string]string{
+		"key_generation_id": intermediateKeyGenerationID,
+		"justification":     "stage4 live-leaf closure guard",
+	}, sessionCookie, stage4MutationHeaders(origin, csrfToken, stopETag, ""))
+	destroyStatus, destroyCode := stage4StatusAndErrorCode(t, destroyResponse)
+	stage4AssertAuthorityUnchangedAfterClosureRejection(t, client, origin, sessionCookie, intermediateID, stopETag, renamed, intermediateKeyGenerationID)
+
+	archiveResponse := mustRequest(t, client, http.MethodPost, origin+"/api/v1/authorities/"+intermediateID+"/archive", map[string]any{}, sessionCookie, stage4MutationHeaders(origin, csrfToken, stopETag, ""))
+	archiveStatus, archiveCode := stage4StatusAndErrorCode(t, archiveResponse)
+	stage4AssertAuthorityUnchangedAfterClosureRejection(t, client, origin, sessionCookie, intermediateID, stopETag, renamed, intermediateKeyGenerationID)
+	if destroyStatus != http.StatusConflict || archiveStatus != http.StatusConflict {
+		t.Fatalf("live Leaf descendants should block Intermediate destruction/archive with HTTP 409; got destruction %d (%q), archive %d (%q)", destroyStatus, destroyCode, archiveStatus, archiveCode)
+	}
+}
+
+func stage4ReadPublicCACertificateAndChain(t *testing.T, client *http.Client, origin, certificateID string) ([]byte, [][]byte, string, string) {
+	t.Helper()
+	basePath := origin + "/pki/ca-certificates/" + certificateID
+	certificateResponse := mustRequest(t, client, http.MethodGet, basePath+"/certificate.pem", nil, nil, nil)
+	stage4ExpectStatus(t, certificateResponse, http.StatusOK)
+	certificateETag := certificateResponse.Header.Get("ETag")
+	certificateDER := stage4ParseCertificatePEM(t, captureResponseBody(t, certificateResponse))
+	if certificateETag == "" {
+		t.Fatal("public CA certificate response omitted its ETag")
+	}
+	chainResponse := mustRequest(t, client, http.MethodGet, basePath+"/chain.pem", nil, nil, nil)
+	stage4ExpectStatus(t, chainResponse, http.StatusOK)
+	chainETag := chainResponse.Header.Get("ETag")
+	chainDER := stage4ParseCertificateChainPEM(t, captureResponseBody(t, chainResponse))
+	if chainETag == "" {
+		t.Fatal("public CA chain response omitted its ETag")
+	}
+	return certificateDER, chainDER, certificateETag, chainETag
+}
+
+func stage4ParseCertificatePEM(t *testing.T, body []byte) []byte {
+	t.Helper()
+	block, rest := pem.Decode(body)
+	if block == nil || block.Type != "CERTIFICATE" || len(bytes.TrimSpace(rest)) != 0 {
+		t.Fatal("public CA certificate response was not one PEM certificate")
+	}
+	if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+		t.Fatal("public CA certificate response contained invalid DER")
+	}
+	return append([]byte(nil), block.Bytes...)
+}
+
+func stage4ParseCertificateChainPEM(t *testing.T, body []byte) [][]byte {
+	t.Helper()
+	var certificates [][]byte
+	for len(bytes.TrimSpace(body)) > 0 {
+		block, rest := pem.Decode(body)
+		if block == nil || block.Type != "CERTIFICATE" {
+			t.Fatal("public CA chain response contained an invalid PEM block")
+		}
+		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+			t.Fatal("public CA chain response contained invalid DER")
+		}
+		certificates = append(certificates, append([]byte(nil), block.Bytes...))
+		body = rest
+	}
+	if len(certificates) == 0 {
+		t.Fatal("public CA chain response contained no certificates")
+	}
+	return certificates
+}
+
+func stage4AssertPublicCANotModified(t *testing.T, client *http.Client, origin, certificateID, filename, etag string) {
+	t.Helper()
+	response := mustRequest(t, client, http.MethodGet, origin+"/pki/ca-certificates/"+certificateID+"/"+filename, nil, nil, map[string]string{"If-None-Match": etag})
+	if response.StatusCode != http.StatusNotModified {
+		stage4ExpectStatus(t, response, http.StatusNotModified)
+	}
+	if got := captureResponseBody(t, response); len(got) != 0 {
+		t.Fatal("conditional public CA response included a body")
+	}
+	if response.Header.Get("ETag") != etag {
+		t.Fatal("conditional public CA response changed its ETag")
+	}
+}
+
+func stage4EqualCertificateChains(left, right [][]byte) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if !bytes.Equal(left[index], right[index]) {
+			return false
+		}
+	}
+	return true
+}
+
+func stage4StatusAndErrorCode(t *testing.T, response *http.Response) (int, string) {
+	t.Helper()
+	if response.StatusCode >= http.StatusBadRequest {
+		return response.StatusCode, apiErrorCode(t, response)
+	}
+	closeResponseBody(t, response)
+	return response.StatusCode, ""
+}
+
+func stage4AssertAuthorityUnchangedAfterClosureRejection(t *testing.T, client *http.Client, origin string, sessionCookie *http.Cookie, authorityID, expectedETag, expectedName, expectedKeyGenerationID string) {
+	t.Helper()
+	response := mustRequest(t, client, http.MethodGet, origin+"/api/v1/authorities/"+authorityID, nil, sessionCookie, nil)
+	stage4ExpectStatus(t, response, http.StatusOK)
+	data := stage4ResponseData(t, response)
+	stage4AssertAuthority(t, data, true)
+	if response.Header.Get("ETag") != expectedETag ||
+		stage4String(t, data, "name") != expectedName ||
+		stage4String(t, data, "key_generation_id") != expectedKeyGenerationID ||
+		stage4String(t, data, "issuance_state") != string(domain.IssuanceStateStopped) ||
+		!stage4Bool(t, data, "key_available") {
+		t.Fatal("rejected authority closure operation mutated the Intermediate")
+	}
+	if _, archived := data["archived_at"]; archived {
+		t.Fatal("rejected authority closure operation archived the Intermediate")
+	}
 }
 
 func stage4ExerciseTransferReissueBoundary(t *testing.T, app *App, client *http.Client, origin string, sessionCookie *http.Cookie, csrfToken, authorityID string) {
