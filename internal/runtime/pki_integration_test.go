@@ -434,6 +434,16 @@ func stage4ExercisePublicCAAndAuthorityClosure(t *testing.T, client *http.Client
 		t.Fatal("Intermediate issuance was not explicitly stopped")
 	}
 	stopETag := stopResponse.Header.Get("ETag")
+	stoppedIssue := mustRequest(t, client, http.MethodPost, origin+"/api/v1/leaf-series", map[string]any{
+		"name": "stopped-issuer.internal", "authority_id": intermediateID,
+		"profile": "server_tls", "key_algorithm": "ecdsa_p256",
+		"subject": map[string]string{"common_name": "stopped-issuer.internal"},
+		"sans":    []map[string]string{{"type": "dns", "value": "stopped-issuer.internal"}},
+	}, sessionCookie, stage4MutationHeaders(origin, csrfToken, "", "00000000-0000-4000-8000-000000000109"))
+	stage4ExpectStatus(t, stoppedIssue, http.StatusConflict)
+	if code := apiErrorCode(t, stoppedIssue); code != "issuer_stopped" {
+		t.Fatalf("stopped issuer code = %q, want issuer_stopped", code)
+	}
 	if stopETag == "" {
 		t.Fatal("stopping Intermediate issuance omitted the new authority ETag")
 	}
