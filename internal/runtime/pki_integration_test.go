@@ -5,13 +5,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"cert-me/internal/app/contract"
 	"cert-me/internal/app/port"
+	"cert-me/internal/app/service"
+	"cert-me/internal/authcrypto"
 	"cert-me/internal/config"
+	"cert-me/internal/cryptoengine"
+	"cert-me/internal/cryptoformats"
 	"cert-me/internal/domain"
 )
 
@@ -82,6 +89,7 @@ func runRuntimePKIIssuanceFlow(t *testing.T, database runtimeDBSpec) {
 		"validity":      map[string]any{"value": 20, "unit": "years"},
 	}
 	rootKey := "00000000-0000-4000-8000-000000000101"
+	t.Log("create Root authority")
 	rootResponse := mustRequest(t, client, http.MethodPost, origin+"/api/v1/authorities", rootBody, sessionCookie, stage4MutationHeaders(origin, csrfToken, "", rootKey))
 	stage4ExpectStatus(t, rootResponse, http.StatusCreated)
 	rootData := stage4ResponseData(t, rootResponse)
@@ -90,6 +98,7 @@ func runRuntimePKIIssuanceFlow(t *testing.T, database runtimeDBSpec) {
 	if stage4String(t, rootData, "kind") != "root" || stage4String(t, rootData, "name") != "Runtime Integration Root" {
 		t.Fatal("Root creation response does not describe the requested authority")
 	}
+	t.Log("replay Root authority creation")
 	rootReplay := mustRequest(t, client, http.MethodPost, origin+"/api/v1/authorities", rootBody, sessionCookie, stage4MutationHeaders(origin, csrfToken, "", rootKey))
 	stage4ExpectStatus(t, rootReplay, http.StatusOK)
 	rootReplayData := stage4ResponseData(t, rootReplay)
@@ -122,6 +131,7 @@ func runRuntimePKIIssuanceFlow(t *testing.T, database runtimeDBSpec) {
 		"key_algorithm":       "ecdsa_p256",
 		"validity":            map[string]any{"value": 10, "unit": "years"},
 	}
+	t.Log("create Intermediate authority")
 	intermediateResponse := mustRequest(t, client, http.MethodPost, origin+"/api/v1/authorities", intermediateBody, sessionCookie, stage4MutationHeaders(origin, csrfToken, "", "00000000-0000-4000-8000-000000000102"))
 	stage4ExpectStatus(t, intermediateResponse, http.StatusCreated)
 	intermediateData := stage4ResponseData(t, intermediateResponse)
@@ -158,7 +168,7 @@ func runRuntimePKIIssuanceFlow(t *testing.T, database runtimeDBSpec) {
 	stage4AssertIssuance(t, issueData, true)
 	seriesID := stage4String(t, issueData, "series_id")
 	initialCertificateID := stage4String(t, issueData, "certificate_id")
-	if stage4String(t, issueData, "key_generation_id") == "" || stage4Int(t, issueData, "renewal_count") != 0 || stage4Bool(t, issueData, "key_rotated") {
+	if stage4String(t, issueData, "key_generation_id") == "" || stage4Int(t, issueData, "renewal_count") != 0 || !stage4Bool(t, issueData, "key_rotated") {
 		t.Fatal("initial Leaf issuance has an invalid key generation or renewal state")
 	}
 	delivery := stage4Object(t, issueData["delivery"])
@@ -194,6 +204,7 @@ func runRuntimePKIIssuanceFlow(t *testing.T, database runtimeDBSpec) {
 		t.Fatal("Leaf series detail omitted its version ETag")
 	}
 
+	t.Log("verify pending-delivery renewal rejection")
 	pendingRenewal := mustRequest(t, client, http.MethodPost, origin+"/api/v1/leaf-series/"+seriesID+"/renewals", map[string]string{"source_certificate_id": initialCertificateID}, sessionCookie, stage4MutationHeaders(origin, csrfToken, initialSeriesETag, "00000000-0000-4000-8000-000000000104"))
 	stage4ExpectStatus(t, pendingRenewal, http.StatusConflict)
 	_ = apiErrorCode(t, pendingRenewal)
@@ -204,7 +215,9 @@ func runRuntimePKIIssuanceFlow(t *testing.T, database runtimeDBSpec) {
 
 	renewalKey := "00000000-0000-4000-8000-000000000105"
 	renewalBody := map[string]string{"source_certificate_id": initialCertificateID}
-	renewalResponse := mustRequest(t, client, http.MethodPost, origin+"/api/v1/leaf-series/"+seriesID+"/renewals", renewalBody, sessionCookie, stage4MutationHeaders(origin, csrfToken, initialSeriesETag, renewalKey))
+	renewalPath := "/api/v1/leaf-series/" + seriesID + "/renewals"
+	t.Logf("renew after completed initial delivery: POST %s", renewalPath)
+	renewalResponse := mustRequest(t, client, http.MethodPost, origin+renewalPath, renewalBody, sessionCookie, stage4MutationHeaders(origin, csrfToken, initialSeriesETag, renewalKey))
 	stage4ExpectStatus(t, renewalResponse, http.StatusCreated)
 	renewalData := stage4ResponseData(t, renewalResponse)
 	stage4AssertIssuance(t, renewalData, true)
@@ -216,7 +229,8 @@ func runRuntimePKIIssuanceFlow(t *testing.T, database runtimeDBSpec) {
 		t.Fatal("key-reuse renewal unexpectedly created a new private delivery")
 	}
 	stage4AssertNoSecretFields(t, renewalResponse)
-	renewalReplay := mustRequest(t, client, http.MethodPost, origin+"/api/v1/leaf-series/"+seriesID+"/renewals", renewalBody, sessionCookie, stage4MutationHeaders(origin, csrfToken, initialSeriesETag, renewalKey))
+	t.Logf("replay renewal with the original If-Match: POST %s", renewalPath)
+	renewalReplay := mustRequest(t, client, http.MethodPost, origin+renewalPath, renewalBody, sessionCookie, stage4MutationHeaders(origin, csrfToken, initialSeriesETag, renewalKey))
 	stage4ExpectStatus(t, renewalReplay, http.StatusOK)
 	renewalReplayData := stage4ResponseData(t, renewalReplay)
 	if stage4String(t, renewalReplayData, "certificate_id") != renewedCertificateID {
@@ -233,14 +247,17 @@ func runRuntimePKIIssuanceFlow(t *testing.T, database runtimeDBSpec) {
 		t.Fatal("Leaf series did not advance to the renewed certificate")
 	}
 
+	reissuePath := "/api/v1/leaf-series/" + seriesID + "/reissues"
+	reissueTarget := origin + reissuePath
+	t.Logf("race concurrent same-key Reissue requests: POST %s", reissuePath)
 	reissueBody := map[string]string{"source_certificate_id": renewedCertificateID, "reason": "manual_rotation"}
 	reissueKey := "00000000-0000-4000-8000-000000000106"
-	reissueResponses := stage4ConcurrentSameKeyRequests(client, origin+"/api/v1/leaf-series/"+seriesID+"/reissues", reissueBody, sessionCookie, stage4MutationHeaders(origin, csrfToken, renewedSeriesETag, reissueKey))
+	reissueResponses := stage4ConcurrentSameKeyRequests(client, reissueTarget, reissueBody, sessionCookie, stage4MutationHeaders(origin, csrfToken, renewedSeriesETag, reissueKey))
 	var reissueData map[string]json.RawMessage
 	var reissueStatus201, reissueStatus200 int
 	for _, result := range reissueResponses {
 		if result.err != nil {
-			t.Fatal("concurrent reissue request failed")
+			t.Fatalf("concurrent Reissue transport failed: %v", result.err)
 		}
 		switch result.response.StatusCode {
 		case http.StatusCreated:
@@ -248,7 +265,13 @@ func runRuntimePKIIssuanceFlow(t *testing.T, database runtimeDBSpec) {
 		case http.StatusOK:
 			reissueStatus200++
 		default:
-			failWithAPIStatus(t, result.response, http.StatusCreated)
+			method, path := http.MethodPost, reissuePath
+			if result.response.Request != nil {
+				method = result.response.Request.Method
+				path = result.response.Request.URL.Path
+			}
+			code := apiErrorCode(t, result.response)
+			t.Fatalf("concurrent Reissue request %s %s returned HTTP %d (error code %q), want 201 or 200", method, path, result.response.StatusCode, code)
 		}
 		data := stage4ResponseData(t, result.response)
 		stage4AssertIssuance(t, data, true)
@@ -331,6 +354,270 @@ func runRuntimePKIIssuanceFlow(t *testing.T, database runtimeDBSpec) {
 			t.Fatal("certificate detail lost its Leaf series lineage")
 		}
 	}
+
+	stage4ExerciseTransferReissueBoundary(t, app, client, origin, sessionCookie, csrfToken, intermediateID)
+}
+
+func stage4ExerciseTransferReissueBoundary(t *testing.T, app *App, client *http.Client, origin string, sessionCookie *http.Cookie, csrfToken, authorityID string) {
+	t.Helper()
+
+	issueBody := map[string]any{
+		"name":          "runtime-transfer-race.internal",
+		"authority_id":  authorityID,
+		"profile":       "server_tls",
+		"subject":       map[string]string{"common_name": "runtime-transfer-race.internal"},
+		"sans":          []map[string]string{{"type": "dns", "value": "runtime-transfer-race.internal"}},
+		"key_algorithm": "ecdsa_p256",
+		"validity":      map[string]any{"value": 1, "unit": "years"},
+		"rotate_every":  3,
+	}
+	issueResponse := mustRequest(t, client, http.MethodPost, origin+"/api/v1/leaf-series", issueBody, sessionCookie, stage4MutationHeaders(origin, csrfToken, "", "00000000-0000-4000-8000-000000000107"))
+	stage4ExpectStatus(t, issueResponse, http.StatusCreated)
+	issueData := stage4ResponseData(t, issueResponse)
+	stage4AssertIssuance(t, issueData, true)
+	seriesID := stage4String(t, issueData, "series_id")
+	certificateID := stage4String(t, issueData, "certificate_id")
+	deliveryView := stage4Object(t, issueData["delivery"])
+	deliveryID := stage4String(t, deliveryView, "id")
+	if stage4String(t, deliveryView, "state") != string(domain.DeliveryStatePending) {
+		t.Fatal("fresh Leaf issuance did not have a pending private-key delivery")
+	}
+
+	seriesResponse := mustRequest(t, client, http.MethodGet, origin+"/api/v1/leaf-series/"+seriesID, nil, sessionCookie, nil)
+	stage4ExpectStatus(t, seriesResponse, http.StatusOK)
+	seriesData := stage4ResponseData(t, seriesResponse)
+	stage4AssertSeries(t, seriesData, true)
+	seriesETag := seriesResponse.Header.Get("ETag")
+	if seriesETag == "" || stage4String(t, seriesData, "current_certificate_id") != certificateID {
+		t.Fatal("fresh Leaf series detail omitted its version or current certificate")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	rawToken, tokenHash, err := (authcrypto.TokenCodec{}).NewToken(ctx)
+	if err != nil {
+		t.Fatal("create one-time private transfer token")
+	}
+	t.Cleanup(func() { _ = rawToken.Close() })
+	seriesIDValue, err := domain.ParseSeriesID(seriesID)
+	if err != nil {
+		t.Fatal("parse transfer-race series identifier")
+	}
+	certificateIDValue, err := domain.ParseCertificateID(certificateID)
+	if err != nil {
+		t.Fatal("parse transfer-race certificate identifier")
+	}
+	deliveryIDValue, err := domain.ParseDeliveryID(deliveryID)
+	if err != nil {
+		t.Fatal("parse transfer-race delivery identifier")
+	}
+	var createdBy domain.AccountID
+	if err := app.store.Read(ctx, func(tx port.TxStores) error {
+		account, err := tx.Accounts().FindAccountByLoginName(ctx, domain.NormalizeLoginName("stage4-admin"))
+		if err != nil {
+			return err
+		}
+		createdBy = account.ID()
+		return nil
+	}); err != nil {
+		t.Fatal("load administrator for typed private-grant fixture")
+	}
+	grantIDText, err := newUUID()
+	if err != nil {
+		t.Fatal("create private-grant identifier")
+	}
+	grantID, err := domain.ParseGrantID(grantIDText)
+	if err != nil {
+		t.Fatal("parse private-grant identifier")
+	}
+	grant, err := domain.NewDownloadGrant(domain.DownloadGrantFacts{
+		ID:            grantID,
+		TokenHash:     tokenHash,
+		Purpose:       domain.GrantPurposeLeafPrivate,
+		CertificateID: certificateIDValue,
+		DeliveryID:    deliveryIDValue,
+		CreatedBy:     createdBy,
+		ExpiresAt:     domain.NewInstant(time.Now().UTC().Add(5 * time.Minute)),
+		Version:       1,
+	})
+	if err != nil {
+		t.Fatal("construct typed private download grant")
+	}
+	if err := app.store.Write(ctx, func(tx port.TxStores) error {
+		return tx.Delivery().InsertGrant(ctx, grant)
+	}); err != nil {
+		t.Fatal("seed private download grant through runtime unit of work")
+	}
+
+	deliveryEncoder, err := cryptoengine.NewDeliveryEncoder(app.ring)
+	if err != nil {
+		t.Fatal("construct real delivery encoder")
+	}
+	distribution, err := service.NewDistributionService(service.DistributionDeps{
+		CommonDeps: service.CommonDeps{
+			UnitOfWork: app.store,
+			ReadStore:  app.store,
+			Authorizer: adminAuthorizer{},
+			Clock:      systemClock{},
+			IDs:        randomIDs{},
+		},
+		TokenCodec:               authcrypto.TokenCodec{},
+		DeliveryEncoder:          deliveryEncoder,
+		PublicCertificateEncoder: cryptoformats.NewPublicCertificateEncoder(),
+		OperationalLogger:        operationalLogger{logger: app.logger},
+		RuntimeGate:              app.gate,
+	})
+	if err != nil {
+		t.Fatal("construct real DistributionService")
+	}
+
+	sink := &stage4BlockingDownloadSink{entered: make(chan int64, 1), release: make(chan struct{})}
+	results := make(chan stage4DeliveryResult, 1)
+	resultObserved := false
+	t.Cleanup(func() {
+		sink.releaseSend()
+		if resultObserved {
+			return
+		}
+		select {
+		case <-results:
+		case <-time.After(10 * time.Second):
+			t.Error("private transfer did not finish during cleanup")
+		}
+	})
+	go func() {
+		summary, err := distribution.Deliver(ctx, contract.RequestMeta{
+			Principal: contract.AnonymousPrincipal(),
+			RequestID: "stage4-transfer-reissue-race",
+		}, contract.DownloadCommand{RawToken: rawToken, Format: contract.DownloadFormatPEM}, sink)
+		results <- stage4DeliveryResult{summary: summary, err: err}
+	}()
+
+	var payloadBytes int64
+	select {
+	case payloadBytes = <-sink.entered:
+	case result := <-results:
+		resultObserved = true
+		if appErr, ok := contract.AsAppError(result.err); ok {
+			t.Fatalf("private transfer failed before Send with code %q", appErr.Code())
+		}
+		t.Fatal("private transfer exited before Send")
+	case <-ctx.Done():
+		cancel()
+		t.Fatal("private transfer did not reach the blocking Send")
+	}
+	if payloadBytes <= 0 {
+		t.Fatal("real private delivery payload was empty")
+	}
+
+	reissuePath := origin + "/api/v1/leaf-series/" + seriesID + "/reissues"
+	reissueBody := map[string]string{"source_certificate_id": certificateID, "reason": "manual_rotation"}
+	reissueKey := "00000000-0000-4000-8000-000000000108"
+	t.Log("verify reissue is rejected while the private payload is in Send")
+	blockedReissue := mustRequest(t, client, http.MethodPost, reissuePath, reissueBody, sessionCookie, stage4MutationHeaders(origin, csrfToken, seriesETag, reissueKey))
+	stage4ExpectStatus(t, blockedReissue, http.StatusConflict)
+	closeResponseBody(t, blockedReissue)
+	if !app.gate.IsAccepting() {
+		t.Fatal("a normal in-flight transfer unexpectedly closed runtime admission")
+	}
+
+	transferringResponse := mustRequest(t, client, http.MethodGet, origin+"/api/v1/leaf-series/"+seriesID, nil, sessionCookie, nil)
+	stage4ExpectStatus(t, transferringResponse, http.StatusOK)
+	transferringData := stage4ResponseData(t, transferringResponse)
+	stage4AssertSeries(t, transferringData, true)
+	if transferringResponse.Header.Get("ETag") != seriesETag ||
+		stage4String(t, transferringData, "current_certificate_id") != certificateID ||
+		stage4String(t, transferringData, "current_key_generation_id") != stage4String(t, seriesData, "current_key_generation_id") {
+		t.Fatal("rejected reissue mutated the Leaf series while delivery was transferring")
+	}
+	transferringDelivery := stage4Object(t, transferringData["delivery"])
+	if stage4String(t, transferringDelivery, "state") != string(domain.DeliveryStateTransferring) {
+		t.Fatal("in-flight private delivery did not remain transferring")
+	}
+
+	sink.releaseSend()
+	var deliveryResult stage4DeliveryResult
+	select {
+	case deliveryResult = <-results:
+		resultObserved = true
+	case <-ctx.Done():
+		t.Fatal("private transfer did not complete after Send was released")
+	}
+	if deliveryResult.err != nil {
+		if appErr, ok := contract.AsAppError(deliveryResult.err); ok {
+			t.Fatalf("private transfer failed after Send with code %q", appErr.Code())
+		}
+		t.Fatal("private transfer failed after Send")
+	}
+	if !deliveryResult.summary.Completed || deliveryResult.summary.BytesWritten != payloadBytes || deliveryResult.summary.DeliveryID != deliveryIDValue {
+		t.Fatal("private transfer summary did not report the completed payload and delivery")
+	}
+	if !app.gate.IsAccepting() {
+		t.Fatal("successful private transfer closed runtime admission")
+	}
+
+	var finalDelivery domain.Delivery
+	var finalCustody domain.KeyCustody
+	if err := app.store.Read(ctx, func(tx port.TxStores) error {
+		snapshot, err := tx.PKI().GetSeriesForUpdate(ctx, seriesIDValue)
+		if err != nil {
+			return err
+		}
+		finalCustody = snapshot.CurrentKeyGeneration.Custody()
+		finalDelivery, err = tx.Delivery().GetDeliveryForUpdate(ctx, deliveryIDValue)
+		return err
+	}); err != nil {
+		t.Fatal("read completed transfer state through runtime unit of work")
+	}
+	if finalDelivery.State() != domain.DeliveryStateServerCompleted || finalCustody != domain.KeyCustodyClientHeld {
+		t.Fatal("successful transfer did not record server completion and client-held key custody")
+	}
+
+	completedResponse := mustRequest(t, client, http.MethodGet, origin+"/api/v1/leaf-series/"+seriesID, nil, sessionCookie, nil)
+	stage4ExpectStatus(t, completedResponse, http.StatusOK)
+	completedData := stage4ResponseData(t, completedResponse)
+	completedDelivery := stage4Object(t, completedData["delivery"])
+	if stage4String(t, completedDelivery, "state") != string(domain.DeliveryStateServerCompleted) {
+		t.Fatal("Leaf series API did not expose the completed private delivery")
+	}
+
+	t.Log("retry manual reissue after server-observed transfer completion")
+	retryReissue := mustRequest(t, client, http.MethodPost, reissuePath, reissueBody, sessionCookie, stage4MutationHeaders(origin, csrfToken, seriesETag, reissueKey))
+	stage4ExpectStatus(t, retryReissue, http.StatusCreated)
+	retryData := stage4ResponseData(t, retryReissue)
+	stage4AssertIssuance(t, retryData, true)
+	if stage4String(t, retryData, "certificate_id") == certificateID || !stage4Bool(t, retryData, "key_rotated") {
+		t.Fatal("reissue retry after completed transfer did not create a fresh certificate and key")
+	}
+}
+
+type stage4DeliveryResult struct {
+	summary contract.TransferSummary
+	err     error
+}
+
+type stage4BlockingDownloadSink struct {
+	entered chan int64
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *stage4BlockingDownloadSink) Send(ctx context.Context, _ port.FileDescriptor, payload io.Reader) (port.TransferOutcome, error) {
+	bytesWritten, err := io.Copy(io.Discard, payload)
+	if err != nil {
+		return port.TransferOutcome{}, err
+	}
+	s.entered <- bytesWritten
+	select {
+	case <-s.release:
+		return port.TransferOutcome{BytesWritten: bytesWritten, FinishedAt: domain.NewInstant(time.Now().UTC()), Completed: true}, nil
+	case <-ctx.Done():
+		return port.TransferOutcome{}, ctx.Err()
+	}
+}
+
+func (s *stage4BlockingDownloadSink) releaseSend() {
+	s.once.Do(func() { close(s.release) })
 }
 
 func stage4CreateAdminSession(t *testing.T, client *http.Client, origin string) (*http.Cookie, string) {
@@ -704,6 +991,10 @@ func stage4CompleteInitialDelivery(t *testing.T, app *App, rawSeriesID string) e
 	}
 	startedAt := domain.NewInstant(time.Now().UTC())
 	if err := app.store.Write(ctx, func(tx port.TxStores) error {
+		snapshot, err := tx.PKI().GetSeriesForUpdate(ctx, seriesID)
+		if err != nil {
+			return err
+		}
 		delivery, err := tx.Delivery().GetDeliveryForUpdate(ctx, deliveryID)
 		if err != nil {
 			return err
@@ -718,16 +1009,16 @@ func stage4CompleteInitialDelivery(t *testing.T, app *App, rawSeriesID string) e
 		if err := tx.Delivery().InvalidatePrivateGrants(ctx, delivery.ID(), startedAt); err != nil {
 			return err
 		}
-		snapshot, err := tx.PKI().GetSeriesForUpdate(ctx, seriesID)
-		if err != nil {
-			return err
-		}
 		return tx.Secrets().Delete(ctx, snapshot.CurrentKeyGeneration.KeyMaterialID(), domain.SecretPurposeLeafDelivery)
 	}); err != nil {
 		return fmt.Errorf("record transfer start: %w", err)
 	}
 	finishedAt := domain.NewInstant(time.Now().UTC())
 	return app.store.Write(ctx, func(tx port.TxStores) error {
+		snapshot, err := tx.PKI().GetSeriesForUpdate(ctx, seriesID)
+		if err != nil {
+			return err
+		}
 		delivery, err := tx.Delivery().GetDeliveryForUpdate(ctx, deliveryID)
 		if err != nil {
 			return err
@@ -739,20 +1030,7 @@ func stage4CompleteInitialDelivery(t *testing.T, app *App, rawSeriesID string) e
 		if err := tx.Delivery().SaveDelivery(ctx, completed, delivery.Version()); err != nil {
 			return err
 		}
-		snapshot, err := tx.PKI().GetSeriesForUpdate(ctx, seriesID)
-		if err != nil {
-			return err
-		}
-		generation := snapshot.CurrentKeyGeneration
-		clientHeld, err := domain.NewLeafKeyGeneration(domain.LeafKeyGenerationFacts{
-			ID: generation.ID(), SeriesID: generation.SeriesID(), KeyMaterialID: generation.KeyMaterialID(),
-			GenerationNo: generation.GenerationNo(), RenewalCount: generation.RenewalCount(),
-			PriorHistoryUnknown: generation.PriorHistoryUnknown(), Custody: domain.KeyCustodyClientHeld,
-		})
-		if err != nil {
-			return err
-		}
-		return tx.PKI().SaveLeafKeyGeneration(ctx, clientHeld)
+		return tx.PKI().MarkLeafKeyGenerationClientHeld(ctx, snapshot.CurrentKeyGeneration.ID())
 	})
 }
 
