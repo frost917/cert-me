@@ -26,7 +26,7 @@
 | 401 | authentication_required, invalid_credentials | 세션 없음·만료 또는 일반적인 로그인 실패 |
 | 403 | permission_denied, csrf_failed | 권한·CSRF 실패 |
 | 404 | not_found, download_not_available | 대상 없음 또는 유효하지 않은 공개 토큰. 미인증 토큰 요청은 만료/소비/미존재 구분 없음 |
-| 409 | issuer_stopped, delivery_not_available, duplicate_public_key, serial_conflict, idempotency_conflict, setup_closed | 업무 상태·중복 충돌 |
+| 409 | issuer_stopped, delivery_not_available, authority_closure_blocked, duplicate_public_key, serial_conflict, idempotency_conflict, setup_closed | 업무 상태·중복 충돌 |
 | 412 / 428 | version_conflict / precondition_required | If-Match 불일치 / 필수 헤더 누락 |
 | 422 | invalid_profile, invalid_chain, validity_exceeds_issuer, unsupported_import | 파싱 가능하지만 정책 위반 |
 | 429 | rate_limited | Retry-After 포함 |
