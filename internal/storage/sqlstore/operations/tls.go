@@ -25,7 +25,7 @@ func (r *TLSRepository) GetActiveForUpdate(ctx context.Context) (domain.TLSChang
 		return domain.TLSChange{}, err
 	}
 	b := r.builder()
-	query := "SELECT active_tls_version_id FROM installation WHERE id = 1" + r.dialect.RowLockClause()
+	query := "SELECT active_tls_version_id FROM installation WHERE id = 1" + core.RowLockClause(r.executor, r.dialect.RowLockClause())
 	var active sql.NullString
 	if err := r.queryRow(ctx, query).Scan(&active); err != nil {
 		return domain.TLSChange{}, failed("read installation TLS pointer", missing(err))
@@ -38,7 +38,7 @@ func (r *TLSRepository) GetActiveForUpdate(ctx context.Context) (domain.TLSChang
 		return domain.TLSChange{}, failed("decode active TLS pointer", err)
 	}
 	b = r.builder()
-	change, err := scanTLSChange(r.queryRow(ctx, "SELECT previous_version_id, candidate_version_id, phase, error_code, version FROM tls_changes WHERE candidate_version_id = "+b.Add(string(versionID))+" AND phase = 'applied'"+r.dialect.RowLockClause(), b.Args()...))
+	change, err := scanTLSChange(r.queryRow(ctx, "SELECT previous_version_id, candidate_version_id, phase, error_code, version FROM tls_changes WHERE candidate_version_id = "+b.Add(string(versionID))+core.RowLockClause(r.executor, r.dialect.RowLockClause()), b.Args()...))
 	if err != nil {
 		return domain.TLSChange{}, failed("read active TLS change", err)
 	}
@@ -273,7 +273,8 @@ func scanTLSVersion(row rowScanner) (domain.TLSVersion, error) {
 }
 
 func scanTLSChange(row rowScanner) (domain.TLSChange, error) {
-	var previous, candidate, phase string
+	var previous sql.NullString
+	var candidate, phase string
 	var errorCode sql.NullString
 	var version int64
 	if err := row.Scan(&previous, &candidate, &phase, &errorCode, &version); err != nil {
@@ -283,8 +284,8 @@ func scanTLSChange(row rowScanner) (domain.TLSChange, error) {
 		return domain.TLSChange{}, fmt.Errorf("TLS change version is negative")
 	}
 	facts := domain.TLSChangeFacts{CandidateVersionID: domain.TLSVersionID(candidate), Phase: domain.TLSChangePhase(phase), Version: domain.Version(version)}
-	if previous != "" {
-		facts.PreviousVersionID = domain.TLSVersionID(previous)
+	if previous.Valid {
+		facts.PreviousVersionID = domain.TLSVersionID(previous.String)
 	}
 	if errorCode.Valid {
 		facts.ErrorCode = errorCode.String

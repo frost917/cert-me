@@ -46,12 +46,12 @@ import (
 //     with its scope list attached; see ListAudit.
 type QueryRepository interface {
 	// ListAuthorities returns one page of authorities within scope.
-	ListAuthorities(ctx context.Context, query contract.AuthorityListQuery, scope QueryScope) (contract.Page[domain.Authority], error)
+	ListAuthorities(ctx context.Context, query contract.AuthorityListQuery, scope QueryScope) (contract.Page[QueriedAuthority], error)
 	// GetAuthority reads one authority without locking it. It returns
 	// ErrNotFound both for an authority that does not exist and for one
 	// outside scope, so a caller cannot probe for the existence of a range
 	// it may not see.
-	GetAuthority(ctx context.Context, id domain.AuthorityID, scope QueryScope) (domain.Authority, error)
+	GetAuthority(ctx context.Context, id domain.AuthorityID, scope QueryScope) (QueriedAuthority, error)
 
 	// ListSeries returns one page of leaf series within scope.
 	ListSeries(ctx context.Context, query contract.SeriesListQuery, scope QueryScope) (contract.Page[SeriesSnapshot], error)
@@ -154,6 +154,14 @@ type QueryScope struct {
 	Public bool
 }
 
+// QueriedAuthority is an authority plus its persisted creation timestamp.
+// The domain value intentionally does not own storage metadata, while the
+// API contract requires created_at on every authority view.
+type QueriedAuthority struct {
+	Authority domain.Authority
+	CreatedAt domain.Instant
+}
+
 // QueriedCertificate is a certificate plus the stored relations
 // contract.CertificateView needs, gathered by the store so the service does
 // not issue one follow-up read per row.
@@ -165,6 +173,7 @@ type QueryScope struct {
 // there is no way to pass this struct a "now" that has gone stale.
 type QueriedCertificate struct {
 	Certificate domain.Certificate
+	CreatedAt   domain.Instant
 	// SeriesID is set for a leaf certificate, nil for a CA certificate.
 	SeriesID *domain.SeriesID
 	Revoked  bool

@@ -53,6 +53,7 @@ func validCommands(t *testing.T) map[string]validatable {
 		"SetupCompleteCommand":               SetupCompleteCommand{},
 		"SettingsGetCommand":                 SettingsGetCommand{},
 		"SettingsUpdateCommand":              SettingsUpdateCommand{RotateEvery: intPtr(5)},
+		"SettingsInitializeCommand":          validSettingsInitializeCommand(),
 
 		"AuthorityCreateCommand": AuthorityCreateCommand{
 			Kind: "root", Name: "Example Root", Subject: SubjectInput{CommonName: "Example Root"},

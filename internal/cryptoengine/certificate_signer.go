@@ -125,7 +125,13 @@ func (s *CertificateSigner) Sign(ctx context.Context, request port.CertificateSi
 		if err != nil {
 			return errors.New("cryptoengine: generated certificate could not be parsed")
 		}
-		facts, err := certificateFactsFromDER(request, parsed, issuer, selfSigned, keyAlgorithm)
+		// The single-label cert-me identity is reserved for the documented
+		// temporary HTTPS chain and its purpose-bound bootstrap signing key.
+		allowBootstrapSAN := caKey.Purpose() == domain.SecretPurposeBootstrapCA &&
+			request.Kind == domain.CertificateKindLeaf && request.Plan.Profile == domain.CertificateProfileServerTLS &&
+			request.Plan.Subject.CommonName() == "cert-me" && request.IssuerCertificate.Subject().CommonName() == "cert-me" &&
+			len(request.Plan.SANs) == 1 && request.Plan.SANs[0].Type() == domain.SANTypeDNS && request.Plan.SANs[0].Value() == "cert-me"
+		facts, err := certificateFactsFromDER(request, parsed, issuer, selfSigned, keyAlgorithm, allowBootstrapSAN)
 		if err != nil {
 			return err
 		}
@@ -401,6 +407,7 @@ func certificateFactsFromDER(
 	issuer *x509.Certificate,
 	selfSigned bool,
 	issuerAlgorithm domain.KeyAlgorithm,
+	allowBootstrapSAN bool,
 ) (domain.CertificateFacts, error) {
 	if parsed == nil {
 		return domain.CertificateFacts{}, errors.New("cryptoengine: generated certificate is missing")
@@ -430,7 +437,7 @@ func certificateFactsFromDER(
 	if err != nil || !actualPublic.Equal(request.SubjectPublicKey) {
 		return domain.CertificateFacts{}, errors.New("cryptoengine: generated certificate public key does not match the request")
 	}
-	sans, err := orderedSANsFromDER(parsed)
+	sans, err := orderedSANsFromDERWithBootstrap(parsed, allowBootstrapSAN)
 	if err != nil || !sameCertificateSANs(sans, request.Plan.SANs) {
 		return domain.CertificateFacts{}, errors.New("cryptoengine: generated certificate SANs do not match the request")
 	}
@@ -638,6 +645,10 @@ func marshalOrderedSANs(sans []domain.SAN) ([]byte, error) {
 }
 
 func orderedSANsFromDER(certificate *x509.Certificate) ([]domain.SAN, error) {
+	return orderedSANsFromDERWithBootstrap(certificate, false)
+}
+
+func orderedSANsFromDERWithBootstrap(certificate *x509.Certificate, allowBootstrapSAN bool) ([]domain.SAN, error) {
 	var extension *pkix.Extension
 	for i := range certificate.Extensions {
 		if certificate.Extensions[i].Id.Equal(certificateSANExtensionOID) {
@@ -676,7 +687,13 @@ func orderedSANsFromDER(certificate *x509.Certificate) ([]domain.SAN, error) {
 		default:
 			return nil, errors.New("cryptoengine: certificate contains an unsupported SAN type")
 		}
-		san, err := domain.NewSAN(kind, value)
+		var san domain.SAN
+		var err error
+		if allowBootstrapSAN && len(names) == 1 && kind == domain.SANTypeDNS && value == "cert-me" {
+			san, err = domain.NewBootstrapDNSNameSAN()
+		} else {
+			san, err = domain.NewSAN(kind, value)
+		}
 		if err != nil || san.Value() != value {
 			return nil, errors.New("cryptoengine: certificate SAN is invalid or non-canonical")
 		}

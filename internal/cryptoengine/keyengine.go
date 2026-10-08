@@ -8,6 +8,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/subtle"
 	"crypto/x509"
 	"encoding/binary"
 	"errors"
@@ -25,6 +26,11 @@ const (
 	secretFormatVersion = 1
 	secretNonceSize     = 12
 )
+
+// storeVerifierMarker is a fixed, non-secret assertion used only to verify
+// that the configured active generation key can authenticate its verifier.
+// Its prefix separates this plaintext from any other encrypted secret use.
+const storeVerifierMarker = "cert-me/encryption-verifier/v1\x00key-ring-integrity"
 
 // KeyEngine implements port.KeyEngine without returning or retaining private
 // key plaintext. Its key-encryption keys are owned by ring.
@@ -219,6 +225,85 @@ func (e *KeyEngine) Reencrypt(ctx context.Context, encrypted domain.EncryptedSec
 		return domain.EncryptedSecret{}, err
 	}
 	return result, nil
+}
+
+// CreateStoreVerifier encrypts a fixed marker under the active generation.
+// The marker is never returned or retained outside cryptoengine.
+func (e *KeyEngine) CreateStoreVerifier(ctx context.Context) (domain.EncryptedSecret, error) {
+	if err := checkContext(ctx); err != nil {
+		return domain.EncryptedSecret{}, err
+	}
+	if e == nil || e.ring == nil {
+		return domain.EncryptedSecret{}, errors.New("cryptoengine: key engine is unavailable")
+	}
+	var result domain.EncryptedSecret
+	err := e.ring.withActiveKey(func(generationID string, key []byte) error {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		var err error
+		result, err = sealSecret(key, domain.StoreVerifierOwnerKeyID, domain.SecretPurposeStoreVerifier,
+			secretFormatVersion, generationID, []byte(storeVerifierMarker))
+		if err != nil {
+			return err
+		}
+		return checkContext(ctx)
+	})
+	if err != nil {
+		return domain.EncryptedSecret{}, err
+	}
+	return result, nil
+}
+
+// VerifyStoreVerifier confirms that encrypted is bound to and decryptable by
+// the active generation. Decrypted bytes never leave this method.
+func (e *KeyEngine) VerifyStoreVerifier(ctx context.Context, encrypted domain.EncryptedSecret) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	if e == nil || e.ring == nil {
+		return errors.New("cryptoengine: key engine is unavailable")
+	}
+	if err := validateStoreVerifier(encrypted); err != nil {
+		return err
+	}
+	nonce := encrypted.Nonce()
+	ciphertext := encrypted.Ciphertext()
+	defer zero(nonce)
+	defer zero(ciphertext)
+
+	return e.ring.withActiveKey(func(activeGenerationID string, key []byte) error {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		if encrypted.EncryptionGenerationID() != activeGenerationID {
+			return errors.New("cryptoengine: store verifier generation does not match active generation")
+		}
+		plaintext, err := openSecret(key, domain.StoreVerifierOwnerKeyID, domain.SecretPurposeStoreVerifier,
+			encrypted.FormatVersion(), activeGenerationID, nonce, ciphertext)
+		if err != nil {
+			return err
+		}
+		defer zero(plaintext)
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		if subtle.ConstantTimeCompare(plaintext, []byte(storeVerifierMarker)) != 1 {
+			return errors.New("cryptoengine: store verifier plaintext is invalid")
+		}
+		return checkContext(ctx)
+	})
+}
+
+func validateStoreVerifier(encrypted domain.EncryptedSecret) error {
+	if encrypted.IsZero() || encrypted.OwnerKeyID() != domain.StoreVerifierOwnerKeyID ||
+		encrypted.Purpose() != domain.SecretPurposeStoreVerifier {
+		return errors.New("cryptoengine: store verifier owner, purpose, or ciphertext is invalid")
+	}
+	if encrypted.FormatVersion() != secretFormatVersion || !validGenerationID(encrypted.EncryptionGenerationID()) {
+		return errors.New("cryptoengine: store verifier format or generation is invalid")
+	}
+	return nil
 }
 
 func (e *KeyEngine) encryptActive(ctx context.Context, owner domain.KeyMaterialID, purpose domain.SecretPurpose, plaintext []byte) (domain.EncryptedSecret, error) {

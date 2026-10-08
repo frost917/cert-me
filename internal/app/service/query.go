@@ -103,6 +103,31 @@ func queryNotFound(resource, detail string) error {
 	return contract.NewAppError(contract.ErrorKindValidation, "not_found", detail).WithField("resource", resource)
 }
 
+func (s *QueryService) authorityViewInRead(ctx context.Context, tx port.TxStores, authority port.QueriedAuthority, now domain.Instant) (contract.AuthorityView, error) {
+	view := toAuthorityView(authority.Authority, authority.CreatedAt)
+	crl, err := s.authorityCRLStatusInRead(ctx, tx, authority.Authority.KeyGenerationID(), now)
+	if err != nil {
+		return contract.AuthorityView{}, err
+	}
+	view.CRL = crl
+	return view, nil
+}
+
+func (s *QueryService) authorityCRLStatusInRead(ctx context.Context, tx port.TxStores, keyGenerationID domain.CAKeyGenerationID, now domain.Instant) (*contract.CRLStatusView, error) {
+	state, err := tx.Queries().GetCRLStatus(ctx, keyGenerationID, adminScope())
+	if errors.Is(err, port.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, storeError(err, "query_authority_crl_status_read_failed", "could not read the authority's CRL status")
+	}
+	view, err := crlStatusViewInRead(ctx, tx, state, now)
+	if err != nil {
+		return nil, err
+	}
+	return &view, nil
+}
+
 // crlPending applies certificate-lifecycle.md's rule ("CRL 발행 실패 시 폐기
 // 상태는 유지하고 발행 작업을 재시도한다. 성공 전에는 'CRL 반영 대기/실패'를
 // 표시한다") to the two generation counters domain.CRLState already tracks:
@@ -129,16 +154,18 @@ func (s *QueryService) ListAuthorities(ctx context.Context, meta contract.Reques
 		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryListAuthority, port.NewAuthorizationScope()); err != nil {
 			return err
 		}
+		query.ManagedOnly = true
 		raw, err := tx.Queries().ListAuthorities(ctx, query, adminScope())
 		if err != nil {
 			return storeError(err, "query_authorities_list_failed", "could not list authorities")
 		}
+		now := s.deps.Clock.Now()
 		items := make([]contract.AuthorityView, len(raw.Items))
 		for i, a := range raw.Items {
-			// CreatedAt zero: authorities carries no created_at column
-			// (data-model.md's row lists none), the same gap
-			// toAuthorityView's own doc comment already documents.
-			items[i] = toAuthorityView(a, domain.Instant{})
+			items[i], err = s.authorityViewInRead(ctx, tx, a, now)
+			if err != nil {
+				return err
+			}
 		}
 		page = contract.Page[contract.AuthorityView]{Items: items, NextCursor: raw.NextCursor}
 		return nil
@@ -164,14 +191,17 @@ func (s *QueryService) GetAuthority(ctx context.Context, meta contract.RequestMe
 		if err := s.deps.Authorizer.Authorize(ctx, meta.Principal, port.ActionQueryGetAuthority, port.NewAuthorizationScope()); err != nil {
 			return err
 		}
-		a, err := tx.Queries().GetAuthority(ctx, query.AuthorityID, adminScope())
+		authority, err := tx.Queries().GetAuthority(ctx, query.AuthorityID, adminScope())
 		if errors.Is(err, port.ErrNotFound) {
 			return queryNotFound("authority", "authority not found")
 		} else if err != nil {
 			return storeError(err, "query_authority_read_failed", "could not read the authority")
 		}
-		view = toAuthorityView(a, domain.Instant{})
-		return nil
+		if authority.Authority.Kind() == domain.AuthorityKindBootstrap {
+			return queryNotFound("authority", "authority not found")
+		}
+		view, err = s.authorityViewInRead(ctx, tx, authority, s.deps.Clock.Now())
+		return err
 	})
 	if err != nil {
 		return contract.AuthorityView{}, err
@@ -184,19 +214,9 @@ func (s *QueryService) GetAuthority(ctx context.Context, meta contract.RequestMe
 // toSeriesView projects a port.SeriesSnapshot into the OpenAPI LeafSeries
 // shape.
 //
-// Two fields are left at their zero value, both flagged for the lead:
-//   - CreatedAt: leaf_series carries no created_at column
-//     (data-model.md's row lists none) and domain.LeafSeries exposes no
-//     accessor for one, the same class of gap toAuthorityView's own doc
-//     comment already documents for authorities.
-//   - Delivery: the OpenAPI LeafSeries.delivery field would be the series'
-//     current key generation's delivery record, but port.DeliveryRepository
-//     (delivery.go) offers no non-locking lookup by leaf_key_generation_id
-//     or series id -- only GetDeliveryForUpdate(deliveryID), which both
-//     locks (wrong for a query) and requires an id this method has no way
-//     to obtain. This is a genuine port gap, not a decision made here.
-//   - ArchivedAt: domain.LeafSeries exposes IsArchived() but no accessor for
-//     the underlying instant, so an archived series cannot report when.
+// CreatedAt and Delivery are persisted read-side metadata on SeriesSnapshot.
+// ArchivedAt comes from the domain series value; zero means the series is not
+// archived.
 func toSeriesView(snapshot port.SeriesSnapshot) contract.LeafSeriesView {
 	series := snapshot.Series
 	policy := series.Policy()
@@ -208,7 +228,13 @@ func toSeriesView(snapshot port.SeriesSnapshot) contract.LeafSeriesView {
 		Validity:              policy.CertificateValidity,
 		RotateEvery:           policy.RotateEvery,
 		Version:               series.Version(),
-		CreatedAt:             domain.Instant{},
+		CreatedAt:             snapshot.CreatedAt,
+	}
+	if archivedAt := series.ArchivedAt(); !archivedAt.IsZero() {
+		view.ArchivedAt = &archivedAt
+	}
+	if snapshot.Delivery != nil {
+		view.Delivery = toDeliveryView(*snapshot.Delivery)
 	}
 	if certID := series.CurrentCertificateID(); certID != "" {
 		view.CurrentCertificateID = &certID
@@ -290,15 +316,8 @@ func (s *QueryService) GetSeries(ctx context.Context, meta contract.RequestMeta,
 // threaded in from outside it (the stale-clock rule every Expired/Pending
 // computation in this file follows).
 //
-// CreatedAt is left at its zero value: the certificates table carries no
-// created_at column (data-model.md's row lists der_sha256, der,
-// key_material_id, issuer_ca_key_generation_id, serial_hex, not_before,
-// not_after, subject_json, extensions_json, origin, created_by -- nothing
-// else), domain.Certificate exposes no such accessor, and
-// port.QueriedCertificate does not carry one either. Certificate schema
-// lists created_at as REQUIRED, unlike Revocation's optional one, so this is
-// flagged as a blocking gap for the lead, the same class as AuthorityView's
-// already-documented one.
+// CreatedAt comes from the persisted certificate projection; Expired is
+// computed against the clock read by the caller inside the same Read.
 func toCertificateView(qc port.QueriedCertificate, now domain.Instant) contract.CertificateView {
 	c := qc.Certificate
 	view := contract.CertificateView{
@@ -316,7 +335,7 @@ func toCertificateView(qc port.QueriedCertificate, now domain.Instant) contract.
 		Revoked:                 qc.Revoked,
 		Affected:                qc.Affected,
 		Expired:                 c.IsExpiredAt(now),
-		CreatedAt:               domain.Instant{},
+		CreatedAt:               qc.CreatedAt,
 	}
 	if qc.Delivery != nil {
 		view.Delivery = toDeliveryView(*qc.Delivery)
@@ -861,6 +880,29 @@ func toCRLStatusView(state domain.CRLState, nextUpdate *domain.Instant, lastErro
 	return view
 }
 
+func crlStatusViewInRead(ctx context.Context, tx port.TxStores, state domain.CRLState, now domain.Instant) (contract.CRLStatusView, error) {
+	var nextUpdate *domain.Instant
+	if publishedID := state.PublishedDocumentID(); publishedID != "" {
+		doc, err := tx.CRLs().GetDocument(ctx, publishedID)
+		if err != nil {
+			return contract.CRLStatusView{}, storeError(err, "query_crl_document_read_failed", "could not read the published CRL document")
+		}
+		if !doc.NextUpdate.IsZero() {
+			next := doc.NextUpdate
+			nextUpdate = &next
+		}
+	}
+
+	lastErrorCode := ""
+	job, err := tx.Jobs().GetByDedupKey(ctx, CRLDedupKey(state.CAKeyGenerationID()))
+	if err == nil {
+		lastErrorCode = job.LastErrorCode
+	} else if !errors.Is(err, port.ErrNotFound) {
+		return contract.CRLStatusView{}, storeError(err, "query_crl_job_read_failed", "could not read the CRL publication job")
+	}
+	return toCRLStatusView(state, nextUpdate, lastErrorCode, now), nil
+}
+
 func (s *QueryService) GetCRLStatus(ctx context.Context, meta contract.RequestMeta, query contract.GetCRLStatusQuery) (contract.CRLStatusView, error) {
 	if err := query.Validate(); err != nil {
 		return contract.CRLStatusView{}, err
@@ -883,27 +925,10 @@ func (s *QueryService) GetCRLStatus(ctx context.Context, meta contract.RequestMe
 			return storeError(err, "query_crl_status_read_failed", "could not read the CRL status")
 		}
 
-		var nextUpdate *domain.Instant
-		if publishedID := state.PublishedDocumentID(); publishedID != "" {
-			doc, err := tx.CRLs().GetDocument(ctx, publishedID)
-			if err != nil {
-				return storeError(err, "query_crl_document_read_failed", "could not read the published CRL document")
-			}
-			if !doc.NextUpdate.IsZero() {
-				next := doc.NextUpdate
-				nextUpdate = &next
-			}
+		view, err = crlStatusViewInRead(ctx, tx, state, s.deps.Clock.Now())
+		if err != nil {
+			return err
 		}
-
-		lastErrorCode := ""
-		job, err := tx.Jobs().GetByDedupKey(ctx, CRLDedupKey(query.CAKeyGenerationID))
-		if err == nil {
-			lastErrorCode = job.LastErrorCode
-		} else if !errors.Is(err, port.ErrNotFound) {
-			return storeError(err, "query_crl_job_read_failed", "could not read the CRL publication job")
-		}
-
-		view = toCRLStatusView(state, nextUpdate, lastErrorCode, s.deps.Clock.Now())
 		return nil
 	})
 	if err != nil {

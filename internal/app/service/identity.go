@@ -265,8 +265,10 @@ func (s *IdentityService) Login(ctx context.Context, meta contract.MutationMeta,
 		}
 		if err := account.CanLogin(); err != nil {
 			// A state rejection (reset_pending/disabled) is not a guessed
-			// password, so it is not counted against the throttle.
-			return contract.FromDomainError(err)
+			// password, so it is not counted against the throttle. The public
+			// login contract also collapses account state into the same response
+			// as an unknown account or an incorrect password.
+			return invalidCredentialsError()
 		}
 
 		sessionID, err := domain.ParseSessionID(s.deps.IDs.NewUUID())
@@ -407,6 +409,17 @@ func (s *IdentityService) Authenticate(ctx context.Context, meta contract.Reques
 		}); err != nil {
 			return authError(err)
 		}
+		var csrfProofHash *domain.TokenHash
+		if cmd.CSRFToken != nil {
+			hash, err := s.deps.TokenCodec.Hash(ctx, cmd.CSRFToken)
+			if err != nil {
+				return storeError(err, "identity_csrf_token_hash_failed", "could not verify the csrf token")
+			}
+			if !locked.CSRFSecretHash().Equal(hash) {
+				return contract.NewAppError(contract.ErrorKindForbidden, "csrf_failed", "the request could not be verified")
+			}
+			csrfProofHash = &hash
+		}
 
 		touched := locked.Touch(now)
 		if err := tx.Accounts().SaveSession(ctx, touched); err != nil {
@@ -414,9 +427,10 @@ func (s *IdentityService) Authenticate(ctx context.Context, meta contract.Reques
 		}
 
 		principal, err := contract.NewAdminPrincipal(contract.AdminPrincipalFacts{
-			AccountID: account.ID(),
-			SessionID: touched.ID(),
-			AuthEpoch: account.AuthEpoch(),
+			AccountID:     account.ID(),
+			SessionID:     touched.ID(),
+			AuthEpoch:     account.AuthEpoch(),
+			CSRFProofHash: csrfProofHash,
 		})
 		if err != nil {
 			return contract.FromDomainError(err)

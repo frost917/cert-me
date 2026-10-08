@@ -8,6 +8,24 @@ import (
 	"cert-me/internal/domain"
 )
 
+func TestStoppedIssuerIsAStateConflictWhileScopeDenialsRemainForbidden(t *testing.T) {
+	for _, tc := range []struct {
+		code string
+		kind ErrorKind
+	}{
+		{"issuer_stopped", ErrorKindConflict},
+		{"scope_denied", ErrorKindForbidden},
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			err := FromDomainError(domain.NewPolicyError(domain.ErrNotPermitted, tc.code, "blocked"))
+			appErr, ok := AsAppError(err)
+			if !ok || appErr.Kind() != tc.kind || appErr.Code() != tc.code || !errors.Is(err, domain.ErrNotPermitted) {
+				t.Fatalf("classification = %v, want %s/%s with preserved cause", err, tc.kind, tc.code)
+			}
+		})
+	}
+}
+
 // The internal cause must never reach a rendered error string. A handler that
 // logs err.Error(), or an adapter that puts it in a response body, must not be
 // able to leak it, which is why AppError.Error deliberately omits it.

@@ -426,7 +426,7 @@ func parseColumn(tokens []sqlToken, dialect string) (columnShape, []constraintSh
 	}
 	column := columnShape{name: name, nullable: true}
 	typeName := strings.ToLower(tokens[pos].text)
-	if tokens[pos].kind == 's' || isPunctuation(tokens[pos].text) {
+	if tokens[pos].kind == 's' || tokens[pos].kind == 'p' || tokens[pos].kind == 'o' {
 		return columnShape{}, nil, errors.New("malformed column type")
 	}
 	pos++
@@ -585,10 +585,29 @@ func parseTableConstraint(tokens []sqlToken, dialect string) (constraintShape, e
 		if end < 0 || end != len(tokens)-1 {
 			return constraintShape{}, errors.New("malformed CHECK expression")
 		}
-		return constraintShape{kind: "check", expression: normalizeExpression(tokens[pos+2 : end])}, nil
+		return constraintShape{kind: "check", expression: serializeCheckExpression(tokens[pos+2:end], dialect)}, nil
 	default:
 		return constraintShape{}, fmt.Errorf("unsupported table constraint for %s", dialect)
 	}
+}
+
+func serializeCheckExpression(tokens []sqlToken, dialect string) string {
+	parts := make([]string, len(tokens))
+	for i, token := range tokens {
+		switch token.kind {
+		case 's':
+			parts[i] = "'" + strings.ReplaceAll(token.text, "'", "''") + "'"
+		case 'i':
+			quote := `"`
+			if dialect == "mysql" || dialect == "mariadb" {
+				quote = "`"
+			}
+			parts[i] = quote + strings.ReplaceAll(token.text, quote, quote+quote) + quote
+		default:
+			parts[i] = token.text
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 func addConstraint(table *tableShape, constraint constraintShape) error {
@@ -738,6 +757,7 @@ func constraintKey(value constraintShape) string {
 }
 
 func normalizeExpression(tokens []sqlToken) string {
+	tokens = stripOuterParensTokens(tokens)
 	var output strings.Builder
 	for _, token := range tokens {
 		if token.kind == 'w' {
@@ -752,41 +772,49 @@ func normalizeExpression(tokens []sqlToken) string {
 			output.WriteString(token.text)
 		}
 	}
-	return stripOuterParens(output.String())
+	return output.String()
 }
 
-func stripOuterParens(expression string) string {
-	for strings.HasPrefix(expression, "(") && strings.HasSuffix(expression, ")") {
-		depth := 0
-		outer := true
-		for i, ch := range expression {
-			if ch == '(' {
-				depth++
-			} else if ch == ')' {
-				depth--
-				if depth == 0 && i != len(expression)-1 {
-					outer = false
-					break
+func stripOuterParensTokens(tokens []sqlToken) []sqlToken {
+	for len(tokens) >= 2 && tokens[0].kind == 'p' && tokens[0].text == "(" {
+		pairs := make([]int, len(tokens))
+		for i := range pairs {
+			pairs[i] = -1
+		}
+		var stack []int
+		for i, token := range tokens {
+			if token.kind != 'p' {
+				continue
+			}
+			switch token.text {
+			case "(":
+				stack = append(stack, i)
+			case ")":
+				if len(stack) == 0 {
+					continue
 				}
+				open := stack[len(stack)-1]
+				stack = stack[:len(stack)-1]
+				pairs[open] = i
 			}
 		}
-		if !outer {
+		if pairs[0] != len(tokens)-1 {
 			break
 		}
-		expression = expression[1 : len(expression)-1]
+		tokens = tokens[1 : len(tokens)-1]
 	}
-	return expression
+	return tokens
 }
 
 func splitTopLevel(tokens []sqlToken, delimiter string) [][]sqlToken {
 	var output [][]sqlToken
 	start, depth := 0, 0
 	for i, token := range tokens {
-		if token.text == "(" {
+		if token.kind == 'p' && token.text == "(" {
 			depth++
-		} else if token.text == ")" {
+		} else if token.kind == 'p' && token.text == ")" {
 			depth--
-		} else if token.text == delimiter && depth == 0 {
+		} else if (token.kind == 'p' || token.kind == 'o') && token.text == delimiter && depth == 0 {
 			output = append(output, tokens[start:i])
 			start = i + 1
 		}
@@ -798,14 +826,14 @@ func splitTopLevel(tokens []sqlToken, delimiter string) [][]sqlToken {
 }
 
 func matchingParen(tokens []sqlToken, open int) int {
-	if open < 0 || open >= len(tokens) || tokens[open].text != "(" {
+	if open < 0 || open >= len(tokens) || tokens[open].kind != 'p' || tokens[open].text != "(" {
 		return -1
 	}
 	depth := 0
 	for i := open; i < len(tokens); i++ {
-		if tokens[i].text == "(" {
+		if tokens[i].kind == 'p' && tokens[i].text == "(" {
 			depth++
-		} else if tokens[i].text == ")" {
+		} else if tokens[i].kind == 'p' && tokens[i].text == ")" {
 			depth--
 			if depth == 0 {
 				return i
@@ -816,7 +844,7 @@ func matchingParen(tokens []sqlToken, open int) int {
 }
 
 func identifier(tokens []sqlToken, pos int) (string, int) {
-	if pos < 0 || pos >= len(tokens) || tokens[pos].kind == 's' || isPunctuation(tokens[pos].text) {
+	if pos < 0 || pos >= len(tokens) || tokens[pos].kind == 's' || tokens[pos].kind == 'p' || tokens[pos].kind == 'o' {
 		return "", pos
 	}
 	name := strings.ToLower(tokens[pos].text)
@@ -839,20 +867,11 @@ func normalizeIdentifier(token sqlToken) string {
 }
 
 func keyword(tokens []sqlToken, pos int, word string) bool {
-	return pos >= 0 && pos < len(tokens) && tokens[pos].kind != 's' && strings.EqualFold(tokens[pos].text, word)
+	return pos >= 0 && pos < len(tokens) && tokens[pos].kind == 'w' && strings.EqualFold(tokens[pos].text, word)
 }
 
 func tokenIs(tokens []sqlToken, pos int, value string) bool {
-	return pos >= 0 && pos < len(tokens) && tokens[pos].text == value
-}
-
-func isPunctuation(value string) bool {
-	switch value {
-	case "(", ")", "[", "]", ",", ".", "=", ";", "+", "-", "*", "/", "<", ">", "<=", ">=", "<>", "!=", "::":
-		return true
-	default:
-		return false
-	}
+	return pos >= 0 && pos < len(tokens) && (tokens[pos].kind == 'p' || tokens[pos].kind == 'o') && tokens[pos].text == value
 }
 
 func canonicalLength(value string) string {

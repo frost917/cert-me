@@ -108,6 +108,9 @@ func (IdentityLogoutCommand) Validate() error { return nil }
 // bearer-shaped token is never accidentally logged with the request body.
 type IdentityAuthenticateCommand struct {
 	SessionToken *secret.Input `json:"-"`
+	// CSRFToken is supplied by the adapter only for state-changing requests.
+	// It is absent for authenticated reads. The adapter owns and closes it.
+	CSRFToken *secret.Input `json:"-"`
 }
 
 // Validate applies the same bearer-token length bounds used elsewhere
@@ -124,6 +127,11 @@ func (c IdentityAuthenticateCommand) Validate() error {
 	// secrets F3 covers.
 	if n := c.SessionToken.Len(); n < tokenMinLength || n > tokenMaxLength {
 		return NewAppError(ErrorKindAuth, "invalid_session_token", "session token has an invalid length")
+	}
+	if c.CSRFToken != nil {
+		if n := c.CSRFToken.Len(); n < tokenMinLength || n > tokenMaxLength {
+			return csrfFailedError()
+		}
 	}
 	return nil
 }
@@ -191,3 +199,7 @@ type CompleteResetResult struct{}
 type IdentityIssueCSRFCommand struct{}
 
 func (IdentityIssueCSRFCommand) Validate() error { return nil }
+
+func csrfFailedError() error {
+	return NewAppError(ErrorKindForbidden, "csrf_failed", "the request could not be verified")
+}

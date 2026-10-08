@@ -8,6 +8,7 @@ import (
 
 	"cert-me/internal/app/port"
 	"cert-me/internal/domain"
+	"cert-me/internal/storage/sqlstore/core"
 )
 
 // GetGrantForUpdate locks the row while the caller validates and consumes or
@@ -17,7 +18,7 @@ func (r *DeliveryRepository) GetGrantForUpdate(ctx context.Context, tokenHash do
 		return domain.DownloadGrant{}, err
 	}
 	b := r.dialect.NewBuilder()
-	query := "SELECT id, token_hash, purpose, certificate_id, key_delivery_id, expires_at, consumed_at, invalidated_at, created_by FROM download_tokens WHERE token_hash = " + b.Add(tokenHash.Hex()) + r.dialect.RowLockClause()
+	query := "SELECT id, token_hash, purpose, certificate_id, key_delivery_id, expires_at, consumed_at, invalidated_at, created_by FROM download_tokens WHERE token_hash = " + b.Add(tokenHash.Hex()) + core.RowLockClause(r.executor, r.dialect.RowLockClause())
 	grant, err := scanGrant(r.executor.QueryRowContext(ctx, query, b.Args()...))
 	if err != nil {
 		return domain.DownloadGrant{}, fmt.Errorf("sqlstore delivery: get grant for update: %w", notFound(err))

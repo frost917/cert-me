@@ -30,7 +30,7 @@ func (r *MaintenanceRepository) GetRunForUpdate(ctx context.Context, id domain.J
 		return port.MaintenanceRun{}, failed("validate maintenance run id", err)
 	}
 	b := r.builder()
-	query := "SELECT id, created_at, updated_at, version, kind, phase, details_json, started_at, completed_at, error_code FROM maintenance_runs WHERE id = " + b.Add(string(id)) + r.dialect.RowLockClause()
+	query := "SELECT id, created_at, updated_at, version, kind, phase, details_json, started_at, completed_at, error_code FROM maintenance_runs WHERE id = " + b.Add(string(id)) + core.RowLockClause(r.executor, r.dialect.RowLockClause())
 	run, err := scanMaintenanceRun(r.queryRow(ctx, query, b.Args()...))
 	if err != nil {
 		return port.MaintenanceRun{}, failed("read maintenance run for update", err)

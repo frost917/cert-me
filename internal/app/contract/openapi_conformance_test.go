@@ -279,6 +279,7 @@ func TestOpenAPIConformance(t *testing.T) {
 	assertFieldSetMatches(t, "Credentials", IdentityLoginCommand{}, "password")
 	assertFieldSetMatches(t, "PasswordReset", IdentityCompleteResetCommand{}, "reset_token", "new_password")
 	assertFieldSetMatches(t, "SettingsPatch", SettingsUpdateCommand{})
+	assertFieldSetMatches(t, "SettingsInitialize", SettingsInitializeCommand{})
 	assertFieldSetMatches(t, "AuthorityCreate", AuthorityCreateCommand{})
 	assertFieldSetMatches(t, "NamePatch", AuthorityRenameCommand{})
 	assertFieldSetMatches(t, "IssuanceState", AuthoritySetIssuanceStateCommand{})

@@ -12,10 +12,10 @@ import (
 // docs/data-model.md "내부 HTTPS·유지보수·작업·감사").
 type TLSRepository interface {
 	// GetActiveForUpdate locks and returns the currently active tls_changes
-	// row (the one in the applied phase, i.e. the change whose candidate is
-	// live), so Activate can re-check its version before the installer
-	// swap. On a fresh installation with no HTTPS history yet it returns
-	// ErrNotFound.
+	// row named by installation.active_tls_version_id, regardless of phase.
+	// Activate can reject a candidate layered over an unresolved change, while
+	// Reconcile needs the committed/recovery_required row after a restart. On a
+	// fresh installation with no HTTPS history yet it returns ErrNotFound.
 	GetActiveForUpdate(ctx context.Context) (domain.TLSChange, error)
 
 	// InsertVersion stores a newly validated TLS snapshot (candidate or

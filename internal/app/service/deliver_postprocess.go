@@ -221,13 +221,13 @@ func (s *DistributionService) sendAndRecord(ctx context.Context, meta contract.R
 // ... 이 함수를 사용한다").
 func (s *DistributionService) recordPrivateOutcome(ctx context.Context, meta contract.RequestMeta, prep preparedDelivery, consumed consumedTransfer, result sendResult, finishedAt domain.Instant) error {
 	return s.deps.UnitOfWork.Write(ctx, func(tx port.TxStores) error {
-		delivery, err := tx.Delivery().GetDeliveryForUpdate(ctx, consumed.delivery.ID())
-		if err != nil {
-			return storeError(err, "delivery_read_failed", "could not read the delivery record")
-		}
 		scope, err := leafManagementAuthority(ctx, tx, prep.certificate.ID())
 		if err != nil {
 			return err
+		}
+		delivery, err := tx.Delivery().GetDeliveryForUpdate(ctx, consumed.delivery.ID())
+		if err != nil {
+			return storeError(err, "delivery_read_failed", "could not read the delivery record")
 		}
 
 		if !result.failed() {
@@ -237,6 +237,9 @@ func (s *DistributionService) recordPrivateOutcome(ctx context.Context, meta con
 			}
 			if err := tx.Delivery().SaveDelivery(ctx, completed, delivery.Version()); err != nil {
 				return storeError(err, "delivery_save_failed", "could not record the delivery completion")
+			}
+			if err := tx.PKI().MarkLeafKeyGenerationClientHeld(ctx, completed.LeafKeyGenerationID()); err != nil {
+				return storeError(err, "delivery_custody_save_failed", "could not record the completed private-key custody")
 			}
 			return appendDistributionAudit(ctx, tx, s.deps.IDs, finishedAt, meta, "distribution.deliver.private.completed", consumed.grant.ID(), contract.AuditResultSuccess, scope)
 		}

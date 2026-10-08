@@ -11,6 +11,7 @@ import (
 	"cert-me/internal/app/port"
 	"cert-me/internal/config"
 	"cert-me/internal/storage/connection"
+	"cert-me/internal/storage/sqlstore/dialect"
 )
 
 func openTestStore(t *testing.T) (*connection.DB, *Store, *SQLExecutor) {
@@ -175,6 +176,52 @@ func TestReadUsesOneTransactionSnapshot(t *testing.T) {
 	}
 	if committed != 20 {
 		t.Fatalf("committed value = %d, want 20", committed)
+	}
+}
+
+func TestReadFactorySuppressesRowLockClause(t *testing.T) {
+	_, store, executor := openTestStore(t)
+	var got string
+	err := store.Read(context.Background(), func(port.TxStores) error {
+		got = RowLockClause(*executor, " FOR UPDATE")
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Read(): %v", err)
+	}
+	if got != "" {
+		t.Fatalf("read snapshot row lock clause = %q, want empty", got)
+	}
+}
+
+func TestWriteFactoryRetainsRowLockClauseForEveryDialect(t *testing.T) {
+	_, store, executor := openTestStore(t)
+	var got []string
+	var want []string
+	err := store.Write(context.Background(), func(port.TxStores) error {
+		for _, kind := range []config.DatabaseKind{config.SQLite, config.Postgres, config.MySQL, config.MariaDB} {
+			d, err := dialect.New(kind)
+			if err != nil {
+				return err
+			}
+			clause := d.RowLockClause()
+			got = append(got, RowLockClause(*executor, clause))
+			want = append(want, clause)
+		}
+		// SQLite has no SQL row-lock suffix, so its dialect clause above is
+		// empty. This sentinel confirms the write executor itself is untagged.
+		if clause := RowLockClause(*executor, " FOR UPDATE"); clause != " FOR UPDATE" {
+			return fmt.Errorf("write executor removed explicit row lock clause: %q", clause)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Write(): %v", err)
+	}
+	for i, clause := range want {
+		if got[i] != clause {
+			t.Errorf("write row lock clause[%d] = %q, want %q", i, got[i], clause)
+		}
 	}
 }
 

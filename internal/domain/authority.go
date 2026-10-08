@@ -238,6 +238,9 @@ func (a Authority) CanIssue(ctx IssuerContext, now Instant) error {
 			ErrNotPermitted, ctx.Intent.describe(), string(requiredKind), string(a.kind))
 	}
 	if a.issuanceState != IssuanceStateEnabled {
+		if a.issuanceState == IssuanceStateStopped {
+			return NewPolicyError(ErrNotPermitted, "issuer_stopped", "the issuing authority has stopped issuance")
+		}
 		return fmt.Errorf("%w: authority issuance state is %s", ErrNotPermitted, string(a.issuanceState))
 	}
 	if !a.keyAvailable {

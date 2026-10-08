@@ -470,10 +470,62 @@ func distRootCACert(t *testing.T, n int, caKeyGenID domain.CAKeyGenerationID) do
 func seedChainAndScope(t *testing.T, store *porttest.Store, n int, certID domain.CertificateID, caKeyGenID domain.CAKeyGenerationID, managementAuthorityID domain.AuthorityID) domain.SeriesID {
 	t.Helper()
 	series := distSeries(t, n, managementAuthorityID)
+	var leafCertificate domain.Certificate
+	if err := store.Read(context.Background(), func(tx port.TxStores) error {
+		var err error
+		leafCertificate, err = tx.PKI().GetCertificate(context.Background(), certID)
+		return err
+	}); err != nil {
+		t.Fatalf("read leaf certificate for lineage: %v", err)
+	}
+	leafKeyGenerationID, err := domain.ParseLeafKeyGenerationID(distID36('6', n))
+	if err != nil {
+		t.Fatalf("leaf key generation id: %v", err)
+	}
+	custody := domain.KeyCustodyClientHeld
+	if err := store.Read(context.Background(), func(tx port.TxStores) error {
+		_, err := tx.Delivery().GetDeliveryByLeafKeyGenerationForUpdate(context.Background(), leafKeyGenerationID)
+		if err == nil {
+			custody = domain.KeyCustodyPendingDelivery
+			return nil
+		}
+		if errors.Is(err, port.ErrNotFound) {
+			return nil
+		}
+		return err
+	}); err != nil {
+		t.Fatalf("check private delivery lineage: %v", err)
+	}
+	generation, err := domain.NewLeafKeyGeneration(domain.LeafKeyGenerationFacts{
+		ID:            leafKeyGenerationID,
+		SeriesID:      series.ID(),
+		KeyMaterialID: leafCertificate.KeyMaterialID(),
+		GenerationNo:  1,
+		Custody:       custody,
+	})
+	if err != nil {
+		t.Fatalf("new leaf key generation: %v", err)
+	}
 	caCert := distRootCACert(t, n, caKeyGenID)
+	currentSeries, err := domain.NewLeafSeries(domain.LeafSeriesFacts{
+		ID:                     series.ID(),
+		Name:                   series.Name(),
+		Purpose:                series.Purpose(),
+		ManagementAuthorityID:  series.ManagementAuthorityID(),
+		CurrentCertificateID:   certID,
+		CurrentKeyGenerationID: leafKeyGenerationID,
+		Policy:                 series.Policy(),
+		Version:                series.Version().Next(),
+	})
+	if err != nil {
+		t.Fatalf("new current leaf series: %v", err)
+	}
 
 	if err := store.Write(context.Background(), func(tx port.TxStores) error {
 		if err := tx.PKI().InsertSeries(context.Background(), series); err != nil {
+			return err
+		}
+		if err := tx.PKI().InsertLeafKeyGeneration(context.Background(), generation); err != nil {
 			return err
 		}
 		if err := tx.PKI().InsertCertificate(context.Background(), caCert); err != nil {
@@ -485,12 +537,19 @@ func seedChainAndScope(t *testing.T, store *porttest.Store, n int, certID domain
 		}); err != nil {
 			return err
 		}
-		return tx.PKI().InsertLeafCertificateRecord(context.Background(), port.LeafCertificateRecord{
+		if err := tx.PKI().InsertLeafCertificateRecord(context.Background(), port.LeafCertificateRecord{
 			CertificateID:         certID,
 			SeriesID:              series.ID(),
+			LeafKeyGenerationID:   leafKeyGenerationID,
 			IssuerCACertificateID: caCert.ID(),
 			Operation:             port.CertificateOperationInitial,
-		})
+		}); err != nil {
+			return err
+		}
+		if err := tx.PKI().SaveSeries(context.Background(), currentSeries, series.Version()); err != nil {
+			return err
+		}
+		return nil
 	}); err != nil {
 		t.Fatalf("seed chain and scope: %v", err)
 	}

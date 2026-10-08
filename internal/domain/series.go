@@ -249,6 +249,40 @@ func (s LeafSeries) ChangePolicy(policy SeriesPolicy) (LeafSeries, error) {
 	return next, nil
 }
 
+// Rename changes the operator-facing name while preserving the series' PKI
+// history. Repeating the current name is a no-op and does not advance the
+// optimistic-lock version.
+func (s LeafSeries) Rename(name string) (LeafSeries, error) {
+	if s.IsArchived() {
+		return LeafSeries{}, fmt.Errorf("%w: series is archived", ErrInvalidTransition)
+	}
+	if name == "" || len(name) > maxSeriesNameLength {
+		return LeafSeries{}, fmt.Errorf("%w: series name must be 1..%d characters", ErrInvalidValue, maxSeriesNameLength)
+	}
+	if name == s.name {
+		return s, nil
+	}
+	next := s
+	next.name = name
+	next.version = s.version.Next()
+	return next, nil
+}
+
+// Archive marks this series as retained history without changing its
+// certificate, key-generation, or policy pointers.
+func (s LeafSeries) Archive(now Instant) (LeafSeries, error) {
+	if now.IsZero() {
+		return LeafSeries{}, fmt.Errorf("%w: archive time must be set", ErrInvalidValue)
+	}
+	if s.IsArchived() {
+		return LeafSeries{}, NewPolicyError(ErrInvalidTransition, "series_already_archived", "series is already archived")
+	}
+	next := s
+	next.archivedAt = now
+	next.version = s.version.Next()
+	return next, nil
+}
+
 // KeyCustody tracks where the private key for a leaf key generation
 // currently lives. [data-model.md: "custody=pending_delivery/client_held/
 // internal"]

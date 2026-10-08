@@ -32,6 +32,7 @@ type IssuanceView struct {
 	Delivery        *DeliveryView
 	CertificateURL  string
 	SeriesURL       string
+	Replayed        bool `json:"-"`
 }
 
 const maxLeafNameLength = 255

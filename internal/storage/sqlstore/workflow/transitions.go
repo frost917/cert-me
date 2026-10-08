@@ -43,7 +43,7 @@ func (r *TransitionRepository) GetForUpdate(ctx context.Context, id domain.Trans
 	}
 	b := r.dialect.NewBuilder()
 	query := "SELECT id, source_authority_id, target_authority_id, mode, state, reported_by, reported_at, reason, version FROM ca_transitions WHERE id = " +
-		b.Add(string(id)) + r.dialect.RowLockClause()
+		b.Add(string(id)) + core.RowLockClause(r.executor, r.dialect.RowLockClause())
 	transition, err := scanTransition(r.executor.QueryRowContext(ctx, query, b.Args()...))
 	if err != nil {
 		return domain.Transition{}, fmt.Errorf("sqlstore workflow: get transition for update: %w", missing(err))

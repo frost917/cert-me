@@ -32,14 +32,19 @@ type CAKeyGeneration struct {
 
 // SeriesSnapshot bundles a leaf series with the key generation its own
 // current_key_generation_id points at. RenewalFacts.CurrentGeneration needs
-// exactly this pair to call LeafSeries.PlanRenewal, and both rows must come
-// from the same locked read so a concurrent rotation cannot be planned
-// against a generation the series has already moved past
+// exactly this pair to call LeafSeries.PlanRenewal, and the PKI write-side
+// loader reads both under the same lock so a concurrent rotation cannot be
+// planned against a generation the series has already moved past
 // (docs/backend-implementation.md §2 "Facts에는 검증 대상의 ID/version도
-// 포함하고 서비스가 commit 안에서 최신 사실을 다시 구성한다").
+// 포함하고 서비스가 commit 안에서 최신 사실을 다시 구성한다"). CreatedAt
+// is persisted row metadata. Delivery is an optional non-locking projection
+// populated by QueryRepository for the current certificate; write-side
+// snapshots leave it unset.
 type SeriesSnapshot struct {
 	Series               domain.LeafSeries
 	CurrentKeyGeneration domain.LeafKeyGeneration
+	CreatedAt            domain.Instant
+	Delivery             *domain.Delivery
 }
 
 // Certificate issuance operations, the leaf_certificates.operation values
@@ -193,6 +198,19 @@ type PKIRepository interface {
 	// with everything rolled back on conflict; no version column is added
 	// (§13).
 	SaveLeafKeyGeneration(ctx context.Context, generation domain.LeafKeyGeneration) error
+
+	// MarkLeafKeyGenerationClientHeld moves a leaf generation from
+	// pending_delivery to client_held only after its matching key delivery has
+	// a persisted server_completed outcome. It is idempotent for an already
+	// client_held generation, but only while that same completion proof still
+	// exists. The repository also requires the delivery certificate's leaf
+	// subtype row to identify this generation and series, and refuses to mark
+	// custody while a leaf_delivery secret remains. Callers must hold the
+	// matching delivery and series locks in the same transaction; no generic
+	// generation save path may change custody. It returns ErrNotFound when the
+	// generation is absent and domain.ErrNotPermitted when the completion
+	// proof, custody state, or secret-deletion condition is not satisfied.
+	MarkLeafKeyGenerationClientHeld(ctx context.Context, id domain.LeafKeyGenerationID) error
 
 	// InsertCertificate stores a freshly signed or imported certificate.
 	// certificates.der_sha256 is unique, so a duplicate DER surfaces as a

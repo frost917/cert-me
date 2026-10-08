@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"cert-me/internal/app/contract"
 	"cert-me/internal/app/port"
@@ -665,7 +666,8 @@ func (s *TLSService) findBootstrapAuthority(ctx context.Context) (domain.Authori
 			if err != nil {
 				return storeError(err, "tls_bootstrap_authority_lookup_failed", "could not find the bootstrap authority")
 			}
-			for _, authority := range page.Items {
+			for _, queried := range page.Items {
+				authority := queried.Authority
 				if authority.Kind() != domain.AuthorityKindBootstrap {
 					continue
 				}
@@ -788,7 +790,10 @@ func (s *TLSService) prepareBootstrap(ctx context.Context, existing *domain.Auth
 	if err != nil {
 		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
 	}
-	window, err := validity.Window(x509NotBefore(now))
+	// Bootstrap must be usable in this same startup. X.509 timestamps have
+	// second precision; rounding up would make the new issuer not yet valid
+	// for the immediate leaf plan and chain verification below.
+	window, err := validity.Window(domain.NewInstant(now.Time().Truncate(time.Second)))
 	if err != nil {
 		return tlsBootstrapPrepared{}, contract.FromDomainError(err)
 	}

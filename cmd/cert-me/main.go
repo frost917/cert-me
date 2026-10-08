@@ -6,22 +6,26 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"cert-me/internal/config"
+	appruntime "cert-me/internal/runtime"
 	"cert-me/internal/storage/migrate"
 )
 
 const (
-	inputExitCode         = 2
-	busyExitCode          = 3
-	incompatibleExitCode  = 4
-	executionExitCode     = 5
-	minStepTimeout        = time.Second
-	maxStepTimeout        = time.Hour
-	statusSchemaVersion   = 1
+	inputExitCode        = 2
+	busyExitCode         = 3
+	incompatibleExitCode = 4
+	executionExitCode    = 5
+	minStepTimeout       = time.Second
+	maxStepTimeout       = time.Hour
+	statusSchemaVersion  = 1
 )
 
 type dbOperation uint8
@@ -42,7 +46,113 @@ type commandOptions struct {
 // main is intentionally a thin wrapper so argument handling and output can be
 // exercised without a process environment or a live database.
 func main() {
-	os.Exit(run(context.Background(), os.Args[1:], os.LookupEnv, os.Stdout, os.Stderr))
+	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "serve" {
+		os.Exit(runServe(context.Background(), args[1:], os.LookupEnv, os.Stdout, os.Stderr))
+	}
+	os.Exit(run(context.Background(), args, os.LookupEnv, os.Stdout, os.Stderr))
+}
+
+func runServe(ctx context.Context, args []string, lookup config.Lookup, stdout, stderr io.Writer) int {
+	serveCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	listenAddress, err := parseListenAddress(args)
+	if err != nil {
+		writeServeInputError(stderr)
+		return inputExitCode
+	}
+
+	cfg, err := config.LoadFrom(lookup)
+	if err != nil {
+		writeServeInputError(stderr)
+		return inputExitCode
+	}
+	defer cfg.Close()
+	if err := config.RequireStorageKey(cfg); err != nil {
+		writeServeInputError(stderr)
+		return inputExitCode
+	}
+	trustedProxyCIDRs, err := config.LoadTrustedProxyCIDRs(lookup)
+	if err != nil {
+		writeServeInputError(stderr)
+		return inputExitCode
+	}
+
+	app, err := appruntime.Open(serveCtx, appruntime.Options{
+		Database:          cfg.Database,
+		StorageKey:        cfg.StorageKey,
+		TrustedProxyCIDRs: trustedProxyCIDRs,
+		ListenAddress:     listenAddress,
+		Logger: slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{
+			Level: slog.LevelInfo,
+		})),
+	})
+	if err != nil {
+		if serveCtx.Err() != nil {
+			return 0
+		}
+		writeServeFailure(stderr)
+		return executionExitCode
+	}
+	if fingerprint := app.BootstrapFingerprint(); fingerprint != "" {
+		if _, err := fmt.Fprintf(stdout, "Bootstrap HTTPS leaf SHA-256: %s\n", fingerprint); err != nil {
+			if closeErr := app.Close(context.Background()); closeErr != nil {
+				writeServeFailure(stderr)
+				return executionExitCode
+			}
+			writeServeFailure(stderr)
+			return executionExitCode
+		}
+	}
+
+	serveErr := app.ListenAndServe(serveCtx)
+	closeErr := app.Close(context.Background())
+	if serveErr != nil || closeErr != nil {
+		writeServeFailure(stderr)
+		return executionExitCode
+	}
+	return 0
+}
+
+func parseListenAddress(args []string) (string, error) {
+	const defaultAddress = ":8443"
+	address := defaultAddress
+	seen := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		var value string
+		switch {
+		case arg == "--listen":
+			if i+1 >= len(args) {
+				return "", errors.New("missing listener address")
+			}
+			i++
+			value = args[i]
+		case strings.HasPrefix(arg, "--listen="):
+			value = strings.TrimPrefix(arg, "--listen=")
+		default:
+			return "", errors.New("unknown serve option")
+		}
+		if seen || value == "" || strings.TrimSpace(value) != value {
+			return "", errors.New("invalid listener address")
+		}
+		seen = true
+		address = value
+	}
+	return address, nil
+}
+
+func writeServeInputError(dst io.Writer) {
+	if dst != nil {
+		_, _ = io.WriteString(dst, "invalid serve command or configuration\n")
+	}
+}
+
+func writeServeFailure(dst io.Writer) {
+	if dst != nil {
+		_, _ = io.WriteString(dst, "HTTPS service could not start or stop cleanly\n")
+	}
 }
 
 // run implements the schema-only database commands. It does not load or

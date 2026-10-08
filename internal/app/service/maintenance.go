@@ -1003,7 +1003,8 @@ func (s *MaintenanceService) restoreCRLPlan(ctx context.Context, runID domain.Jo
 			if err != nil {
 				return storeError(err, "maintenance_restore_authority_list_failed", "could not list authorities")
 			}
-			for _, authority := range page.Items {
+			for _, queried := range page.Items {
+				authority := queried.Authority
 				if authority.IsArchived() || authority.KeyGenerationID() == "" {
 					continue
 				}

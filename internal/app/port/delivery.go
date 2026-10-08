@@ -16,6 +16,11 @@ type DeliveryRepository interface {
 	// against a row read this way inside the same commit that saves it.
 	GetDeliveryForUpdate(ctx context.Context, deliveryID domain.DeliveryID) (domain.Delivery, error)
 
+	// GetDeliveryByLeafKeyGenerationForUpdate locks the one delivery row
+	// created for a key generation. Reissue uses this key-scoped lookup to
+	// verify failed/expired evidence and close any still-pending old delivery.
+	GetDeliveryByLeafKeyGenerationForUpdate(ctx context.Context, generationID domain.LeafKeyGenerationID) (domain.Delivery, error)
+
 	// GetGrantForUpdate locks and returns the grant row by its token hash --
 	// the plaintext token never reaches this layer
 	// (docs/backend-implementation.md §6 TokenCodec).

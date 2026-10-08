@@ -165,6 +165,9 @@ func FromDomainError(err error) error {
 			code = policyErr.Code
 		}
 		detail = policyErr.Detail
+		if policyErr.Code == "issuer_stopped" && errors.Is(err, domain.ErrNotPermitted) {
+			kind = ErrorKindConflict
+		}
 	}
 	out := WrapAppError(kind, code, detail, err)
 	if policyErr != nil {

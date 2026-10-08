@@ -67,19 +67,21 @@ func (o InternalOperation) String() string { return string(o) }
 // InternalPrincipalFactory injected during assembly. It deliberately has no
 // JSON decoding, so a request body can never claim admin.
 type Principal struct {
-	kind       PrincipalKind
-	accountID  domain.AccountID
-	sessionID  domain.SessionID
-	authEpoch  domain.AuthEpoch
-	operations []InternalOperation
+	kind          PrincipalKind
+	accountID     domain.AccountID
+	sessionID     domain.SessionID
+	authEpoch     domain.AuthEpoch
+	csrfProofHash *domain.TokenHash
+	operations    []InternalOperation
 }
 
 // AdminPrincipalFacts is the validated session state a principal is minted
 // from. IdentityService fills it from the account and session it just read.
 type AdminPrincipalFacts struct {
-	AccountID domain.AccountID
-	SessionID domain.SessionID
-	AuthEpoch domain.AuthEpoch
+	AccountID     domain.AccountID
+	SessionID     domain.SessionID
+	AuthEpoch     domain.AuthEpoch
+	CSRFProofHash *domain.TokenHash
 }
 
 // NewAdminPrincipal mints an admin principal. It re-parses the identifiers so
@@ -94,11 +96,20 @@ func NewAdminPrincipal(facts AdminPrincipalFacts) (Principal, error) {
 	if _, err := domain.ParseAuthEpoch(facts.AuthEpoch.Int64()); err != nil {
 		return Principal{}, err
 	}
+	var csrfProofHash *domain.TokenHash
+	if facts.CSRFProofHash != nil {
+		if facts.CSRFProofHash.IsZero() {
+			return Principal{}, fmt.Errorf("%w: CSRF proof hash must not be empty", domain.ErrInvalidValue)
+		}
+		proof := *facts.CSRFProofHash
+		csrfProofHash = &proof
+	}
 	return Principal{
-		kind:      PrincipalKindAdmin,
-		accountID: facts.AccountID,
-		sessionID: facts.SessionID,
-		authEpoch: facts.AuthEpoch,
+		kind:          PrincipalKindAdmin,
+		accountID:     facts.AccountID,
+		sessionID:     facts.SessionID,
+		authEpoch:     facts.AuthEpoch,
+		csrfProofHash: csrfProofHash,
 	}, nil
 }
 
@@ -185,6 +196,16 @@ func (p Principal) AuthEpoch() domain.AuthEpoch {
 		return 0
 	}
 	return p.authEpoch
+}
+
+// HasCSRFProof reports whether this authenticated principal carries a
+// session-bound CSRF proof from its authentication request.
+func (p Principal) HasCSRFProof() bool { return p.IsAdmin() && p.csrfProofHash != nil }
+
+// MatchesCSRFProof compares the carried proof with the current session hash.
+// The hash itself is never exposed outside the Principal.
+func (p Principal) MatchesCSRFProof(hash domain.TokenHash) bool {
+	return p.HasCSRFProof() && p.csrfProofHash.Equal(hash)
 }
 
 // Can reports whether an internal principal may run an operation. Admin and

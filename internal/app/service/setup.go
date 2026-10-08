@@ -77,20 +77,23 @@ func loadInstallation(ctx context.Context, tx port.TxStores) (port.Installation,
 	return inst, nil
 }
 
-// toSetupView projects the port-level Installation row into the OpenAPI
-// Setup shape. BootstrapHTTPS is inferred from whether an active TLS
-// version has ever been recorded: port.Installation.ActiveTLSVersionID's own
-// doc comment defines "empty" as "before any HTTPS version is active", which
-// is exactly the bootstrap-certificate condition Setup.bootstrap_https
-// names. There is no dedicated boolean column or documented ServiceMode
-// enum to read this from instead -- see the report, this mapping is this
-// developer's inference from the one line of port documentation available,
-// not a confirmed product decision.
-func toSetupView(inst port.Installation) contract.SetupView {
+// toSetupView projects the installation row and its recorded active TLS
+// version into the OpenAPI Setup shape. An absent active version keeps the
+// setup-time warning visible; otherwise the persisted version source decides
+// whether the listener is still using the temporary bootstrap certificate.
+func toSetupView(ctx context.Context, tx port.TxStores, inst port.Installation) (contract.SetupView, error) {
+	bootstrapHTTPS := true
+	if inst.ActiveTLSVersionID != "" {
+		version, err := tx.TLS().GetVersion(ctx, inst.ActiveTLSVersionID)
+		if err != nil {
+			return contract.SetupView{}, storeError(err, "setup_tls_version_read_failed", "could not read the active TLS version")
+		}
+		bootstrapHTTPS = version.Source() == domain.TLSSourceBootstrap
+	}
 	return contract.SetupView{
 		SetupStage:     contract.SetupStage(inst.SetupStage),
-		BootstrapHTTPS: inst.ActiveTLSVersionID == "",
-	}
+		BootstrapHTTPS: bootstrapHTTPS,
+	}, nil
 }
 
 // Status reports the current installation progress. It is reachable
@@ -104,8 +107,8 @@ func (s *SetupService) Status(ctx context.Context, meta contract.RequestMeta, cm
 		if err != nil {
 			return err
 		}
-		view = toSetupView(inst)
-		return nil
+		view, err = toSetupView(ctx, tx, inst)
+		return err
 	})
 	if err != nil {
 		return contract.SetupView{}, err
@@ -244,8 +247,9 @@ func (s *SetupService) Complete(ctx context.Context, meta contract.MutationMeta,
 			// current state instead of erroring -- Complete carries no
 			// idempotency key of its own to replay through the request-store
 			// mechanism, so this is the natural, cheap alternative.
-			view = toSetupView(inst)
-			return nil
+			var err error
+			view, err = toSetupView(ctx, tx, inst)
+			return err
 		}
 		if inst.SetupStage != port.SetupStagePKIRequired {
 			// Unreachable in practice: requireCurrentAuth above already
@@ -267,6 +271,17 @@ func (s *SetupService) Complete(ctx context.Context, meta contract.MutationMeta,
 			return contract.NewAppError(contract.ErrorKindConflict, "setup_settings_version_mismatch",
 				"the service settings changed since this request was prepared")
 		}
+		if _, err := DecodeSettingsV1(settings); err != nil {
+			return err
+		}
+		hasRoot, err := installationHasRoot(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if !hasRoot {
+			return contract.NewAppError(contract.ErrorKindConflict, "setup_root_required",
+				"at least one Root authority is required before setup can be completed")
+		}
 
 		originalVersion := inst.Version
 		inst.SetupStage = port.SetupStageComplete
@@ -277,15 +292,35 @@ func (s *SetupService) Complete(ctx context.Context, meta contract.MutationMeta,
 
 		now := s.deps.Clock.Now()
 		if err := appendAccountAudit(ctx, tx, s.deps.IDs, now, meta.RequestMeta,
-			contract.AuditActorAccount, string(meta.Principal.AccountID()), "setup.complete", "installation", "installation"); err != nil {
+			contract.AuditActorAccount, string(meta.Principal.AccountID()), "setup.complete", "installation", ""); err != nil {
 			return err
 		}
 
-		view = toSetupView(inst)
-		return nil
+		view, err = toSetupView(ctx, tx, inst)
+		return err
 	})
 	if err != nil {
 		return contract.SetupView{}, err
 	}
 	return view, nil
+}
+
+func installationHasRoot(ctx context.Context, tx port.TxStores) (bool, error) {
+	page := contract.PageRequest{Limit: 200}
+	for {
+		result, err := tx.Queries().ListAuthorities(ctx, contract.AuthorityListQuery{Page: page}, port.QueryScope{All: true})
+		if err != nil {
+			return false, storeError(err, "setup_authority_read_failed", "could not verify the initial Root authority")
+		}
+		for _, queried := range result.Items {
+			authority := queried.Authority
+			if authority.Kind() == domain.AuthorityKindRoot {
+				return true, nil
+			}
+		}
+		if result.NextCursor == nil {
+			return false, nil
+		}
+		page.Cursor = *result.NextCursor
+	}
 }

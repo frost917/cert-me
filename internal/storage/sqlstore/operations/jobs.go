@@ -37,7 +37,7 @@ func (r *JobRepository) UpsertDemand(ctx context.Context, dedupKey, kind string,
 	// serializes the first insertion for all other dialects. Existing rows are
 	// locked before applying the merge, so running leases are never stolen.
 	b := r.builder()
-	query := "SELECT id, created_at, updated_at, version, kind, dedup_key, payload_version, payload_json, state, available_at, lease_until, attempt_count, last_error_code FROM jobs WHERE dedup_key = " + b.Add(dedupKey) + r.dialect.RowLockClause()
+	query := "SELECT id, created_at, updated_at, version, kind, dedup_key, payload_version, payload_json, state, available_at, lease_until, attempt_count, last_error_code FROM jobs WHERE dedup_key = " + b.Add(dedupKey) + core.RowLockClause(r.executor, r.dialect.RowLockClause())
 	job, err := scanJob(r.queryRow(ctx, query, b.Args()...))
 	if err == nil {
 		job.Kind = kind
@@ -90,7 +90,7 @@ func (r *JobRepository) ClaimDue(ctx context.Context, now, leaseUntil domain.Ins
 		return nil, failed("validate job claim", domain.ErrInvalidValue)
 	}
 	b := r.builder()
-	query := "SELECT id, created_at, updated_at, version, kind, dedup_key, payload_version, payload_json, state, available_at, lease_until, attempt_count, last_error_code FROM jobs WHERE (state = 'pending' AND available_at <= " + b.Add(now.UnixMicro()) + ") OR (state = 'running' AND lease_until IS NOT NULL AND lease_until <= " + b.Add(now.UnixMicro()) + ") ORDER BY available_at, id LIMIT " + b.Add(limit) + r.dialect.RowLockClause()
+	query := "SELECT id, created_at, updated_at, version, kind, dedup_key, payload_version, payload_json, state, available_at, lease_until, attempt_count, last_error_code FROM jobs WHERE (state = 'pending' AND available_at <= " + b.Add(now.UnixMicro()) + ") OR (state = 'running' AND lease_until IS NOT NULL AND lease_until <= " + b.Add(now.UnixMicro()) + ") ORDER BY available_at, id LIMIT " + b.Add(limit) + core.RowLockClause(r.executor, r.dialect.RowLockClause())
 	rows, err := r.executor.QueryContext(ctx, query, b.Args()...)
 	if err != nil {
 		return nil, failed("select due jobs", err)
@@ -182,7 +182,7 @@ func (r *JobRepository) GetForUpdate(ctx context.Context, jobID domain.JobID) (p
 		return port.Job{}, err
 	}
 	b := r.builder()
-	query := "SELECT id, created_at, updated_at, version, kind, dedup_key, payload_version, payload_json, state, available_at, lease_until, attempt_count, last_error_code FROM jobs WHERE id = " + b.Add(string(jobID)) + r.dialect.RowLockClause()
+	query := "SELECT id, created_at, updated_at, version, kind, dedup_key, payload_version, payload_json, state, available_at, lease_until, attempt_count, last_error_code FROM jobs WHERE id = " + b.Add(string(jobID)) + core.RowLockClause(r.executor, r.dialect.RowLockClause())
 	job, err := scanJob(r.queryRow(ctx, query, b.Args()...))
 	if err != nil {
 		return port.Job{}, failed("read job for update", err)

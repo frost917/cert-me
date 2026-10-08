@@ -89,7 +89,7 @@ command의 외부 필드는 아래 OpenAPI schema를 그대로 typed struct로 �
 | --- | --- | --- |
 | SetupService | Status: Empty → Setup; CreateAdmin: Credentials → Account; Complete: Empty → Setup | 최초 생성은 익명, Complete는 Settings version 필수. 설치 상태를 내부에서 확인 |
 | IdentityService | Login: Credentials → Login; Logout: Empty → 없음; Authenticate(sessionToken) → Principal/Session; BeginReset(accountID) → ResetLink; CompleteReset: PasswordReset → 없음; IssueCSRF → CSRF | BeginReset은 local 전용. Login/CompleteReset은 세션 인증 대신 pre-auth 검증 경로 |
-| SettingsService | Get → Settings; Update: SettingsPatch → Settings | Update에 version 필수, 이전 링크/계보 설정 불변 |
+| SettingsService | Get → Settings; Initialize: SettingsInitialize → Settings; Update: SettingsPatch → Settings | Initialize는 관리자 세션+CSRF, pki_required·설정 없음 조건에서 명시 입력으로 최초 생성. Update에 version 필수, 이전 링크/계보 설정 불변 |
 | AuthorityService | Create: AuthorityCreate → Authority; Rename: NamePatch → Authority; SetIssuanceState: IssuanceState → Authority; DestroyKey: KeyDestruction → Authority; Archive: Empty → Authority | Create는 idempotency, 나머지는 Authority version 필수 |
 | IssuanceService | Issue: LeafCreate → Issuance; Renew: Renew → Issuance; Reissue: Reissue → Issuance; UpdateSeries: LeafPatch → LeafSeries; ArchiveSeries: Empty → LeafSeries | 발급 3종 idempotency, 기존 계보 명령은 Series version 필수 |
 | DistributionService | CreateLink: DownloadLinkRequest → DownloadLink; Deliver: DownloadCommand + DownloadSink → TransferSummary; ReportFailure: Justification → DeliveryFailure | ReportFailure는 Delivery version 필수. Deliver는 토큰만으로 제한된 인증 |

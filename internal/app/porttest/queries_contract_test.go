@@ -70,7 +70,7 @@ func TestQueryScopeAppliedBeforePaging(t *testing.T) {
 	store := NewStore()
 	seedAuthorities(t, store)
 
-	var page contract.Page[domain.Authority]
+	var page contract.Page[port.QueriedAuthority]
 	err := store.Read(context.Background(), func(tx port.TxStores) error {
 		var err error
 		page, err = tx.Queries().ListAuthorities(context.Background(),
@@ -86,8 +86,8 @@ func TestQueryScopeAppliedBeforePaging(t *testing.T) {
 	if len(page.Items) != 2 {
 		t.Fatalf("want 2 in-scope authorities in one page, got %d", len(page.Items))
 	}
-	if page.Items[0].ID() != domain.AuthorityID(authAID) || page.Items[1].ID() != domain.AuthorityID(authCID) {
-		t.Fatalf("want A and C, got %q and %q", page.Items[0].ID(), page.Items[1].ID())
+	if page.Items[0].Authority.ID() != domain.AuthorityID(authAID) || page.Items[1].Authority.ID() != domain.AuthorityID(authCID) {
+		t.Fatalf("want A and C, got %q and %q", page.Items[0].Authority.ID(), page.Items[1].Authority.ID())
 	}
 	if page.NextCursor != nil {
 		t.Fatalf("want an exhausted page, got cursor %q", *page.NextCursor)
@@ -104,7 +104,7 @@ func TestQueryCursorIsExclusive(t *testing.T) {
 	var seen []domain.AuthorityID
 	cursor := ""
 	for step := 0; step < 5; step++ {
-		var page contract.Page[domain.Authority]
+		var page contract.Page[port.QueriedAuthority]
 		err := store.Read(ctx, func(tx port.TxStores) error {
 			var err error
 			page, err = tx.Queries().ListAuthorities(ctx,
@@ -116,7 +116,7 @@ func TestQueryCursorIsExclusive(t *testing.T) {
 			t.Fatalf("ListAuthorities: %v", err)
 		}
 		for _, a := range page.Items {
-			seen = append(seen, a.ID())
+			seen = append(seen, a.Authority.ID())
 		}
 		if page.NextCursor == nil {
 			break
@@ -134,6 +134,73 @@ func TestQueryCursorIsExclusive(t *testing.T) {
 		if seen[i] != want[i] {
 			t.Fatalf("row %d: want %q, got %q", i, want[i], seen[i])
 		}
+	}
+}
+
+func TestManagedAuthorityFilterRunsBeforePagingAndDefaultsToInternalView(t *testing.T) {
+	store := NewStore()
+	seedAuthorities(t, store)
+	bootstrapID := domain.AuthorityID("00000000-0000-4000-8000-000000000001")
+	bootstrap, err := domain.NewAuthority(domain.AuthorityFacts{
+		ID:              bootstrapID,
+		Kind:            domain.AuthorityKindBootstrap,
+		Name:            "internal-bootstrap",
+		IssuanceState:   domain.IssuanceStateInventory,
+		KeyGenerationID: domain.CAKeyGenerationID("00000000-0000-4000-8000-000000000002"),
+		KeyAvailable:    true,
+		Version:         1,
+	})
+	if err != nil {
+		t.Fatalf("NewAuthority bootstrap: %v", err)
+	}
+	if err := store.Write(context.Background(), func(tx port.TxStores) error {
+		return tx.PKI().InsertAuthority(context.Background(), bootstrap)
+	}); err != nil {
+		t.Fatalf("insert bootstrap authority: %v", err)
+	}
+
+	ctx := context.Background()
+	var internalPage contract.Page[port.QueriedAuthority]
+	err = store.Read(ctx, func(tx port.TxStores) error {
+		var err error
+		internalPage, err = tx.Queries().ListAuthorities(ctx,
+			contract.AuthorityListQuery{Page: contract.PageRequest{Limit: 1}}, port.QueryScope{All: true})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("internal ListAuthorities: %v", err)
+	}
+	if len(internalPage.Items) != 1 || internalPage.Items[0].Authority.ID() != bootstrapID {
+		t.Fatalf("internal first page = %#v, want bootstrap %q", internalPage.Items, bootstrapID)
+	}
+
+	var first, second contract.Page[port.QueriedAuthority]
+	err = store.Read(ctx, func(tx port.TxStores) error {
+		var err error
+		first, err = tx.Queries().ListAuthorities(ctx, contract.AuthorityListQuery{
+			ManagedOnly: true,
+			Page:        contract.PageRequest{Limit: 2},
+		}, port.QueryScope{All: true})
+		if err != nil {
+			return err
+		}
+		if first.NextCursor == nil {
+			return nil
+		}
+		second, err = tx.Queries().ListAuthorities(ctx, contract.AuthorityListQuery{
+			ManagedOnly: true,
+			Page:        contract.PageRequest{Limit: 2, Cursor: *first.NextCursor},
+		}, port.QueryScope{All: true})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("managed ListAuthorities: %v", err)
+	}
+	if len(first.Items) != 2 || first.Items[0].Authority.ID() != domain.AuthorityID(authAID) || first.Items[1].Authority.ID() != domain.AuthorityID(authBID) {
+		t.Fatalf("first managed page = %#v, want A and B", first.Items)
+	}
+	if len(second.Items) != 1 || second.Items[0].Authority.ID() != domain.AuthorityID(authCID) || second.NextCursor != nil {
+		t.Fatalf("second managed page = %#v, want C and no cursor", second)
 	}
 }
 

@@ -805,6 +805,7 @@ func (s *IssuanceService) replayBeforePreparation(
 		if err != nil {
 			return err
 		}
+		projected.Replayed = true
 		*result = projected
 		found = true
 		return nil
@@ -984,6 +985,7 @@ func (s *IssuanceService) commitIssue(ctx context.Context, tx port.TxStores, met
 		if err != nil {
 			return err
 		}
+		v.Replayed = true
 		*result = v
 		return nil
 	}
@@ -1379,6 +1381,9 @@ func (s *IssuanceService) prepareRenew(ctx context.Context, meta contract.Mutati
 	if err := targetIssuer.CanIssue(domain.IssuerContext{RequestedWindow: policyWindow, Intent: domain.IssuanceIntentLeaf}, prep.now); err != nil {
 		return renewPrepared{}, contract.FromDomainError(err)
 	}
+	if !revoked && !keyCompromised && prep.snapshot.CurrentKeyGeneration.Custody() != domain.KeyCustodyClientHeld {
+		return renewPrepared{}, contract.NewAppError(contract.ErrorKindConflict, "delivery_not_available", "the current private key must be received before renewal")
+	}
 
 	keyReady := !revoked && !keyCompromised && prep.snapshot.CurrentKeyGeneration.Custody() == domain.KeyCustodyClientHeld
 	renewalPlan, err := prep.snapshot.Series.PlanRenewal(domain.RenewalFacts{
@@ -1528,6 +1533,7 @@ func (s *IssuanceService) commitRenew(ctx context.Context, tx port.TxStores, met
 		if err != nil {
 			return err
 		}
+		v.Replayed = true
 		*result = v
 		return nil
 	}

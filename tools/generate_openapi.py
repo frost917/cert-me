@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the initial OpenAPI contract. Handlers are not implemented by this file."""
+"""Build the canonical OpenAPI contract; HTTP handlers are implemented separately."""
 import copy
 import json
 from pathlib import Path
@@ -37,6 +37,7 @@ S['Session']=obj({'account':ref('Account'),'idle_expires_at':TIME,'absolute_expi
 S['Login']=obj({**S['Session']['properties'],'csrf_token':string(minLength=32,maxLength=256)},['account','csrf_token','idle_expires_at','absolute_expires_at'])
 settings={'service_url':string(format='uri',pattern='^https://'),'leaf_validity':ref('Validity'),'root_validity':ref('Validity'),'intermediate_validity':ref('Validity'),'rotate_every':{'type':'integer','minimum':1,'maximum':100,'default':3},'private_delivery_seconds':{'type':'integer','minimum':300,'maximum':86400,'default':10800},'public_link_seconds':{'type':'integer','minimum':60,'maximum':10800,'default':600},'crl_interval_seconds':{'type':'integer','minimum':300,'maximum':86400,'default':43200},'crl_validity_seconds':{'type':'integer','minimum':600,'maximum':604800,'default':172800},'audit_retention_days':{'type':'integer','minimum':30,'maximum':3650,'default':365}}
 S['SettingsPatch']=obj(settings);S['SettingsPatch']['minProperties']=1
+S['SettingsInitialize']=obj(settings,list(settings))
 S['Settings']=obj({**settings,'version':VERSION},list(settings)+['version']);S['Settings']['description']='CRL validity must be at least twice interval; URL must match active operational TLS certificate or be changed through CLI recovery.'
 S['NamePatch']=obj({'name':NAME},['name'])
 S['LeafPatch']=obj({'name':NAME,'validity':ref('Validity'),'rotate_every':settings['rotate_every']});S['LeafPatch']['minProperties']=1
@@ -137,7 +138,8 @@ def endpoint(method,path,operation,out=None,body=None,status=200,public=False,ma
  return op
 
 endpoint('get','/setup','getSetup','Setup',public=True)
-endpoint('get','/auth/csrf','getCSRF','CSRF',public=True,description='Same-origin only; may use current session or pre-auth nonce cookie. Never grants setup authorization.')
+csrf=endpoint('get','/auth/csrf','getCSRF','CSRF',public=True,description='Same-origin only. If mode is omitted, use a valid session when present or the pre-auth nonce cookie otherwise. mode=preauth forces the pre-auth flow; mode=session requires a valid session. Never grants setup authorization.')
+csrf['parameters'].insert(0,param('mode',enum('preauth','session')))
 endpoint('post','/setup/admin','createFirstAdmin','Account','Credentials',201,public=True)
 login=endpoint('post','/auth/login','login','Login','Credentials',public=True)
 login['responses']['200']['headers']['Set-Cookie']={'schema':string(),'description':'__Host-certme_session; Secure; HttpOnly; SameSite=Strict; Path=/'}
@@ -146,7 +148,10 @@ endpoint('get','/auth/me','getSession','Session')
 endpoint('post','/auth/password-reset','completePasswordReset',body='PasswordReset',status=204,public=True)
 endpoint('get','/settings','getSettings','Settings')
 endpoint('patch','/settings','updateSettings','Settings','SettingsPatch',match=True)
-endpoint('post','/setup/complete','completeSetup','Setup','Empty',match=True)
+initial=endpoint('post','/setup/settings','initializeSettings','Settings','SettingsInitialize',201,description='Administrator session and CSRF required. Create the initial settings only during pki_required, with every field explicitly supplied. Existing settings return 409; after a lost response use GET /settings. No Host-derived URL or implicit PATCH upsert. Bootstrap TLS may have no operational URL binding; operational TLS must match service_url.')
+initial['responses']['201']['headers']['Location']={'schema':string(),'description':'/api/v1/settings'}
+complete=endpoint('post','/setup/complete','completeSetup','Setup','Empty',match=True)
+complete['requestBody']['required']=False
 endpoint('get','/authorities','listAuthorities','Authority',listing=True)
 endpoint('post','/authorities','createAuthority','Authority','AuthorityCreate',201,idem=True)
 endpoint('get','/authorities/{id}','getAuthority','Authority')
