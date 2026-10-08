@@ -1056,7 +1056,7 @@ func (s *AuthorityService) DestroyKey(ctx context.Context, meta contract.Mutatio
 		}
 		destroyed, err := authority.DestroyKey(closure, now)
 		if err != nil {
-			return contract.FromDomainError(err)
+			return authorityClosureError(err)
 		}
 		generation.KeyDestroyedAt = now
 		if err := tx.PKI().SaveCAKeyGeneration(ctx, generation); err != nil {
@@ -1148,7 +1148,7 @@ func (s *AuthorityService) Archive(ctx context.Context, meta contract.MutationMe
 		}
 		archived, err := authority.Archive(closure, now)
 		if err != nil {
-			return contract.FromDomainError(err)
+			return authorityClosureError(err)
 		}
 		if err := tx.PKI().SaveAuthority(ctx, archived, expectedVersion); err != nil {
 			return storeError(err, "authority_save_failed", "could not archive the authority")
@@ -1175,4 +1175,14 @@ func (s *AuthorityService) Archive(ctx context.Context, meta contract.MutationMe
 		return contract.AuthorityView{}, err
 	}
 	return result, nil
+}
+
+// Closure eligibility describes stored business state, after authorization
+// has already succeeded. An unmet condition is a conflict, not a scope denial.
+func authorityClosureError(err error) error {
+	if errors.Is(err, domain.ErrNotPermitted) {
+		return contract.WrapAppError(contract.ErrorKindConflict, "authority_closure_blocked",
+			"the authority closure requirements are not satisfied", err)
+	}
+	return contract.FromDomainError(err)
 }
