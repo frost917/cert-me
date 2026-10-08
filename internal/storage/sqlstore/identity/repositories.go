@@ -128,13 +128,8 @@ func versionConflictOrFailed(op string, err error) error {
 	return failed(op, err)
 }
 
-func lockSuffix(d dialect.Dialect) string {
-	if d.Kind() == config.SQLite {
-		// SQLite's writer transaction is opened with _txlock=immediate. It
-		// serializes write-side row changes without SELECT FOR UPDATE syntax.
-		return ""
-	}
-	return " FOR UPDATE"
+func lockSuffix(executor core.SQLExecutor, d dialect.Dialect) string {
+	return core.RowLockClause(executor, d.RowLockClause())
 }
 
 func optionalID(id string) any {
@@ -268,7 +263,7 @@ func (r *AccountRepository) GetAccountForUpdate(ctx context.Context, id domain.A
 		return domain.Account{}, err
 	}
 	b := r.dialect.NewBuilder()
-	query := "SELECT " + accountColumns + " FROM accounts WHERE id = " + b.Add(string(id)) + lockSuffix(r.dialect)
+	query := "SELECT " + accountColumns + " FROM accounts WHERE id = " + b.Add(string(id)) + lockSuffix(r.executor, r.dialect)
 	return accountFromRow(r.executor.QueryRowContext(ctx, query, b.Args()...))
 }
 
@@ -355,7 +350,7 @@ func (r *AccountRepository) GetResetToken(ctx context.Context, tokenHash domain.
 		return domain.AdminResetToken{}, err
 	}
 	b := r.dialect.NewBuilder()
-	query := "SELECT id, account_id, token_hash, auth_epoch, created_at, expires_at, consumed_at, invalidated_at FROM password_reset_tokens WHERE token_hash = " + b.Add(tokenHash.Hex()) + lockSuffix(r.dialect)
+	query := "SELECT id, account_id, token_hash, auth_epoch, created_at, expires_at, consumed_at, invalidated_at FROM password_reset_tokens WHERE token_hash = " + b.Add(tokenHash.Hex()) + lockSuffix(r.executor, r.dialect)
 	return resetTokenFromRow(r.executor.QueryRowContext(ctx, query, b.Args()...))
 }
 
@@ -477,7 +472,7 @@ func (r *InstallationRepository) GetForUpdate(ctx context.Context) (port.Install
 		return port.Installation{}, err
 	}
 	b := r.dialect.NewBuilder()
-	query := "SELECT setup_stage, first_admin_id, active_encryption_generation_id, active_tls_version_id, service_mode, version FROM installation WHERE id = " + b.Add(1) + lockSuffix(r.dialect)
+	query := "SELECT setup_stage, first_admin_id, active_encryption_generation_id, active_tls_version_id, service_mode, version FROM installation WHERE id = " + b.Add(1) + lockSuffix(r.executor, r.dialect)
 	var stage, encryptionID, serviceMode string
 	var firstAdminID, tlsID sql.NullString
 	var version int64

@@ -49,7 +49,7 @@ func (r *RevocationRepository) FindForUpdate(ctx context.Context, issuer domain.
 	}
 	b := r.dialect.NewBuilder()
 	query := revocationSelect + " WHERE issuer_ca_key_generation_id = " + b.Add(string(issuer)) +
-		" AND serial_hex = " + b.Add(serial.Hex()) + r.dialect.RowLockClause()
+		" AND serial_hex = " + b.Add(serial.Hex()) + core.RowLockClause(r.executor, r.dialect.RowLockClause())
 	revocation, err := scanRevocation(r.executor.QueryRowContext(ctx, query, b.Args()...))
 	if err != nil {
 		if errors.Is(err, port.ErrNotFound) {

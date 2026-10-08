@@ -23,6 +23,20 @@ type SQLExecutor interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
+// readSnapshotExecutor marks executors used by Store.Read. Locking reads can
+// switch away from the transaction's consistent snapshot and contend with
+// concurrent writers, so read callbacks keep those clauses out of their SQL.
+type readSnapshotExecutor struct{ SQLExecutor }
+
+// RowLockClause removes a row-lock suffix from read snapshot executors while
+// preserving it for write transactions and untagged executors.
+func RowLockClause(executor SQLExecutor, clause string) string {
+	if _, ok := executor.(readSnapshotExecutor); ok {
+		return ""
+	}
+	return clause
+}
+
 // Factory builds the repository set bound to the supplied executor. The
 // executor belongs to the transaction opened by Store and must not be retained
 // after the callback returns.
@@ -140,7 +154,11 @@ func (s *Store) run(tx *sql.Tx, callback func(port.TxStores) error, write bool) 
 		}
 	}()
 
-	stores, err := s.factory(tx)
+	var executor SQLExecutor = tx
+	if !write {
+		executor = readSnapshotExecutor{SQLExecutor: tx}
+	}
+	stores, err := s.factory(executor)
 	if err != nil {
 		finished = true
 		if rollbackErr := safeRollback(tx); rollbackErr != nil {

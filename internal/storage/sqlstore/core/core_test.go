@@ -197,6 +197,7 @@ func TestReadFactorySuppressesRowLockClause(t *testing.T) {
 func TestWriteFactoryRetainsRowLockClauseForEveryDialect(t *testing.T) {
 	_, store, executor := openTestStore(t)
 	var got []string
+	var want []string
 	err := store.Write(context.Background(), func(port.TxStores) error {
 		for _, kind := range []config.DatabaseKind{config.SQLite, config.Postgres, config.MySQL, config.MariaDB} {
 			d, err := dialect.New(kind)
@@ -204,19 +205,20 @@ func TestWriteFactoryRetainsRowLockClauseForEveryDialect(t *testing.T) {
 				return err
 			}
 			clause := d.RowLockClause()
-			if clause == "" {
-				// Use a representative lock suffix for SQLite, whose writer
-				// serialization does not use SQL row-lock syntax.
-				clause = " FOR UPDATE"
-			}
 			got = append(got, RowLockClause(*executor, clause))
+			want = append(want, clause)
+		}
+		// SQLite has no SQL row-lock suffix, so its dialect clause above is
+		// empty. This sentinel confirms the write executor itself is untagged.
+		if clause := RowLockClause(*executor, " FOR UPDATE"); clause != " FOR UPDATE" {
+			return fmt.Errorf("write executor removed explicit row lock clause: %q", clause)
 		}
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("Write(): %v", err)
 	}
-	for i, clause := range []string{" FOR UPDATE", " FOR UPDATE", " FOR UPDATE", " FOR UPDATE"} {
+	for i, clause := range want {
 		if got[i] != clause {
 			t.Errorf("write row lock clause[%d] = %q, want %q", i, got[i], clause)
 		}

@@ -53,7 +53,7 @@ func (r *CRLRepository) readState(ctx context.Context, caKeyGenerationID domain.
 	b := r.dialect.NewBuilder()
 	query := "SELECT ca_key_generation_id, max_reserved_number_hex, revocation_generation, published_crl_id, next_publish_at, publication_state, signing_ca_certificate_id, version FROM crl_states WHERE ca_key_generation_id = " + b.Add(string(caKeyGenerationID))
 	if lock {
-		query += r.dialect.RowLockClause()
+		query += core.RowLockClause(r.executor, r.dialect.RowLockClause())
 	}
 	var rawID, maxNumberHex, publicationState string
 	var rawPublishedID, rawSigningCertificateID sql.NullString

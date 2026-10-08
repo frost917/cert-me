@@ -33,7 +33,7 @@ func New(exec core.SQLExecutor, d dialect.Dialect) *Repository {
 var _ port.PKIRepository = (*Repository)(nil)
 
 func (r *Repository) lockSuffix() string {
-	return r.dialect.RowLockClause()
+	return core.RowLockClause(r.exec, r.dialect.RowLockClause())
 }
 
 // databaseNowMicros returns a dialect-native Unix-microsecond expression for

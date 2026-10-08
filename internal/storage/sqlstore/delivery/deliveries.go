@@ -32,7 +32,7 @@ func (r *DeliveryRepository) GetDeliveryForUpdate(ctx context.Context, id domain
 		return domain.Delivery{}, err
 	}
 	b := r.dialect.NewBuilder()
-	query := "SELECT id, leaf_key_generation_id, certificate_id, expires_at, state, consumed_at, finished_at, failure_code, version FROM key_deliveries WHERE id = " + b.Add(string(id)) + r.dialect.RowLockClause()
+	query := "SELECT id, leaf_key_generation_id, certificate_id, expires_at, state, consumed_at, finished_at, failure_code, version FROM key_deliveries WHERE id = " + b.Add(string(id)) + core.RowLockClause(r.executor, r.dialect.RowLockClause())
 	delivery, err := scanDelivery(r.executor.QueryRowContext(ctx, query, b.Args()...))
 	if err != nil {
 		return domain.Delivery{}, fmt.Errorf("sqlstore delivery: get for update: %w", notFound(err))
@@ -45,7 +45,7 @@ func (r *DeliveryRepository) GetDeliveryByLeafKeyGenerationForUpdate(ctx context
 		return domain.Delivery{}, err
 	}
 	b := r.dialect.NewBuilder()
-	query := "SELECT id, leaf_key_generation_id, certificate_id, expires_at, state, consumed_at, finished_at, failure_code, version FROM key_deliveries WHERE leaf_key_generation_id = " + b.Add(string(generationID)) + r.dialect.RowLockClause()
+	query := "SELECT id, leaf_key_generation_id, certificate_id, expires_at, state, consumed_at, finished_at, failure_code, version FROM key_deliveries WHERE leaf_key_generation_id = " + b.Add(string(generationID)) + core.RowLockClause(r.executor, r.dialect.RowLockClause())
 	delivery, err := scanDelivery(r.executor.QueryRowContext(ctx, query, b.Args()...))
 	if err != nil {
 		return domain.Delivery{}, fmt.Errorf("sqlstore delivery: get by leaf key generation for update: %w", notFound(err))

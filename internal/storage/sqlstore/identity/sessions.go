@@ -73,7 +73,7 @@ func (r *AccountRepository) GetSessionForUpdate(ctx context.Context, sessionID d
 		return domain.SessionState{}, err
 	}
 	b := r.dialect.NewBuilder()
-	query := "SELECT id, account_id, token_hash, auth_epoch, last_seen_at, absolute_expires_at, csrf_secret_hash FROM sessions WHERE id = " + b.Add(string(sessionID)) + lockSuffix(r.dialect)
+	query := "SELECT id, account_id, token_hash, auth_epoch, last_seen_at, absolute_expires_at, csrf_secret_hash FROM sessions WHERE id = " + b.Add(string(sessionID)) + lockSuffix(r.executor, r.dialect)
 	return sessionFromRow(r.executor.QueryRowContext(ctx, query, b.Args()...))
 }
 

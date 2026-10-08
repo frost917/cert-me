@@ -25,7 +25,7 @@ func (r *TLSRepository) GetActiveForUpdate(ctx context.Context) (domain.TLSChang
 		return domain.TLSChange{}, err
 	}
 	b := r.builder()
-	query := "SELECT active_tls_version_id FROM installation WHERE id = 1" + r.dialect.RowLockClause()
+	query := "SELECT active_tls_version_id FROM installation WHERE id = 1" + core.RowLockClause(r.executor, r.dialect.RowLockClause())
 	var active sql.NullString
 	if err := r.queryRow(ctx, query).Scan(&active); err != nil {
 		return domain.TLSChange{}, failed("read installation TLS pointer", missing(err))
@@ -38,7 +38,7 @@ func (r *TLSRepository) GetActiveForUpdate(ctx context.Context) (domain.TLSChang
 		return domain.TLSChange{}, failed("decode active TLS pointer", err)
 	}
 	b = r.builder()
-	change, err := scanTLSChange(r.queryRow(ctx, "SELECT previous_version_id, candidate_version_id, phase, error_code, version FROM tls_changes WHERE candidate_version_id = "+b.Add(string(versionID))+r.dialect.RowLockClause(), b.Args()...))
+	change, err := scanTLSChange(r.queryRow(ctx, "SELECT previous_version_id, candidate_version_id, phase, error_code, version FROM tls_changes WHERE candidate_version_id = "+b.Add(string(versionID))+core.RowLockClause(r.executor, r.dialect.RowLockClause()), b.Args()...))
 	if err != nil {
 		return domain.TLSChange{}, failed("read active TLS change", err)
 	}

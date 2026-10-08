@@ -176,7 +176,7 @@ func (r *ImportRepository) GetPendingTakeoverForUpdate(ctx context.Context, caKe
 	}
 	b := r.dialect.NewBuilder()
 	query := "SELECT id, ca_key_generation_id, state, history_assertion, previous_max_number_hex, external_issuer_stopped_at, confirmed_by, confirmed_at, evidence_json, version FROM ca_takeovers WHERE ca_key_generation_id = " +
-		b.Add(string(caKeyGenerationID)) + " AND state = 'pending' ORDER BY created_at, id LIMIT 1" + r.dialect.RowLockClause()
+		b.Add(string(caKeyGenerationID)) + " AND state = 'pending' ORDER BY created_at, id LIMIT 1" + core.RowLockClause(r.executor, r.dialect.RowLockClause())
 	takeover, err := scanTakeover(r.executor.QueryRowContext(ctx, query, b.Args()...))
 	if err != nil {
 		return port.Takeover{}, fmt.Errorf("sqlstore workflow: get pending takeover for update: %w", missing(err))
