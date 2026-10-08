@@ -945,6 +945,10 @@ func TestAuthorityServiceSetIssuanceStateStoppedBlocksLeafIssuance(t *testing.T)
 	if err == nil {
 		t.Fatal("want issuance to be rejected once the issuer is stopped")
 	}
+	var appErr *contract.AppError
+	if !errors.As(err, &appErr) || appErr.Kind() != contract.ErrorKindConflict || appErr.Code() != "issuer_stopped" {
+		t.Fatalf("stopped issuer error = %v, want conflict/issuer_stopped", err)
+	}
 }
 
 // mutateOnceUoW is shared with settings_service_test.go.
